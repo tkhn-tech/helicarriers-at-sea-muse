@@ -49,6 +49,13 @@ const G = {
   bombs: [], missiles: [],
   camYaw: 0.6, camPitch: 0.32, camDist: 1100, camPan: { x: 0, y: 0 },
   camFollow: null, camTac: null, camTacIdx: 0,
+  // v1.2.0 spectate (Hurricane v11.15 flow): the destroyed carrier the
+  // camera follows through the fall/breakup/splash/sinking. Command and
+  // the helm stay with the selected live carrier — spectate never locks
+  // them. Null = follow the selected carrier as usual.
+  camSpectate: null,
+  // v1.2.0 pitch: spring-return pitch-track value, -1..1 (+ = nose up).
+  pitchTrack: 0,
   rudderInput: 0, keys: {},
   enemyTimers: new Map(), enemyLoadout: new Map(),
   over: false, bombStats: { drops: 0, hits: 0, log: [] },
@@ -154,6 +161,7 @@ function switchShip(next) {
   if (!next || !next.alive) return;
   const prev = G.selected;
   G.waypoint = null;
+  G.camSpectate = null; // v1.2.0: tapping another live ship exits spectate
   rederiveSlots(next, G.playerFleet);
   if (prev) { next.telegraphIdx = prev.telegraphIdx; next.spoolSpeed = next.forwardSpeed; next.rudderDeg = next.rudder * 35; }
   G.selected = next;
@@ -391,6 +399,13 @@ function updateSteering(dt) {
   // already moved to a live carrier before anything steers this frame,
   // so escortControl always gets a live flag and never early-returns.
   ensureLiveCommand();
+  // v1.2.0 pitch: spring-return track + ArrowUp/Down combine into one
+  // pitch command on the selected carrier, every frame. The track and
+  // the rudder each own their pointer, so both can be driven at once.
+  if (G.selected) {
+    const keyPitch = (G.keys['ArrowUp'] ? 1 : 0) + (G.keys['ArrowDown'] ? -1 : 0);
+    G.selected.pitchInput = clamp(G.pitchTrack + keyPitch, -1, 1);
+  }
   // Collision debug course (?collide= / debug button): the pair steers
   // at each other with fixed rudder/telegraph, bypassing the keep-out
   // rudder and the formation controller entirely — otherwise the
@@ -478,6 +493,22 @@ function orbitPos(target, yaw, pitch, dist) {
     target.z + Math.cos(yaw) * Math.cos(pitch) * dist);
 }
 function cameraTarget() {
+  // v1.2.0 spectate (Hurricane v11.15): while a destroyed carrier is
+  // falling, sinking, or breaking up, the camera follows HER — through
+  // the fall, the breakup pieces, the splash and the sinking. The
+  // follow ends by itself when the wreck is fully gone, and the camera
+  // returns to the selected live carrier. Helm/telegraph/rudder are
+  // untouched: they keep driving the selected carrier throughout.
+  if (G.camSpectate) {
+    const c = G.camSpectate;
+    if (c.state === 'falling' || c.state === 'sinking') return { x: c.x, y: c.y, z: c.z };
+    if (c.state === 'gone' && c.pieces.length) {
+      const p = c.pieces[0];
+      return { x: p.group.position.x, y: p.group.position.y, z: p.group.position.z };
+    }
+    G.camSpectate = null; // wreck resolved — back to the fleet
+    renderFleetPanels();
+  }
   if (G.camTac) return G.camTac;
   if (G.camFollow) return G.camFollow.group ? { x: G.camFollow.x, y: G.camFollow.y, z: G.camFollow.z } : G.camFollow;
   const s = G.selected;
@@ -524,18 +555,20 @@ function zoneLine(c) {
   return `${podLine}<br>${f('reactor', 'Rct')} · ${f('magazine', 'Mag')} · ${f('bridge', 'Brg')} · ${f('deck', 'Deck')} · ${f('engines', 'Eng')}${fires ? '<br>' + fires : ''}`;
 }
 function carrierRowHTML(c, selectable) {
-  const cls = 'carrierRow' + (G.selected === c ? ' sel' : '') + (c.state === 'gone' || c.state === 'sinking' ? ' dead' : '');
+  const cls = 'carrierRow' + (G.selected === c ? ' sel' : '') + (c.state === 'gone' || c.state === 'sinking' ? ' dead' : '') + (G.camSpectate === c ? ' watch' : '');
   const hpCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? ' hurt' : ' crit';
   const barCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? 'mid' : 'low';
   const wing = c.wing ? ` · ✈ ${c.wing.remaining} jets (${c.wing.airborneCount()} up)` + (c.wing.squadrons.some(s => s.state === 'launchQueued') ? ' · LAUNCH QUEUED' : '') : '';
   // v1.1.0: Hurricane v11.30 visual row — icon + short code + health bar
   // on phones (CSS shows .fic/.fcode/.fbar and hides .nm/.hp/.zones/.bar);
   // desktop keeps the full row. fic flags fire / loss / camera-follow.
-  const fic = c.fires.length ? '🔥' : (c.state !== 'alive' ? '💥' : G.camFollow === c ? '🎥' : '🚢');
+  // v1.2.0: 🎥 marks the carrier being spectated (Hurricane v11.15).
+  const fic = G.camSpectate === c ? '🎥' : c.fires.length ? '🔥' : (c.state !== 'alive' ? '💥' : G.camFollow === c ? '🎥' : '🚢');
   const code = c.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E');
   const pct = Math.round(c.hpFrac * 100);
+  const hpText = G.camSpectate === c ? 'WATCHING' : c.state === 'alive' ? pct + '%' : c.state.toUpperCase();
   return `<div class="${cls}" data-cid="${c.id}">
-    <h4><span class="fic">${fic}</span><span class="fcode">${code}</span><span class="nm">${c.name}</span><span class="hp">${c.state === 'alive' ? pct + '%' : c.state.toUpperCase()}</span></h4>
+    <h4><span class="fic">${fic}</span><span class="fcode">${code}</span><span class="nm">${c.name}</span><span class="hp">${hpText}</span></h4>
     <div class="fbar"><i class="${barCls}" style="width:${pct}%"></i></div>
     <div class="bar${hpCls}"><i style="width:${pct}%"></i></div>
     <div class="zones">Lift ${Math.round(c.lift * 100)}% · Alt ${Math.round(c.y)} m · Spd ${Math.abs(c.forwardSpeed).toFixed(0)} m/s${wing}<br>${zoneLine(c)}</div>
@@ -550,6 +583,26 @@ function renderFleetPanels() {
     el.addEventListener('click', () => {
       const c = G.allCarriers.find(x => x.id === +el.dataset.cid);
       if (!c) return;
+      // v1.2.0 spectate (Hurricane v11.15): a destroyed carrier's row
+      // switches the CAMERA to watch her go down — command stays with
+      // the live flagship and the helm does NOT lock. A live ship's row
+      // takes command (and clears any spectate). Tapping the spectated
+      // row again returns the camera to the fleet.
+      if (c.side === 'player' && !c.alive) {
+        if (c.state === 'falling' || c.state === 'sinking' || (c.state === 'gone' && c.pieces.length)) {
+          if (G.camSpectate === c) {
+            G.camSpectate = null;
+            msg('Camera back on ' + (G.selected ? G.selected.name : 'the fleet'));
+          } else {
+            G.camSpectate = c;
+            msg('🎥 Watching ' + c.name + ' go down — helm still live, R or a live ship returns');
+          }
+          renderFleetPanels();
+          return;
+        }
+        msg(c.name + ' is gone');
+        return;
+      }
       if (c.side === 'player') switchShip(c);
       else { G.targetCarrier = c; G.targetMode = 'designated'; $('btnTarget').textContent = 'Target: ' + c.name; msg('Target designated: ' + c.name); }
     });
@@ -567,6 +620,12 @@ function updateTeleBox() {
 function updateStatus() {
   const s = G.selected;
   if (!s) return;
+  // v1.2.0: pitch readout follows the selected carrier's real pitch
+  // angle whenever the pitch track / arrow keys are not actively held.
+  if (Math.abs(G.pitchTrack) < 0.02 && !G.keys['ArrowUp'] && !G.keys['ArrowDown']) {
+    const pd = Math.round(s.pitch * 57.2958);
+    $('pitchReadout').textContent = 'PITCH ' + (pd >= 0 ? '+' : '') + pd + '°';
+  }
   // v1.1.0: the wide centred status strip is gone — its facts live in the
   // Hurricane-style top pill bar (ship / nav / air) and the minimap stats.
   const pods = s.pods.map(p => p.alive ? '●' : '✕').join('');
@@ -762,6 +821,10 @@ function bindInput() {
 
   // Joystick — Hurricane v11.0 horizontal rudder track: the knob only
   // swings left/right (rudder), centred by a transform, not a left offset.
+  // v1.2.0: the rudder track and the pitch track each own their pointer
+  // (separate pointerId + pointer capture per control), so two thumbs
+  // can drive rudder and pitch at the same time while a third finger
+  // taps the telegraph — no single-pointer lock anywhere.
   const joy = $('joy'), knob = $('joyKnob');
   let joyId = null;
   const joyMove = e => {
@@ -772,11 +835,30 @@ function bindInput() {
     knob.style.transform = `translateX(${dx * (r.width / 2 - 28)}px)`;
     $('rudderReadout').textContent = 'RUDDER ' + Math.round(dx * 35) + '°';
   };
-  joy.addEventListener('pointerdown', e => { joyId = e.pointerId; joy.setPointerCapture(e.pointerId); joyMove(e); });
+  joy.addEventListener('pointerdown', e => { joyId = e.pointerId; try { joy.setPointerCapture(e.pointerId); } catch (_) {} joyMove(e); });
   joy.addEventListener('pointermove', e => { if (e.pointerId === joyId) joyMove(e); });
-  const joyEnd = () => { joyId = null; G.rudderInput = 0; knob.style.transform = ''; };
+  const joyEnd = e => { if (e && e.pointerId !== joyId) return; joyId = null; G.rudderInput = 0; knob.style.transform = ''; };
   joy.addEventListener('pointerup', joyEnd);
   joy.addEventListener('pointercancel', joyEnd);
+
+  // v1.2.0 pitch track — vertical spring-return drag beside the rudder:
+  // drag up = nose up, drag down = nose down, returns to level on
+  // release. Own pointerId/capture, independent of the rudder track.
+  const pt = $('pitchTrack'), pk = $('pitchKnob');
+  let ptId = null;
+  const ptMove = e => {
+    const r = pt.getBoundingClientRect();
+    let dy = ((r.top + r.height / 2) - e.clientY) / (r.height / 2);
+    dy = clamp(dy, -1, 1);
+    G.pitchTrack = dy;
+    pk.style.transform = `translateY(${-dy * (r.height / 2 - 26)}px)`;
+    $('pitchReadout').textContent = 'PITCH ' + (dy >= 0 ? '+' : '') + Math.round(dy * 12) + '°';
+  };
+  pt.addEventListener('pointerdown', e => { ptId = e.pointerId; try { pt.setPointerCapture(e.pointerId); } catch (_) {} ptMove(e); });
+  pt.addEventListener('pointermove', e => { if (e.pointerId === ptId) ptMove(e); });
+  const ptEnd = e => { if (e && e.pointerId !== ptId) return; ptId = null; G.pitchTrack = 0; pk.style.transform = ''; $('pitchReadout').textContent = 'PITCH 0°'; };
+  pt.addEventListener('pointerup', ptEnd);
+  pt.addEventListener('pointercancel', ptEnd);
 
   // Minimap click — Hurricane v11.25: tap an enemy contact to designate it
   // as the air wing's target; open ocean sets a waypoint.
@@ -824,6 +906,8 @@ function bindInput() {
     if (e.key === 's' || e.key === 'S') setTelegraph(G.telegraphIdx + 1);
     if (e.key === 'q' || e.key === 'Q') adjustAlt(25);
     if (e.key === 'e' || e.key === 'E') adjustAlt(-25);
+    // v1.2.0: ArrowUp/Down pitch (ArrowLeft/Right already rudder).
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') e.preventDefault();
     if (e.key === 'r' || e.key === 'R') resetCamera();
     if (e.key === 'c' || e.key === 'C') cycleTactical();
   });
@@ -870,6 +954,7 @@ function adjustAlt(d) {
 function resetCamera() {
   G.camYaw = 0.6; G.camPitch = 0.32; G.camDist = 1100;
   G.camPan = { x: 0, y: 0 }; G.camTac = null; G.camTacIdx = 0; G.camFollow = G.selected;
+  G.camSpectate = null; // v1.2.0: R also ends a spectate follow (Hurricane v11.15)
   $('btnCam').textContent = 'Camera: fleet [C]';
 }
 function clickPick(cx, cy) {
@@ -883,6 +968,15 @@ function clickPick(cx, cy) {
     while (o && !o.userData.carrier) o = o.parent;
     const c = o && o.userData.carrier;
     if (c && c.state !== 'gone') {
+      // v1.2.0: tapping a falling/sinking carrier spectates her
+      // (camera follows her down, helm untouched); a live carrier
+      // behaves as before (follow / take command / designate target).
+      if (!c.alive) {
+        G.camSpectate = c;
+        msg('🎥 Watching ' + c.name + ' go down — helm still live, R returns');
+        renderFleetPanels();
+        return;
+      }
       G.camFollow = c;
       if (c.side === 'player') switchShip(c);
       else { G.targetCarrier = c; G.targetMode = 'designated'; $('btnTarget').textContent = 'Target: ' + c.name; }

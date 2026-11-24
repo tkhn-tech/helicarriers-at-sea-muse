@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>Helicarriers at Sea — v1.1.0</title>
+<title>Helicarriers at Sea — v1.2.0</title>
 <style>
   html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0b1c26;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#dfeef5;}
   #app{position:fixed;inset:0;}
@@ -34,6 +34,7 @@
   .carrierRow{border:1px solid rgba(140,200,230,.2);border-radius:8px;padding:6px 8px;margin:6px 0;cursor:pointer;background:rgba(255,255,255,.03);}
   .carrierRow.sel{border-color:#ffd166;background:rgba(255,209,102,.10);}
   .carrierRow.dead{opacity:.45;}
+  .carrierRow.watch{border-color:rgba(120,200,255,.7);background:rgba(120,200,255,.10);} /* v1.2.0: spectated wreck (Hurricane v11.15) */
   .carrierRow h4{margin:0 0 4px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:4px;}
   .carrierRow h4 .nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .carrierRow h4 .hp{color:#9db8cc;font-weight:800;flex:none;}
@@ -89,6 +90,17 @@
   .joyLab{position:absolute;top:50%;transform:translateY(-50%);font-size:10px;letter-spacing:.1em;color:#9db8cc;font-weight:800;pointer-events:none;}
   #rudderReadout{position:fixed;left:14px;bottom:calc(84px + env(safe-area-inset-bottom));z-index:6;
     font-size:12px;font-weight:800;letter-spacing:.08em;color:#ffd166;text-shadow:0 1px 6px rgba(0,0,0,.8);pointer-events:none;}
+  /* v1.2.0 pitch track — vertical spring-return drag beside the rudder:
+     drag up = nose up, drag down = nose down, returns to level on release.
+     Own pointer, independent of the rudder track. */
+  #pitchTrack{position:fixed;left:242px;bottom:calc(14px + env(safe-area-inset-bottom));z-index:6;width:56px;height:110px;border-radius:28px;
+    background:rgba(6,18,30,.45);border:1px solid rgba(140,190,230,.35);backdrop-filter:blur(4px);touch-action:none;pointer-events:auto;}
+  #pitchKnob{position:absolute;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%, #a8e6ff, #3d9ac6 60%, #1f5a7a);box-shadow:0 4px 14px rgba(0,0,0,.5);pointer-events:none;}
+  .pitchTick{position:absolute;left:8px;right:8px;height:2px;background:rgba(140,190,230,.4);pointer-events:none;}
+  .pitchLab{position:absolute;left:0;right:0;text-align:center;font-size:9px;letter-spacing:.1em;color:#9db8cc;font-weight:800;pointer-events:none;}
+  #pitchReadout{position:fixed;left:242px;bottom:calc(132px + env(safe-area-inset-bottom));z-index:6;
+    font-size:12px;font-weight:800;letter-spacing:.08em;color:#8fd4f5;text-shadow:0 1px 6px rgba(0,0,0,.8);pointer-events:none;white-space:nowrap;}
   #hint{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(10px + env(safe-area-inset-bottom));z-index:5;
     pointer-events:none;font-size:11.5px;color:#9db8cc;text-shadow:0 1px 6px rgba(0,0,0,.8);text-align:center;
     max-width:calc(100vw - 430px);}
@@ -144,6 +156,9 @@
     #joy{left:12px;bottom:calc(12px + env(safe-area-inset-bottom));width:180px;height:56px;}
     #joyKnob{width:40px;height:40px;margin:-20px 0 0 -20px;}
     #rudderReadout{left:12px;bottom:calc(76px + env(safe-area-inset-bottom));font-size:11px;}
+    #pitchTrack{left:200px;bottom:calc(12px + env(safe-area-inset-bottom));width:48px;height:96px;}
+    #pitchKnob{width:36px;height:36px;margin:-18px 0 0 -18px;}
+    #pitchReadout{left:200px;bottom:calc(114px + env(safe-area-inset-bottom));font-size:11px;}
     #hint{display:none;}
     #debugPanel{left:8px;right:auto;top:calc(262px + env(safe-area-inset-top));width:150px;max-height:calc(100dvh - 500px);overflow:auto;}
   }
@@ -220,17 +235,23 @@
     </div>
   </div>
   <div id="rudderReadout">RUDDER 0°</div>
+  <div id="pitchReadout">PITCH 0°</div>
+  <div id="pitchTrack">
+    <span class="pitchTick" style="top:25%"></span><span class="pitchTick" style="top:50%"></span><span class="pitchTick" style="top:75%"></span>
+    <span class="pitchLab" style="top:4px">UP</span><span class="pitchLab" style="bottom:4px">DN</span>
+    <div id="pitchKnob"></div>
+  </div>
   <div id="joy">
     <span class="joyTick" style="left:25%"></span><span class="joyTick" style="left:50%"></span><span class="joyTick" style="left:75%"></span>
     <span class="joyLab" style="left:10px">PORT</span><span class="joyLab" style="right:10px">STBD</span>
     <div id="joyKnob"></div>
   </div>
-  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>←/→</kbd> rudder · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · click a carrier to follow it</div>
+  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · click a carrier to follow it · click a falling carrier to watch her go down</div>
 </div>
 
 <div id="menu"><div id="menuCard" class="panel">
   <h1>HELICARRIERS <span>AT SEA</span></h1>
-  <p class="sub">v1.1.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. Jets strike only — no dogfighting in v1. HUD reworked to Hurricane Fleet's anchored layout: compact, collapsible, phone-friendly.</p>
+  <p class="sub">v1.2.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: spectate a destroyed carrier as she falls, rebuilt lift fans with real spinning rotors, pitch control (vertical track / ↑↓), and deeper fire, explosion and breakup physics.</p>
   <div class="pick"><label>Fleet size (you)</label><div class="seg" id="segPlayerFleet">
     <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4" class="on">4</button></div></div>
   <div class="pick"><label>Fleet size (enemy)</label><div class="seg" id="segEnemyFleet">

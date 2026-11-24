@@ -1,8 +1,18 @@
-# Helicarriers at Sea — v1.1.0
+# Helicarriers at Sea — v1.2.0
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
 home. **Jets strike only in v1 — no dogfighting, no air-to-air combat.**
+
+v1.2.0: spectate a destroyed carrier as she falls/breaks up/sinks (fleet-row
+or 3D tap, helm stays live, R or a live ship exits); rebuilt lift fans —
+real 8-blade rotors spinning inside deep ducted pods, spooling with lift
+demand; deck hole closed (continuous flight deck) plus deck markings,
+island bridge/mast/radar/nav lights, hull panelling and stern exhausts;
+pitch control (vertical spring-return track beside the rudder, ↑/↓ keys,
+±12°, drives climb/descent with altitude hold on release); deeper damage
+physics — zone/severity-tied fires, damage-scaled explosions, and breakups
+that vary with hit location, severity, speed and altitude.
 
 GitHub repo: `tkhn-tech/helicarriers-at-sea-muse` — v1.0.0 pushed 24 Nov 2026,
 live on GitHub Pages at https://tkhn-tech.github.io/helicarriers-at-sea-muse/
