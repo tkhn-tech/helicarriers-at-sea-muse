@@ -1,11 +1,11 @@
-# Helicarriers at Sea — v1.0.0
+# Helicarriers at Sea — v1.1.0
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
 home. **Jets strike only in v1 — no dogfighting, no air-to-air combat.**
 
-GitHub repo (exists, empty at build time — this build was **not** pushed):
-`tkhn-tech/helicarriers-at-sea-muse`
+GitHub repo: `tkhn-tech/helicarriers-at-sea-muse` — v1.0.0 pushed 24 Nov 2026,
+live on GitHub Pages at https://tkhn-tech.github.io/helicarriers-at-sea-muse/
 
 ## How to run
 
@@ -380,6 +380,19 @@ overlay text unchanged and true, zero errors.
   vertical speed, not from carried horizontal momentum.
 - Performance is untested beyond a headless load probe; 4v4 with all
   wings airborne is the heaviest case (~16 jets + 8 carriers).
+
+## v1.1.0 — HUD rework (live)
+
+- Hurricane Fleet's anchored HUD layout: top pill bar (ship / nav / air),
+  fleet panel top-left, minimap top-right, Air Ops + telegraph docked
+  bottom-right, horizontal rudder track bottom-left. Collapsible fleet
+  list and Air Ops panel; on phones the fleet rows go visual (icon +
+  short code + health bar), telegraph buttons use short labels, the
+  toast sits top-left under the bar. Enemy roster panel removed —
+  enemies are tracked on the minimap (tap one to designate it as the
+  target, open ocean still sets a waypoint). No mechanics changed.
+  Verified headless at 390x844 and 1280x800: zero console errors,
+  no overlaps, all controls live.
 
 ## v1.1 candidates
 

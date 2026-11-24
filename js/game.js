@@ -526,16 +526,26 @@ function zoneLine(c) {
 function carrierRowHTML(c, selectable) {
   const cls = 'carrierRow' + (G.selected === c ? ' sel' : '') + (c.state === 'gone' || c.state === 'sinking' ? ' dead' : '');
   const hpCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? ' hurt' : ' crit';
+  const barCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? 'mid' : 'low';
   const wing = c.wing ? ` · ✈ ${c.wing.remaining} jets (${c.wing.airborneCount()} up)` + (c.wing.squadrons.some(s => s.state === 'launchQueued') ? ' · LAUNCH QUEUED' : '') : '';
+  // v1.1.0: Hurricane v11.30 visual row — icon + short code + health bar
+  // on phones (CSS shows .fic/.fcode/.fbar and hides .nm/.hp/.zones/.bar);
+  // desktop keeps the full row. fic flags fire / loss / camera-follow.
+  const fic = c.fires.length ? '🔥' : (c.state !== 'alive' ? '💥' : G.camFollow === c ? '🎥' : '🚢');
+  const code = c.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E');
+  const pct = Math.round(c.hpFrac * 100);
   return `<div class="${cls}" data-cid="${c.id}">
-    <h4><span>${c.name}</span><span>${c.state === 'alive' ? Math.round(c.hpFrac * 100) + '%' : c.state.toUpperCase()}</span></h4>
-    <div class="bar${hpCls}"><i style="width:${Math.round(c.hpFrac * 100)}%"></i></div>
+    <h4><span class="fic">${fic}</span><span class="fcode">${code}</span><span class="nm">${c.name}</span><span class="hp">${c.state === 'alive' ? pct + '%' : c.state.toUpperCase()}</span></h4>
+    <div class="fbar"><i class="${barCls}" style="width:${pct}%"></i></div>
+    <div class="bar${hpCls}"><i style="width:${pct}%"></i></div>
     <div class="zones">Lift ${Math.round(c.lift * 100)}% · Alt ${Math.round(c.y)} m · Spd ${Math.abs(c.forwardSpeed).toFixed(0)} m/s${wing}<br>${zoneLine(c)}</div>
   </div>`;
 }
 function renderFleetPanels() {
+  // v1.1.0: Hurricane v11.16 — the enemy roster panel is gone; enemies are
+  // tracked on the minimap (red triangles) and designated by tapping one
+  // there or with the Target button. Only the player fleet gets a list.
   $('fleetRows').innerHTML = G.playerFleet.map(c => carrierRowHTML(c)).join('');
-  $('enemyRows').innerHTML = G.enemyFleet.map(c => carrierRowHTML(c)).join('');
   document.querySelectorAll('.carrierRow').forEach(el => {
     el.addEventListener('click', () => {
       const c = G.allCarriers.find(x => x.id === +el.dataset.cid);
@@ -550,16 +560,25 @@ function updateTeleBox() {
   $('teleNotch').textContent = t.name;
   const s = G.selected;
   $('teleSub').textContent = (s ? Math.abs(s.forwardSpeed).toFixed(0) + ' m/s · rudder ' + Math.round(s.rudderDeg) + '°' : '—');
+  $('rudderReadout').textContent = 'RUDDER ' + (s ? Math.round(s.rudderDeg) + '°' : '0°');
   $('modeBtn').textContent = G.mode;
+  document.querySelectorAll('#teleBtns .teleBtn').forEach(b => b.classList.toggle('on', +b.dataset.idx === G.telegraphIdx));
 }
 function updateStatus() {
   const s = G.selected;
   if (!s) return;
-  $('statusLine').textContent =
-    `${s.name} · ALT ${Math.round(s.y)} m (target ${Math.round(s.targetAlt)}) · SPD ${Math.abs(s.forwardSpeed).toFixed(0)} m/s · ` +
-    `TELEGRAPH ${TELEGRAPH[s.telegraphIdx].name} · MODE ${G.mode} · ${STAGES[G.stage].name} sea (Hs ${G.sea.HS.toFixed(1)} m) · ` +
-    `✈ ${G.playerFleet.reduce((a, c) => a + (c.wing ? c.wing.remaining : 0), 0)} jets left · ` +
-    `Bombs ${G.bombStats.drops} dropped / ${G.bombStats.hits} hits`;
+  // v1.1.0: the wide centred status strip is gone — its facts live in the
+  // Hurricane-style top pill bar (ship / nav / air) and the minimap stats.
+  const pods = s.pods.map(p => p.alive ? '●' : '✕').join('');
+  $('pillShip').innerHTML = `<b>${s.name}</b> · Lift ${Math.round(s.lift * 100)}% · Pods ${pods}`;
+  $('pillNav').textContent =
+    `ALT ${Math.round(s.y)} m (→${Math.round(s.targetAlt)}) · SPD ${Math.abs(s.forwardSpeed).toFixed(0)} m/s · ` +
+    `${TELEGRAPH[s.telegraphIdx].name} · ${G.mode}`;
+  $('pillAir').textContent =
+    `✈ ${G.playerFleet.reduce((a, c) => a + (c.wing ? c.wing.remaining : 0), 0)} jets · ` +
+    `💣 ${G.bombStats.drops}/${G.bombStats.hits} · ${STAGES[G.stage].name} Hs ${G.sea.HS.toFixed(1)} m`;
+  $('miniStats').innerHTML =
+    `YOU <b>${G.playerFleet.filter(c => c.alive).length}/${G.playerFleet.length}</b> · FOE <b>${G.enemyFleet.filter(c => c.alive).length}/${G.enemyFleet.length}</b>`;
 }
 
 // ---------- Minimap ----------
@@ -741,7 +760,8 @@ function bindInput() {
   }, { passive: true });
   cv.addEventListener('touchend', e => { for (const t of e.changedTouches) touches.delete(t.identifier); pinchD = 0; });
 
-  // Joystick (phone-first rudder)
+  // Joystick — Hurricane v11.0 horizontal rudder track: the knob only
+  // swings left/right (rudder), centred by a transform, not a left offset.
   const joy = $('joy'), knob = $('joyKnob');
   let joyId = null;
   const joyMove = e => {
@@ -749,22 +769,51 @@ function bindInput() {
     let dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
     dx = clamp(dx, -1, 1);
     G.rudderInput = dx;
-    knob.style.left = (40 + dx * 38) + 'px';
+    knob.style.transform = `translateX(${dx * (r.width / 2 - 28)}px)`;
+    $('rudderReadout').textContent = 'RUDDER ' + Math.round(dx * 35) + '°';
   };
   joy.addEventListener('pointerdown', e => { joyId = e.pointerId; joy.setPointerCapture(e.pointerId); joyMove(e); });
   joy.addEventListener('pointermove', e => { if (e.pointerId === joyId) joyMove(e); });
-  const joyEnd = () => { joyId = null; G.rudderInput = 0; knob.style.left = '40px'; };
+  const joyEnd = () => { joyId = null; G.rudderInput = 0; knob.style.transform = ''; };
   joy.addEventListener('pointerup', joyEnd);
   joy.addEventListener('pointercancel', joyEnd);
 
-  // Minimap click = waypoint
+  // Minimap click — Hurricane v11.25: tap an enemy contact to designate it
+  // as the air wing's target; open ocean sets a waypoint.
   $('minimap').addEventListener('click', e => {
     const r = $('minimap').getBoundingClientRect();
-    const wx = ((e.clientX - r.left) / r.width * 2 - 1) * 4200;
-    const wz = ((e.clientY - r.top) / r.height * 2 - 1) * 4200;
+    const ix = (e.clientX - r.left) / r.width * 380, iy = (e.clientY - r.top) / r.height * 380;
+    let best = null, bd = 1e18;
+    for (const c of G.enemyFleet) {
+      if (!c.alive) continue;
+      const d = Math.hypot((c.x / 4200 * 0.5 + 0.5) * 380 - ix, (c.z / 4200 * 0.5 + 0.5) * 380 - iy);
+      if (d < bd) { bd = d; best = c; }
+    }
+    if (best && bd < 30) {
+      G.targetCarrier = best; G.targetMode = 'designated';
+      $('btnTarget').textContent = 'Target: ' + best.name;
+      msg('Target designated: ' + best.name);
+      return;
+    }
+    const wx = (ix / 380 * 2 - 1) * 4200;
+    const wz = (iy / 380 * 2 - 1) * 4200;
     G.waypoint = { x: wx, z: wz };
     msg(`Waypoint set (${Math.round(wx)}, ${Math.round(wz)}) — fleet steering there`);
   });
+
+  // v1.1.0: collapsible panels (Hurricane Air Ops header toggle) + direct
+  // telegraph notch buttons (Hurricane 2-column teleBtn grid).
+  const bindToggle = (btnId, panelId) => {
+    $(btnId).addEventListener('click', () => {
+      const p = $(panelId);
+      p.classList.toggle('collapsed');
+      $(btnId).textContent = p.classList.contains('collapsed') ? '▸' : '▾';
+    });
+  };
+  bindToggle('fleetToggle', 'fleetPanel');
+  bindToggle('aoToggle', 'airOpsPanel');
+  document.querySelectorAll('#teleBtns .teleBtn').forEach(b =>
+    b.addEventListener('click', () => { setTelegraph(+b.dataset.idx); updateTeleBox(); }));
 
   addEventListener('keydown', e => {
     if (!G.started) return;
