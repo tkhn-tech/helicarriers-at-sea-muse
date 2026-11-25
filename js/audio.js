@@ -50,6 +50,28 @@ export class GameAudio {
     } catch (_) {}
   }
   click() { this._blip(880, 0.06, 'square', 0.04); }
+  // v1.4.0 rotor hum: a continuous low drone whose pitch and level
+  // follow the selected carrier's mean rotor spin (0..~1.15). Created
+  // lazily on the first call after the AudioContext exists; a no-op
+  // until then (headless probes never create a context). Muting silences
+  // it with everything else.
+  rotor(spinFrac) {
+    if (!this.ctx) return;
+    try {
+      if (!this._rotor) {
+        const a = this.ctx;
+        const o = a.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 55;
+        const f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 220; f.Q.value = 0.7;
+        const g = a.createGain(); g.gain.value = 0;
+        o.connect(f); f.connect(g); g.connect(a.destination); o.start();
+        this._rotor = { o, f, g };
+      }
+      const s = Math.max(0, Math.min(1.15, spinFrac || 0));
+      const t = this.ctx.currentTime;
+      this._rotor.o.frequency.setTargetAtTime(38 + s * 42, t, 0.2);
+      this._rotor.g.gain.setTargetAtTime(this.muted ? 0 : 0.012 + s * 0.04, t, 0.2);
+    } catch (_) { /* audio must never break the sim */ }
+  }
   whoosh() { this._noise(0.7, 0.18, 900, 1.2); this._blip(220, 0.5, 'sawtooth', 0.03); }
   samLaunch() { this._noise(0.5, 0.2, 1400, 1); this._blip(440, 0.4, 'sawtooth', 0.05); }
   boom(big) { this._noise(big ? 1.4 : 0.9, big ? 0.5 : 0.35, 220, 0.6); this._blip(55, big ? 1.2 : 0.8, 'sine', 0.3); }

@@ -1,8 +1,131 @@
-# Helicarriers at Sea — v1.3.0
+# Helicarriers at Sea — v1.4.0
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
-home. **Jets strike only in v1 — no dogfighting, no air-to-air combat.**
+home. **Jets strike only in v1 — no dogfighting.** v1.4.0 adds defensive
+CAP gun passes against inbound strikes (see below) — interception,
+not dogfighting.
+
+v1.4.0: mass-grounded flight physics for the 120,000 t carriers (spec in
+`../goals/helicarriers-at-sea-game/hidden_files/v14-physics-spec.md`):
+spool-up 0.45 / spool-down 0.60 m/s² with a 4 s speed lag (0→FULL in ~39 s,
+stop from FULL in ~31 s / ~274 m), banked lagged turns (10° bank cap, turn
+rate falls with speed — 5.2°/s at FULL, 2.8°/s at FLANK in Hurricane seas),
+rudder slew 8°/s, mass-limited pitch (12° in ~5.2 s, lever arms re-derived
+from the GLB's own pod centres: 65.1 m pitch / 58.2 m roll), 6 s rotor
+spool, altitude hold capped +6/−5 m/s, hover threshold re-anchored 0.60 →
+0.69 with control authority scaling with lift. Pitch fix: `user-select:
+none` on the whole HUD (the first mouse drag used to select the UP/DN
+label text, and the next drag died on a native text-drag pointercancel —
+rudder had the same flaw), and pitch now commands vertical speed directly
+so full pitch-up climbs at 1.25 m/s at hover, 3.9 m/s at FULL 16 m/s and
+up to the 6 m/s clamp at FLANK (spec §7.3: climb =
+(|V|·0.8 + 6)·sin(pitch), vy chasing it with a 5 s lag — the old code's
+6 m/s at hover was audit finding F13, fixed here; measured 4 m gained
+in the first 5.6 s at hover, vy 0.97 m/s and still ramping toward 1.25). New collective-style throttle track (69% hovers):
+rotor strength drives lift, climb authority, forward-speed coupling and
+rotor spin + audio hum; high throttle + pitch up is the strongest climb,
+low throttle sinks. All four helm controls (rudder, pitch, telegraph,
+throttle) accept simultaneous independent inputs. Formation escorts
+reworked for the slow physics (§5.2): catch-up is now signed along-track
+(an escort ahead of its slot slows down instead of speeding away —
+SHIELD-3 used to fall 900 m behind and never come back), gain lowered
+0.05 → 0.02, and heading follows the flagship while it turns, steering
+toward the slot only on a steady course — the fleet forms up from spawn
+and holds ~35–60 m in straight flight, with no collisions and the
+flagship's speed steady. A hard 90° turn at FULL still scatters it
+~1.2 km (the slots swing at 42–82 m/s while escorts top out at 22 m/s —
+geometrically unavoidable) and it stalls ~800–1300 m off afterwards,
+needing manual recovery (Tab) — scattered escorts can also blunder into
+each other or the flagship (grinds and one 34-damage impact observed
+across probe runs); wider steering clamps were tried and rejected —
+one recovered fully in 235 s but the escorts rammed the flagship on
+their way back (111 damage), another made the error grow to 1.9 km. Damage amounts, gates,
+fall/sink, fragmentation and all v1.3.0 features unchanged.
+
+v1.4.0: the enemy AI director is tactical now (was a launch timer +
+nearest target + a beeline at the player flagship). Target selection
+scores damage, crippled lift, fires, isolation and distance, with
+skill-scaled noise (elite picks the best target almost every time,
+cadet often picks a worse one); one fleet-wide focus target is held
+for a skill-scaled window, with ~3/4 of the live enemy carriers
+striking it and the rest hunting the best secondary target, so the
+enemy focuses fire without always dogpiling one ship; launches are
+coordinated waves — one flight per carrier, staggered a few seconds
+(tighter at higher skill), arriving together instead of trickling in.
+Enemy carriers close to a 1400 ± 250 m standoff band around the player
+flagship and circle there (Hurricane's optimal-range circling,
+rescaled from 240 u × 5.74 m/u) at STANDARD instead of steaming into
+the fleet. Each enemy carrier's strike flights fly their own
+climb-out lane / altitude step so flights from different carriers
+never share a transit line. Skill tiers now differ in wave tempo,
+stagger, focus discipline and target quality (cadet ~50 s waves, 6 s
+stagger; veteran ~35 s, 3.5 s; elite ~22 s, 2 s) on top of the existing
+launch interval / aim error; jetMul/dmgMul stay unwired — wiring
+dmgMul would change bomb/missile damage, which the AD tuning forbade.
+
+v1.4.0: combat air patrol (CAP) — a standing defensive fighter
+patrol over the fleet, ordered per wing from Air Ops ("Launch CAP
+patrol"). One squadron per wing orbits a station 500 m out from its
+home carrier toward the nearest enemy carrier, 250 m above the deck
+(the flown orbit is ~350 m; the aim radius is 450 m because the jet
+cuts the corner chasing the moving aim point at cruise speed). When
+an inbound enemy strike flight closes within 1600 m of a live
+carrier of the defended side, the patrol breaks orbit and flies a
+pure-pursuit intercept (at the attacker's current position — no lead
+pursuit) and makes close-range gun passes: one probability roll
+(35%) per 2.5 s refractory window while inside 250 m, 4 passes per
+jet per sortie, 20 damage through the existing jet zone model. An
+attacker closing inside 400 m jinks (the existing SAM-evasion break);
+a gun hit in the dive forces an immediate pullout, and two hits
+abort the sortie outright — the flight egresses with its ordnance
+undelivered (counted, not dropped silently). CAP jets return to
+patrol when the target egresses, breaks off past 2200 m, or runs out
+of ammo, and RTB for relief after 240 s on station (the wing
+relaunches a fresh patrol while CAP is on); standing CAP down
+recalls the flight to trap and rearm. This is deliberately NOT the
+dogfighting kit (proposal 1, not chosen): no intercept/engage FSM,
+no skill table, no lead pursuit, no missiles, no flares, no return
+fire from the attackers — CAP is disruption and attrition, not a
+kill machine (one gun hit cannot kill a jet alone). Measured
+(v14-cap probes, 4v4 veteran, player parked + healed, 360 game-s
+each, 6 runs): bombs delivered 2.2/wave with no CAP vs 1.4/wave
+with CAP on the flagship's wing only vs 0.7/wave with CAP on all
+four wings; all-wings runs totalled 26 aborts and 100 ordnance
+denied, gun hit rate 0.33 pooled (68/205) vs the 0.35 design, and 0
+CAP gun kills — CAP disrupts, it does not kill outright. At a real
+cost: CAP jets stand inside the enemy SAM envelope for their whole
+patrol and lost 14–15 jets to SAM/CIWS per 360 s run with all four
+wings up (8–9 per run with one wing up; 0 with no CAP airborne in
+one baseline run, 4 in the other — all four deck jets lost with a
+carrier that died to collision damage, none airborne), so a standing
+patrol trades jets for blunted strikes. Most CAP flights end by
+losing both jets to AD on station rather than coming home — of 28
+cleanly measured intercepts in one all-wings run, 7 returned to
+patrol, 3 trapped for rearm, and 18 ended with the flight wiped out.
+Enemy CAP does not exist — the director was not changed and still
+commands strike flights only. Damage amounts, AD constants, physics
+and the director are unchanged.
+One bug found by the director probe and fixed with it: keep-out
+steering used to count same-side carriers, so the enemy flagship fled
+its own escorts (450 m slots, inside the 600 m trigger) and opened
+1641 → 3274 m at FULL — keep-out now only counts the opposite side.
+No dogfighting: the director commands strike flights only. Damage
+amounts, AD constants and the flight model are unchanged.
+
+v1.4.0: the helicarrier model is Nicholas's own STL (Helicarrier model by
+roboticide, Printables, CC BY-NC 4.0 — see assets/ASSETS.md), decimated
+169,723 → 35,667 triangles and meshopt-compressed (267,644 B, down from
+631,132 B). The sculpted hull, four detailed lift fans and the wedge
+island are the model itself — the v1.3.0 patch-up is gone: no inner hull
+core slab, no flat wedge pods, no blob island. The STL fans spin in
+place (lift-matched, diagonal pairs counter-rotating); the deck is the
+model's own sloped flight deck (bow −4.65 m, stern +0.86 m) with the
+Ford deck texture, centreline trench closed by an infill strip, and
+deck markings, island bridge/mast/radar/nav lights and duct caps placed
+on the model's measured geometry. Breakup pieces are genuine sections
+of this model, with the per-frame re-aimed clip planes and scorched
+caps from v1.3.2. All v1.3.0 features intact.
 
 v1.3.0: solid helicarrier models from every angle (closed inner hull core
 following the GLB's own keel profile, bow/stern caps, island coaming and
@@ -63,7 +186,14 @@ decodes them with `atob()` and feeds the bytes to `GLTFLoader.parseAsync`
   current positions, telegraph inherited — no lurch). Mode button cycles
   **FLEET** (flagship + escorts in formation) / **INDV** (selected ship
   only) / **ANCHOR** (selected ship holds, the rest are driven).
-- **Altitude:** `Q/E` or the ▲/▼ buttons, 200–600 m.
+- **Altitude:** `Q/E` or the ▲/▼ buttons, 200–600 m. **Pitch:** drag the
+  vertical pitch track beside the rudder (or ↑/↓) — nose up climbs, nose
+  down dives, ±12°, altitude hold resumes at the new altitude on release.
+  **Throttle:** drag the vertical throttle track right of the pitch track
+  (or `Shift+W/S`, or `+`/`−`) — collective-style rotor strength, stays
+  where left; 69% hovers, above it the excess lift climbs, below it she
+  sinks; it also drives rotor spin rate and the rotor hum, and couples
+  with forward speed.
 - **Waypoint:** click the minimap — the fleet steers there; manual rudder
   cancels it; arrival within 100 m clears it.
 - **Air wing:** Launch flight (bombs) / Launch flight (ASM) from the
@@ -148,13 +278,33 @@ and re-derived in metres.
   38.5 m amidships, beam 70 m) plus a vertical check (`|dy| < 70 m`, hull
   half-extent 35 m). A carrier counts as an obstacle while alive, while
   falling, and while sinking with `sinkT < 1` (Hurricane v11.41 rule:
-  wrecks stay solid while sinking); two wrecks do not collide, and
-  breakup pieces are debris, not obstacles. A falling carrier passing
-  through another carrier's airspace collides if the hulls overlap — its
-  vertical speed counts toward the closing speed. The 600 m keep-out
-  rudder (`game.js`) is prevention only: it must not be treated as the
-  collision system, and collisions are still detected and resolved when
-  carriers do meet.
+  wrecks stay solid while sinking); two wrecks do not collide with each
+  other. A falling carrier passing through another carrier's airspace
+  collides if the hulls overlap — its vertical speed counts toward the
+  closing speed, and (v1.4.0) so does the horizontal drift she carries
+  out of the fall. The 600 m keep-out rudder (`game.js`) is prevention
+  only: it must not be treated as the collision system, and collisions
+  are still detected and resolved when carriers do meet.
+- **v1.4.0 solidity rule — pieces are solid too:** every breakup piece
+  is a solid body in every state (falling, tumbling, sinking, drifting
+  apart): piece-vs-carrier and piece-vs-piece collisions are detected
+  and resolved in `js/collisions.js` alongside the carrier-carrier path,
+  over a 256 m uniform-grid broadphase (8 carriers + up to 48 pieces).
+  A piece's shape is an oriented box built from its real section bounds
+  (`segLo`/`segHi` in `carrier.js` — never its geometry AABB, which is
+  always full-ship because clipping is rasterisation-only): length is
+  the segment's horizontal projection (shrinks as the piece pitches up),
+  beam 70 m, vertical half-extent from pitch/roll. Narrowphase is 2-D
+  SAT plus a vertical interval check, resolved along the axis of least
+  penetration (horizontal shove, or a vertical lift when a piece lands
+  on a deck). A piece-vs-carrier hit damages only the carrier, in the
+  zone at the contact point, on the same KE scale (`3 + 0.6·v²`,
+  catastrophic ≥ 20 m/s breaks the carrier up); a piece-vs-piece hit
+  damages nothing — the pieces deflect, grind and separate. Both log
+  `piece-impact` / `piece-catastrophic` / `piece-grind` entries in
+  `G.collLog`. Probe handle: `window.__game.soliditySnapshot()` returns
+  every solid body plus the worst signed separation between any two
+  (negative = interpenetration).
 - **Consequences** (both sides, equal mass 10/10, so the damage splits
   evenly): zone damage at the impact point through the existing per-zone
   model (`carrier.js` `damage()` — hull/pods/deck as the contact point
@@ -393,19 +543,185 @@ overlay text unchanged and true, zero errors.
 - Enemy fleet AI steers its flagship at the player fleet and launches on
   timers; it does not pick targets tactically or recall wings.
 - Breakup pieces are clipping-plane clones, not true geometry splits;
-  a piece that clips through another piece is possible in a multi-piece split.
+  their COLLISION shape is the real section, not the clone geometry —
+  see the v1.4.0 solidity rule below.
 - Ocean wake uniforms only cover hulls near the water (flying carriers
   correctly skip them); sinking wrecks keep a wake slot until gone.
 - Bomb hit resolution uses the deck footprint only; a bomb that passes
   just beside the deck keeps falling to the sea (by design).
-- A falling carrier's horizontal position is frozen in the fall branch
-  (carrier.js), so a falling carrier only ever collides as a stationary
-  obstacle — its closing speed comes from the other hull and its own
-  vertical speed, not from carried horizontal momentum.
+- A falling carrier keeps the horizontal velocity she had when lift
+  failed (`fallVx`/`fallVz` in `carrier.js`, decaying slowly), so a
+  falling hull is a moving obstacle — the old frozen fall is gone.
 - Performance is untested beyond a headless load probe; 4v4 with all
   wings airborne is the heaviest case (~16 jets + 8 carriers).
 
-## v1.3.0 — solidity, fragmentation, refinement pass (staged — awaiting push)
+## v1.4.0 — STL model, mass-grounded physics, director / CAP / AD / wreckage / touch / dive-cam
+
+- **Helicarrier model (PRIORITY):** Nicholas's own STL (Helicarrier model by
+  roboticide, Printables, CC BY-NC 4.0 — see assets/ASSETS.md), decimated
+  169,723 → 35,667 triangles and meshopt-compressed (267,644 B, down from
+  631,132 B). The sculpted hull, four detailed lift fans and the wedge
+  island are the model itself — the v1.3.0 patch-up is gone: no inner hull
+  core slab, no flat wedge pods, no blob island. The STL fans spin in
+  place (lift-matched, diagonal pairs counter-rotating); the deck is the
+  model's own sloped flight deck (bow −4.65 m, stern +0.86 m) with the
+  Ford deck texture, centreline trench closed by an infill strip, and
+  deck markings, island bridge/mast/radar/nav lights and duct caps placed
+  on the model's measured geometry. Breakup pieces are genuine sections
+  of this model, with the per-frame re-aimed clip planes and scorched
+  caps from v1.3.2. Verified by rendered frames from top, bottom, both
+  sides, bow, stern and obliques plus a breakup frame: no slab, wedge or
+  blob from any angle.
+- **Flight physics — mass-grounded (120,000 t):** spool-up 0.45 /
+  spool-down 0.60 m/s² with a 4 s speed lag (0→FULL in ~39 s, stop from
+  FULL in ~31 s / ~274 m — measured 31.2 s / 272.1 m), banked lagged
+  turns (10° bank cap, turn rate falls with speed — 5.2°/s at FULL,
+  2.8°/s at FLANK), rudder slew 8°/s, mass-limited pitch (12° in
+  ~5.2 s, lever arms re-derived from the GLB's own pod centres: 65.1 m
+  pitch / 58.2 m roll), 6 s rotor spool (measured t63 7 s), altitude
+  hold capped +6/−5 m/s, hover threshold re-anchored 0.60 → 0.69 with
+  control authority scaling with lift. Formation escorts reworked for
+  the slow physics: catch-up is signed along-track (an escort ahead of
+  its slot slows down instead of speeding away), gain lowered 0.05 →
+  0.02, heading follows the flagship while it turns — the fleet forms
+  up from spawn and holds ~35–60 m in straight flight (measured escort
+  errors 25–40 m at form-up) with no collisions and the flagship's
+  speed steady. Known limit, unchanged by this pass: a hard 90° turn at
+  FULL still scatters the fleet ~1.2 km (slots swing at 42–82 m/s while
+  escorts top out at 22 m/s — geometrically unavoidable) and it stalls
+  ~800–1300 m off afterwards, needing manual recovery (Tab); scattered
+  escorts can blunder into each other or the flagship.
+- **Pitch fix + throttle track:** `user-select: none` on the whole HUD
+  (the first mouse drag used to select the UP/DN label text, and the
+  next drag died on a native text-drag pointercancel — rudder had the
+  same flaw), and pitch now commands vertical speed directly: full
+  pitch-up climbs at 1.25 m/s at hover, 3.9 m/s at FULL 16 m/s, up to
+  the 6 m/s clamp at FLANK (spec §7.3: climb = (|V|·0.8 + 6)·
+  sin(pitch), vy chasing it with a 5 s lag — the old code's 6 m/s at
+  hover was audit finding F13, fixed here; fresh merge-probe
+  measurement: 4 m gained in the first 5.6 s at hover, vy 0.97 m/s
+  and still ramping toward 1.25, pitch 12°, return to level on
+  release verified).
+- **Air-defence tuning (proposal 2):** SAM_DMG 55 → 40 (one SAM no
+  longer primes a zone for a single CIWS follow-up kill), SAM turn
+  3 → 3.5 rad/s, flare decoy 0.5 → 0.4, CIWS_HIT_P_JET 0.08 → 0.06,
+  and the `samsHit` counter fixed (was always 0). Measured over 10
+  clean strike flights (fresh re-run on the final tree): AD losses
+  0.60/flight — the pass-3 sample measured 0.40 and the v1.3.0
+  baseline 0.6, so the loss mean varies run to run and the tuning's
+  stable effects are elsewhere: SAM connect 35.5% (pass 3: 40%;
+  baseline ~27%), bombs intercepted 14% (was 25%), bombs 31/31
+  logged hit, target died 7/10. All 6 fresh losses were SAM wing
+  kills; CIWS did damage but killed nothing in this sample. Bomb
+  damage, zone HP, reload, ranges and skill tiers unchanged.
+- **Bomb accuracy / round length (proposal 4):** FIRE_DRAIN_RATE 2.0
+  → 1.2 HP/s (new const) — the round-length lever: at 2.0 a reactor
+  fire finished what 2–4 bomb hits started in 9/10 flights. Over 5
+  full 4v4 rounds: rounds +30% longer on average (376 → 489 game s),
+  bombs hit/logged 97.9%, 3W–2L (baseline 1W–4L), per-round AD
+  attrition down ~30% but still meaningful. Knock-on: mid-air
+  collisions rose (22 jets over 5 rounds vs 4 — jets survive AD
+  longer, so more are airborne at once); not touched here.
+- **Enemy AI director (proposal 3):** tactical now (was a launch timer
+  + nearest target + a beeline at the player flagship). Target
+  selection scores damage, crippled lift, fires, isolation and
+  distance, with skill-scaled noise; one fleet-wide focus target held
+  for a skill-scaled window, ~3/4 of live enemy carriers striking it;
+  launches are coordinated waves (one flight per carrier, staggered
+  a few seconds, tighter at higher skill) arriving together. Enemy
+  carriers close to a 1400 ± 250 m standoff band around the player
+  flagship and circle there at STANDARD instead of steaming into the
+  fleet; each carrier's flights fly their own climb-out lane /
+  altitude step. Skill tiers now differ in wave tempo, stagger, focus
+  discipline and target quality (cadet ~50 s waves, 6 s stagger;
+  veteran ~35 s, 3.5 s; elite ~22 s, 2 s). Measured (4v4 veteran,
+  player parked): standoff 13/15 samples in band (median 1583 m),
+  27 launches in 8 waves, 7/8 focus-fire waves; fresh re-run on the
+  final tree confirms it (11/12 in band, median 1578 m, 25 launches
+  in 7 waves, 6/7 focus-fire waves). Also fixed: keep-out
+  steering used to count same-side carriers, so the enemy flagship
+  fled its own escorts — keep-out now only counts the opposite side.
+  jetMul/dmgMul stay unwired (wiring dmgMul would change bomb/missile
+  damage, which the AD tuning forbade). Damage amounts, AD constants
+  and the flight model unchanged.
+- **Combat air patrol (proposal 7):** a standing defensive fighter
+  patrol over the fleet, ordered per wing from Air Ops. One squadron
+  per wing orbits a station 500 m out from its home carrier toward
+  the nearest enemy carrier, 250 m above the deck. When an inbound
+  enemy strike flight closes within 1600 m of a live carrier of the
+  defended side, the patrol breaks orbit and makes close-range gun
+  passes (35% per 2.5 s window inside 250 m, 4 passes per jet per
+  sortie, 20 damage through the jet zone model); a gun hit in the
+  dive forces an immediate pullout, two hits abort the sortie
+  outright. Measured (4v4 veteran, 360 game-s runs): bombs delivered
+  2.2/wave with no CAP vs 1.4/wave with CAP on one wing vs 0.7/wave
+  with CAP on all four wings; all-wings runs totalled 26 aborts and
+  100 ordnance denied, gun hit rate 0.33 pooled vs the 0.35 design,
+  0 CAP gun kills — CAP disrupts, it does not kill outright. At a
+  real cost: CAP jets stand inside the enemy SAM envelope for their
+  whole patrol and lost 14–15 jets to SAM/CIWS per 360 s run with all
+  four wings up. Enemy CAP does not exist — the director still
+  commands strike flights only. This is deliberately NOT dogfighting
+  (proposal 1, not chosen): no intercept/engage FSM, no skill table,
+  no lead pursuit, no missiles, no flares, no return fire.
+- **Floating wreckage (proposal 9):** sunk carriers leave drifting
+  debris fields and oil slicks that stay on the sea for the rest of
+  the round. Measured (fresh re-run): 6 fields / 30 chunks / 6 slicks
+  present at +30 s, growing to 12 / 48 / 12 by +120 s as more ships
+  sank, and all still present at +300 s; wreck update 1.45 ms.
+- **Touch refinements (proposal 11):** floating rudder (thumb lands =
+  centre, centre-follow past the ring, 3 mm dead zone, spring-back on
+  release, lost-pointer-capture recovery), every in-round button ≥
+  48 px hit area, haptics only on meaningful events (kill once,
+  own-loss pattern, freak wave, round end — silent for telegraph /
+  camera / waypoint), tap-vs-drag disambiguation (4 mm), pinch zoom
+  with a 2 mm jitter gate and survivor-orbit on finger release,
+  third-finger telegraph taps mid-steer, mute kills haptics. One
+  pointer registry for the whole HUD (rudder + pitch + throttle +
+  orbit + pinch-partner); the legacy Touch Events pinch listeners are
+  deleted. Verified headless at 390×844 (CDP touch, fresh re-run on
+  the final tree): 20/20 spec tests pass, zero console errors, zero
+  failed requests. (An earlier run showed T18 pinch and T22 perf
+  failing; both pass on re-run — T18 was a probe read racing the
+  input dispatch, and T22's headless fps baseline varies 6.8–84 fps
+  run to run under SwiftShader, so the metric is not reproducible
+  headless; the touch input path itself adds no per-frame allocation.)
+- **Dive camera (proposal 14):** spectate a sinking wreck, then dive
+  the camera under the surface (U) to watch it go down — underwater
+  fog, tint and wash; surface (U) returns, tactical camera and reset
+  both exit dive mode. Verified: dive/surface/tactical-exit/reset-exit
+  all pass, underwater frame 87% blue.
+- **Solidity rule — pieces are solid too:** every breakup piece is a
+  solid body in the collision system, so pieces never phase through
+  each other or a live carrier in any state. The 09:18 mass-discipline
+  change (F15 separation cap, 2 m/s per side) regressed this — deep
+  overlaps took seconds to clear (worst −26.57 m). Fix pass (same
+  day): positional correction is exempt from the cap — it is a
+  constraint projection, not a velocity, so it cannot cause a glide,
+  shove or freeze (all velocity responses stay capped/gated); and
+  carrier-carrier detection now uses the same full-hull OBB SAT the
+  solidity snapshot measures (the old tapered circles ended 5.3 m
+  short of each bow tip, letting visual bow tips interpenetrate up to
+  ~10.6 m while the circles just touched). Re-verified 2026-11-25:
+  solid-a/b/c and solid-regress 0 violations on two consecutive runs
+  each (worst min-gap −0.28 m), fragmass dense 0 violations; full
+  17-probe sweep re-run clean on the fixed tree.
+- **Fragmentation realism + mass discipline:** breakups are progressive
+  (cracking → hinge → sequential release over ~1.5–2.3 s, hinge
+  3.8–6.2°), cuts are seeded and jagged with torn petals / bent flaps
+  on the caps, cut-face venting and debris shedding are pool-guarded;
+  pieces tumble with mass-capped rates and inherit the carrier's
+  momentum (falling hulls keep their horizontal drift; INDV/ANCHOR
+  stops are damped, not instant). Verified: detonation 5 pieces,
+  silhouette sum 333 m (one 333 m ship, no duplicates); wreck
+  freeboard error ≤0.05 m; piece yaw rates inside their caps.
+- **Verification (final sweep, 2026-11-25):** boot 8/8 alive, zero
+  console errors, zero failed requests on every probe page. Probe
+  results in `~/workspace/probe-helicarriers/v14-*.json` (fresh
+  re-runs) with per-item notes in
+  `~/workspace/goals/helicarriers-at-sea-game/hidden_files/`.
+
+## v1.3.0 — solidity, fragmentation, refinement pass (folded into the v1.4.0 push)
 
 - **Solid models (v1.2.1 work, folded in):** the GLB hull is open shell
   patches — the mid-body side band was open and the belly hollow (rays

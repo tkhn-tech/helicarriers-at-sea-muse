@@ -1,42 +1,61 @@
-// airdefense.js — Helicarriers at Sea v1.3.0: NavalAirDefenseSystem
+// airdefense.js — Helicarriers at Sea v1.4.0: NavalAirDefenseSystem
 // (Hurricane v11.25, rescaled to metres — Hurricane ran 1 unit ≈ 5.74 m,
 // so its constants are NOT copied literally):
 //   CIWS_RANGE 120u -> 120*5.74 = 689 m -> 700 m
 //   SAM_RANGE  280u -> 280*5.74 = 1607 m -> 1600 m
 //   SAM_SPEED  85 u/s -> 85*5.74 = 488 m/s -> 480 m/s
-//   CIWS_BURST_T 0.14 s, CIWS_HIT_P 0.08, CIWS_DMG 12, SAM_DMG 55,
-//   SAM_RELOAD_T 6 s, max 2 SAMs out per carrier — all verbatim numbers,
+//   CIWS_BURST_T 0.14 s, CIWS_DMG 12 — verbatim numbers (CIWS_HIT_P_JET
+//   was 0.08 verbatim, cut to 0.06 in the v1.4.0 retune below),
 //   only the ranges/speeds are rescaled (they were distances).
+// v1.4.0 (items 2+4) AD retune — SAMs more numerous and reliable but
+// less spiky, so per-flight jet losses stop being a lottery (v1.3.0
+// baseline: 0,0,0,0,0,2,1,0,1,2 per flight — 6/10 untouched, 2/10 wiped):
+//   SAM_DMG 55 -> 40: one SAM no longer primes a wing/engine for a
+//     single CIWS follow-up kill (wing 48+14.4=62 < 80; engine 60+18=78
+//     < 90; fuel 40 < 50, so no ignite). A kill now needs two SAMs on
+//     one zone, or a SAM plus several CIWS hits on the same zone.
+//   SAM turn authority 3 -> 3.5 rad/s, flare decoy 0.5 -> 0.4: SAMs
+//     connect more often than v1.3.0's ~27% without becoming unavoidable.
+// PASS 2 (measured): volume back at v1.3.0 levels (reload 6, max-out 2,
+//   prox 25) with SAM_DMG 40 + turn 3.5 + decoy 0.4 — SAM damage events
+//   4.2/flight (vs 2.9 baseline), connect 39% (vs 27%). AD losses
+//   0.90/flight (2,0,0,1,1,2,1,1,0,1), still above baseline 0.6, and
+//   flights 7–8 showed the remaining killer is pure CIWS concentration:
+//   the nearest jet eats ~16 of ~22 CIWS hits and 6–8 of them land on
+//   one wing (6 × 14.4 = 86 > 80). So PASS 3 cuts CIWS_HIT_P_JET
+//   0.08 -> 0.06 (ordnance probability untouched at 0.04): fewer hits
+//   overall, and P(≥6 hits on one wing) falls ~3×. CIWS damage stays 12.
+//   CIWS range / burst time / ordnance probability are unchanged.
 // Active on BOTH sides (Hurricane's player-side code existed but was
 // never exercised — here enemy jets exist, so player carriers defend
-// too). Tuned conservatively: CIWS vs ordnance is half as likely to hit
-// as vs jets, SAMs prefer jets and only take ordnance when no jet is in
-// range, and a SAM hit (55) cannot one-shot a jet zone (wing 80, engine
-// 90 — see jets.js). SAM/CIWS damage feeds the jet zone model, never
-// instant-kills.
+// too). SAM/CIWS damage feeds the jet zone model, never instant-kills.
 import * as THREE from 'three';
 
 export const CIWS_RANGE = 700;
 export const SAM_RANGE = 1600;
 export const CIWS_BURST_T = 0.14;
-export const CIWS_HIT_P_JET = 0.08;
+export const CIWS_HIT_P_JET = 0.06;
 export const CIWS_HIT_P_ORD = 0.04;
 export const CIWS_DMG = 12;
-export const SAM_DMG = 55;
+export const SAM_DMG = 40;
 export const SAM_SPEED = 480;
 export const SAM_RELOAD_T = 6;
 export const SAM_MAX_OUT = 2;
 export const SAM_PROX = 25; // proximity detonation radius, m
+export const SAM_TURN_RATE = 3.5; // rad/s steering authority
+export const SAM_FLARE_DECOY_P = 0.4; // chance a flaring jet decoys a SAM
 
 // One VLS SAM in flight (Hurricane SamMissile): vertical launch, then
 // homes with predictive lead (0.3 s), proximity detonation. Flares can
-// decoy it: when the target dumps flares, the SAM has a 50% chance to
-// chase the flare burst instead and fizzle.
+// decoy it: when the target dumps flares, the SAM has a chance
+// (SAM_FLARE_DECOY_P, v1.4.0: 0.4, was 0.5) to chase the flare burst
+// instead and fizzle.
 export class SamMissile {
-  constructor(scene, fromCarrier, target, ctx) {
+  constructor(scene, fromCarrier, target, ctx, adSys) {
     this.fromCarrier = fromCarrier;
     this.target = target;
     this.ctx = ctx;
+    this.adSys = adSys || null; // AirDefenseSystem — owns stats.samsHit
     this.x = fromCarrier.x; this.y = fromCarrier.y + 10; this.z = fromCarrier.z;
     this.vx = 0; this.vy = 60; this.vz = 0;
     this.speed = SAM_SPEED;
@@ -74,7 +93,7 @@ export class SamMissile {
     // off. Decided once, at the moment the SAM is inside 600 m.
     if (!this.decoyed && tgt.flareT > 0 && this.t > 0.5) {
       const d0 = Math.hypot(tgt.x - this.x, tgt.y - this.y, tgt.z - this.z);
-      if (d0 < 600 && Math.random() < 0.5) {
+      if (d0 < 600 && Math.random() < SAM_FLARE_DECOY_P) {
         this.decoyed = true;
         this.decoyPt = { x: tgt.x, y: tgt.y - 20, z: tgt.z };
       }
@@ -89,13 +108,14 @@ export class SamMissile {
     const dx = tx - this.x, dy = ty - this.y, dz = tz - this.z;
     const d = Math.hypot(dx, dy, dz) || 0.001;
     // Turn authority: the SAM cannot turn instantly — it steers toward
-    // the aim point at up to 3 rad/s, so a hard-breaking jet can out-turn it.
+    // the aim point at up to SAM_TURN_RATE rad/s, so a hard-breaking jet
+    // can out-turn it.
     const sp = this.speed;
     const ux = dx / d, uy = dy / d, uz = dz / d;
     const cl = Math.hypot(this.vx, this.vy, this.vz) || 1;
     const cvx = this.vx / cl, cvy = this.vy / cl, cvz = this.vz / cl;
     const ang = Math.acos(Math.max(-1, Math.min(1, cvx * ux + cvy * uy + cvz * uz)));
-    const k = ang > 1e-6 ? Math.min(1, (3 * dt) / ang) : 1;
+    const k = ang > 1e-6 ? Math.min(1, (SAM_TURN_RATE * dt) / ang) : 1;
     let nx = cvx + (ux - cvx) * k, ny = cvy + (uy - cvy) * k, nz = cvz + (uz - cvz) * k;
     const nl = Math.hypot(nx, ny, nz) || 1;
     this.vx = nx / nl * sp; this.vy = ny / nl * sp; this.vz = nz / nl * sp;
@@ -116,13 +136,18 @@ export class SamMissile {
   }
   detonate() {
     const tgt = this.target;
+    // v1.4.0: proximity detonation IS a hit — count it. (stats.samsHit
+    // was always 0 before: detonate() never incremented it.)
+    if (this.adSys) this.adSys.stats.samsHit++;
     this.ctx.vfx.burst(this.x, this.y, this.z, 30, [1, 0.7, 0.3], 8, 4);
     this.ctx.vfx.spawnSprite(this.x, this.y, this.z, 0.5, 18, 18, 2, 0xff8c2e, 0.9);
     if (this.ctx.audio) this.ctx.audio.boom(false);
     if (this.ctx.noteDetonation) this.ctx.noteDetonation(this.x, this.y, this.z, 'sam');
     if (tgt && tgt.damageZone) {
       // SAM damage feeds the jet zone model (jets.js): random zone,
-      // never an instant kill. A jet survives one SAM barely.
+      // never an instant kill. v1.4.0: one SAM (40) leaves a wing at
+      // 32 HP / an engine at 30 HP — dangerous, but it takes a second
+      // hit on the same zone (or several CIWS hits) to finish it.
       const zones = ['wingL', 'wingR', 'engineL', 'engineR', 'fuselage', 'fuel'];
       tgt.damageZone(SAM_DMG, zones[Math.floor(Math.random() * zones.length)], 'sam', this.ctx);
     } else if (tgt && tgt.splash) {
@@ -219,7 +244,7 @@ export class AirDefenseSystem {
     ad.samT = SAM_RELOAD_T;
     ad.samsOut++;
     this.stats.samsFired++;
-    const sam = new SamMissile(ctx.scene, carrier, tgt, ctx);
+    const sam = new SamMissile(ctx.scene, carrier, tgt, ctx, this);
     this.sams.push(sam);
     ctx.vfx.spawnSprite(carrier.x, carrier.deckTopY() + 4, carrier.z, 0.8, 20, 20, 0.8, 0xffffff, 0.7);
     if (ctx.audio) ctx.audio.samLaunch();

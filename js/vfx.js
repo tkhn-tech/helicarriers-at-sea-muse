@@ -57,6 +57,12 @@ export class VFX {
     scene.add(this.boomLight);
     this.shake = 0;
   }
+  // v1.4.0: live-pool counts, for emission guards (cut-face venting
+  // halves/stops under pool pressure — research §5). Cheap scans of
+  // the pool state; callers check before emitting, never assume a
+  // spawn survives.
+  liveParticles() { let n = 0; for (const p of this.parts) if (p.life > 0) n++; return n; }
+  liveSprites() { let n = 0; for (const s of this.spritePool) if (s.life > 0) n++; return n; }
   spawnParticle(x, y, z, vx, vy, vz, life, r, g, b, grav = 0) {
     const p = this.parts[this.pCursor];
     this.pCursor = (this.pCursor + 1) % P_MAX;

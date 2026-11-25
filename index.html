@@ -4,14 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>Helicarriers at Sea — v1.3.0</title>
+<title>Helicarriers at Sea — v1.4.0</title>
 <style>
   html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0b1c26;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#dfeef5;}
   #app{position:fixed;inset:0;}
   canvas{display:block;touch-action:none;}
   #hud *{box-sizing:border-box;}
   .panel{background:rgba(8,24,34,.82);border:1px solid rgba(140,200,230,.25);border-radius:10px;backdrop-filter:blur(3px);}
-  #hud{position:fixed;inset:0;pointer-events:none;display:none;z-index:5;}
+  #hud{position:fixed;inset:0;pointer-events:none;display:none;z-index:5;
+    /* v1.4.0 pitch fix (cause A): no selectable text anywhere on the
+       HUD. The first mouse drag on the pitch/rudder track used to select
+       the UP/DN (PORT/STBD) label text; the next drag then started a
+       native text drag-and-drop, which fired pointercancel and killed
+       the track until something cleared the selection. user-select:none
+       on the whole HUD fixes both tracks (and every readout/button)
+       at once; touch was never affected. */
+    user-select:none;-webkit-user-select:none;}
   #hud.on{display:block;}
   /* v1.1.0 HUD rework — Hurricane Fleet's anchored layout: a top pill bar
      (reserving the minimap corner in BASE css, not a breakpoint, per
@@ -20,7 +28,7 @@
      telegraph docked bottom-right, horizontal rudder track bottom-left.
      Nothing is centred-bottom or free-floating any more, so no two
      elements can pile up on a phone portrait screen. */
-  .hudTop{position:fixed;left:0;right:0;top:0;display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start;
+  .hudTop{position:fixed;left:0;right:0;top:0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
     padding:calc(8px + env(safe-area-inset-top)) calc(168px + env(safe-area-inset-right)) 0 10px;pointer-events:none;z-index:5;}
   .pill{background:rgba(6,18,30,.72);border:1px solid rgba(140,190,230,.25);border-radius:999px;
     padding:6px 11px;font-size:12.5px;font-weight:650;backdrop-filter:blur(6px);white-space:nowrap;}
@@ -62,7 +70,8 @@
   #airOpsPanel .aoHead{display:flex;justify-content:space-between;align-items:center;font-size:9px;letter-spacing:.12em;
     text-transform:uppercase;color:#ffd166;font-weight:800;margin-bottom:5px;}
   #airOpsPanel.collapsed .aoBody{display:none;}
-  #airOpsPanel .aoBtn{display:block;width:100%;text-align:left;margin-bottom:4px;}
+  #airOpsPanel .aoBtn{display:block;width:100%;text-align:left;margin-bottom:4px;min-height:48px;padding:12px;}
+  #airOpsPanel .aoBtn.on{border-color:#ffd166;color:#ffd166;}
   #airOpsPanel .aoBtn:last-child{margin-bottom:0;}
   #airOpsPanel .aoRow2{display:flex;gap:4px;margin-bottom:4px;}
   #airOpsPanel .aoRow2 .aoBtn{flex:1;margin-bottom:0;text-align:center;}
@@ -71,17 +80,72 @@
   #telePanel .teleHead span{color:#e8f1f8;font-size:11px;}
   .teleBtns{display:grid;grid-template-columns:1fr 1fr;gap:3px;}
   .teleBtn{background:rgba(255,255,255,.06);border:1px solid rgba(140,190,230,.25);color:#cfe2ef;
-    border-radius:8px;padding:4px 1px;font-size:9.5px;font-weight:700;letter-spacing:.03em;cursor:pointer;pointer-events:auto;}
+    border-radius:8px;padding:6px 1px;font-size:9.5px;font-weight:700;letter-spacing:.03em;cursor:pointer;pointer-events:auto;
+    min-height:48px;}
+  /* v1.4.0 (item 7, touch spec §4): hit areas — every in-round
+     control gets an invisible hit area of at least 48×48 CSS px;
+     the visible graphic does not change. Telegraph / Air Ops /
+     tele-step buttons grow visibly (min-height:48px) because they
+     are full-width rows where invisible padding would overlap the
+     neighbour; the small pills/toggles grow invisibly (::before)
+     where space allows, keeping ≥8 px between neighbouring hit areas. */
   .teleBtn.astern{color:#9db8cc;}
   .teleBtn.on{background:#ffd166;color:#1a2a1a;border-color:#ffd166;}
   .teleStep{display:flex;gap:6px;margin-top:4px;}
-  .teleStep button{flex:1;padding:4px 0;font-size:12px;font-weight:800;}
+  .teleStep button{flex:1;padding:4px 0;font-size:12px;font-weight:800;min-height:48px;}
+  /* v1.4.0 (item 7, touch spec §4): pause/mute pills are only ~18 px
+     tall visibly — their hit area grows invisibly to 48 px tall
+     (::before, vertical only: the pills are already ≥48 px wide and
+     sit 6 px apart, so horizontal padding would swallow the
+     neighbour). Panel toggles (#fleetToggle, #aoToggle) are ~18×18
+     visibly — theirs grows to 44×48 (44 is the Apple/WCAG floor;
+     48 wide would swallow the panel heading text). Fleet rows grow
+     visibly to 48 px tall on phones (desktop rows are already ~50). */
+  .miniBtn{position:relative;}
+  /* v1.4.0 (item 7, touch spec §4): the pause/mute pills are genuinely
+     44 px tall (the 44 px floor) — NOT via ::before padding, because
+     .hudTop is scrollable (overflow-x:auto), which forces vertical
+     clipping: a ::before extending 15 px below the pill is cut off at
+     the bar's edge, leaving only ~31 px of hit area (probed 2026-11-25).
+     The ::before below only adds horizontal slop (±4 px; the pills sit
+     6 px apart, so wider padding would swallow the neighbour) plus
+     whatever vertical slop fits inside the bar. */
+  .miniBtn.pill{min-height:44px;padding:0 10px;}
+  .miniBtn.pill::before{content:'';position:absolute;inset:-15px -4px;pointer-events:auto;}
+  #fleetToggle::before,#aoToggle::before{content:'';position:absolute;inset:-15px -13px;pointer-events:auto;}
   #teleSub{margin-top:4px;font-size:10px;color:#9db8cc;text-align:center;line-height:1.5;}
   #teleSub b{color:#ffd166;}
   button{pointer-events:auto;background:#16405a;color:#eaf6ff;border:1px solid #3d7ea6;border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer;}
   button:hover{background:#1f5578;} button:disabled{opacity:.4;cursor:default;}
   button.warn{background:#5a2a16;border-color:#a65a3d;} button.go{background:#14532d;border-color:#3d9a5a;}
-  /* v11.0: the helm is a horizontal rudder track — the stick only swings left/right. */
+  /* v1.4.0 (item 7, touch spec §2): the floating-rudder zone —
+     left 45% of the viewport × bottom 40%, minus the fleet panel
+     (the panel and the pitch/throttle tracks sit above it in DOM
+     order at the same z-index, so their touches still reach them).
+     Transparent, touch-action:none, owns the rudder touches in
+     floating mode; inert (.fixed) in fixed mode. Hidden until the
+     HUD is on. */
+  #joyZone{position:fixed;left:0;bottom:0;width:45vw;height:40vh;z-index:4;pointer-events:auto;
+    touch-action:none;background:transparent;display:none;}
+  /* z-index 4 is deliberate: above the canvas (so the zone owns the
+     touches there) but BELOW #hud (z-index 5, a stacking context),
+     so the pitch/throttle tracks, fleet panel and dock — all inside
+     #hud — still receive their own touches over the zone. */
+  #hud.on ~ #joyZone{display:block;}
+  #joyZone.fixed{pointer-events:none;}
+  /* Floating rudder base (spec §2.3/§2.4): a 120 px ring (2×R_MAX)
+     centred on the touch-down point, moved with centre-follow; the
+     knob travels at most R_MAX − 22 = 38 px. At rest it is a ghost
+     ring at 18% opacity at the last used centre, so the control stays
+     findable; in fixed mode #joy keeps its v1.3.0 track look and
+     pointer-events. */
+  #joy.float{width:120px;height:120px;border-radius:50%;pointer-events:none;}
+  #joy.float.ghost{opacity:.18;}
+  #joy{transition:opacity .3s;}
+  /* v1.4.0 (item 8): underwater wash (Hurricane v11.5) — a fullscreen
+     tint that fades in when the dive camera goes under. */
+  #waterTint{position:fixed;inset:0;z-index:8;pointer-events:none;opacity:0;transition:opacity .4s;
+    background:radial-gradient(ellipse at 50% 40%, rgba(10,60,70,.28), rgba(4,25,35,.62));}
   #joy{position:fixed;left:14px;bottom:calc(14px + env(safe-area-inset-bottom));z-index:6;width:216px;height:62px;border-radius:32px;
     background:rgba(6,18,30,.45);border:1px solid rgba(140,190,230,.35);backdrop-filter:blur(4px);touch-action:none;pointer-events:auto;}
   #joyKnob{position:absolute;left:50%;top:50%;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;
@@ -101,6 +165,18 @@
   .pitchLab{position:absolute;left:0;right:0;text-align:center;font-size:9px;letter-spacing:.1em;color:#9db8cc;font-weight:800;pointer-events:none;}
   #pitchReadout{position:fixed;left:242px;bottom:calc(132px + env(safe-area-inset-bottom));z-index:6;
     font-size:12px;font-weight:800;letter-spacing:.08em;color:#8fd4f5;text-shadow:0 1px 6px rgba(0,0,0,.8);pointer-events:none;white-space:nowrap;}
+  /* v1.4.0 throttle track — vertical collective-style drag right of the
+     pitch track, same visual family (rounded track, knob, ticks,
+     labels). Drag up = more rotor strength, drag down = less; it stays
+     where it is left (NOT spring-return). 69% hovers. */
+  #thrTrack{position:fixed;left:310px;bottom:calc(14px + env(safe-area-inset-bottom));z-index:6;width:56px;height:110px;border-radius:28px;
+    background:rgba(6,18,30,.45);border:1px solid rgba(140,190,230,.35);backdrop-filter:blur(4px);touch-action:none;pointer-events:auto;}
+  #thrKnob{position:absolute;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%, #ffe9a8, #d9a93b 60%, #8a6d1f);box-shadow:0 4px 14px rgba(0,0,0,.5);pointer-events:none;}
+  .thrTick{position:absolute;left:8px;right:8px;height:2px;background:rgba(140,190,230,.4);pointer-events:none;}
+  .thrLab{position:absolute;left:0;right:0;text-align:center;font-size:9px;letter-spacing:.1em;color:#9db8cc;font-weight:800;pointer-events:none;}
+  #thrReadout{position:fixed;left:310px;bottom:calc(132px + env(safe-area-inset-bottom));z-index:6;
+    font-size:12px;font-weight:800;letter-spacing:.08em;color:#ffd166;text-shadow:0 1px 6px rgba(0,0,0,.8);pointer-events:none;white-space:nowrap;}
   #hint{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(10px + env(safe-area-inset-bottom));z-index:5;
     pointer-events:none;font-size:11.5px;color:#9db8cc;text-shadow:0 1px 6px rgba(0,0,0,.8);text-align:center;
     max-width:calc(100vw - 430px);}
@@ -138,7 +214,7 @@
     #msg{left:8px;transform:none;top:calc(50px + env(safe-area-inset-top));max-width:calc(100vw - 140px);white-space:normal;text-align:center;line-height:1.35;font-size:12px;}
     #fleetPanel{width:104px;left:8px;top:calc(100px + env(safe-area-inset-top));padding:5px;max-height:calc(100dvh - 340px);}
     #fleetPanel .panelHead{font-size:9px;margin-bottom:3px;}
-    .carrierRow{padding:3px 4px;margin:4px 0;display:flex;align-items:center;gap:4px;}
+    .carrierRow{padding:3px 4px;margin:4px 0;display:flex;align-items:center;gap:4px;min-height:48px;}
     .carrierRow h4{margin:0;flex:1;display:flex;align-items:center;gap:4px;min-width:0;}
     .carrierRow .nm,.carrierRow .hp,.carrierRow .zones,.carrierRow .bar{display:none;}
     .carrierRow .fic{display:inline;font-size:12px;flex:none;}
@@ -162,6 +238,9 @@
     #pitchTrack{left:200px;bottom:calc(12px + env(safe-area-inset-bottom));width:48px;height:96px;}
     #pitchKnob{width:36px;height:36px;margin:-18px 0 0 -18px;}
     #pitchReadout{left:200px;bottom:calc(114px + env(safe-area-inset-bottom));font-size:11px;}
+    #thrTrack{left:256px;bottom:calc(12px + env(safe-area-inset-bottom));width:48px;height:96px;}
+    #thrKnob{width:36px;height:36px;margin:-18px 0 0 -18px;}
+    #thrReadout{left:256px;bottom:calc(114px + env(safe-area-inset-bottom));font-size:11px;}
     #hint{display:none;}
     #debugPanel{left:8px;right:auto;top:calc(262px + env(safe-area-inset-top));width:150px;max-height:calc(100dvh - 500px);overflow:auto;}
   }
@@ -210,9 +289,11 @@
       <div class="aoBody">
         <button id="btnLaunchBomb" class="aoBtn go">✈ Launch flight (bombs)</button>
         <button id="btnLaunchAsm" class="aoBtn go">✈ Launch flight (ASM)</button>
+        <button id="btnCap" class="aoBtn">🛡 Launch CAP patrol</button>
         <button id="btnRecall" class="aoBtn">Recall wings</button>
         <button id="btnTarget" class="aoBtn">Target: nearest</button>
         <button id="btnCam" class="aoBtn">Camera: fleet [C]</button>
+        <button id="btnDive" class="aoBtn">🌊 Dive cam [U]</button>
         <div class="aoRow2">
           <button id="btnAltUp" class="aoBtn">▲ Alt</button>
           <button id="btnAltDn" class="aoBtn">▼ Alt</button>
@@ -241,6 +322,12 @@
   </div>
   <div id="rudderReadout">RUDDER 0°</div>
   <div id="pitchReadout">PITCH 0°</div>
+  <div id="thrReadout">THR 69%</div>
+  <div id="thrTrack">
+    <span class="thrTick" style="top:25%"></span><span class="thrTick" style="top:50%"></span><span class="thrTick" style="top:75%"></span>
+    <span class="thrLab" style="top:4px">MAX</span><span class="thrLab" style="bottom:4px">IDLE</span>
+    <div id="thrKnob"></div>
+  </div>
   <div id="pitchTrack">
     <span class="pitchTick" style="top:25%"></span><span class="pitchTick" style="top:50%"></span><span class="pitchTick" style="top:75%"></span>
     <span class="pitchLab" style="top:4px">UP</span><span class="pitchLab" style="bottom:4px">DN</span>
@@ -251,14 +338,16 @@
     <span class="joyLab" style="left:10px">PORT</span><span class="joyLab" style="right:10px">STBD</span>
     <div id="joyKnob"></div>
   </div>
-  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · <kbd>P</kbd>/<kbd>Esc</kbd> pause · click a carrier to follow it · click a falling carrier to watch her go down</div>
+  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>Shift+W/S</kbd> or <kbd>+</kbd>/<kbd>−</kbd> throttle · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · <kbd>U</kbd> dive camera · <kbd>P</kbd>/<kbd>Esc</kbd> pause · click a carrier to follow it · click a falling carrier to watch her go down</div>
 </div>
+<div id="joyZone"></div>
+<div id="waterTint"></div>
 
 <div id="pauseOverlay"><div id="pauseCard" class="panel"><h2>⏸ PAUSED</h2><p id="pauseText">The fleet holds position. The sea keeps moving.</p><button id="btnResume" class="go">▶ Resume</button><button id="btnRestart">↻ Restart round</button><button id="btnMenu">☰ Back to menu</button></div></div>
 
 <div id="menu"><div id="menuCard" class="panel">
   <h1>HELICARRIERS <span>AT SEA</span></h1>
-  <p class="sub">v1.3.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result.</p>
+  <p class="sub">v1.4.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: mass-grounded flight physics for the 120,000 t carriers (slow spool, banked lagged turns, mass-limited pitch, 6 s rotor spool), a pitch fix that makes pitch-up climb for real, and a collective-style throttle track that drives rotor strength, lift and climb (69% hovers). Also: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result. Sunk carriers leave drifting debris and oil slicks that stay on the sea for the rest of the round.</p>
   <p class="hint" id="bestLine">No rounds played yet — your best result will be remembered here.</p>
   <div class="pick"><label>Fleet size (you)</label><div class="seg" id="segPlayerFleet">
     <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4" class="on">4</button></div></div>
@@ -273,6 +362,9 @@
     <button data-v="C" class="on">Cruising (wedge)</button><button data-v="A">Attack (line)</button></div></div>
   <div class="pick"><label>Cruise altitude</label><select id="selAlt"><option value="300">300 m</option><option value="350" selected>350 m</option><option value="450">450 m</option><option value="550">550 m</option></select></div>
   <div class="pick"><label>Enemy attacks</label><select id="selEnemyAI"><option value="auto" selected>Automatic (enemy launches on its own)</option><option value="passive">Passive (enemy never launches — target practice)</option></select></div>
+  <div class="pick"><label>Rudder stick</label><div class="seg" id="segJoyMode">
+    <button data-v="float">Floating</button><button data-v="fixed">Fixed</button></div></div>
+  <p class="hint">Floating (default on touch screens): touch down anywhere bottom-left to steer — the stick appears under your thumb. Fixed: the classic track. Sound off also silences vibration.</p>
   <button id="startBtn" class="go">▶ &nbsp;LAUNCH THE FLEET</button>
   <p class="hint" style="margin-top:12px;">Scale: 1 unit = 1 m. Helicarrier 333 m, F-18 18.79 m. Sea: JONSWAP/Gerstner lifted from Hurricane Fleet. Damage is per-zone — pods, reactor, magazine, bridge, deck, engines. Lose all four lift pods and a carrier falls out of the sky under gravity.</p>
 </div></div>

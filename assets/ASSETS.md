@@ -3,27 +3,57 @@
 Decoded 2026-11-24 from the Pandora Planes Vite project. Both files are
 self-contained binary glTF (no external `.bin` or texture files).
 
-> Update 2026-11-24: the binary `.glb` files below were re-encoded as
-> base64 JS modules (`helicarrier.b64.js`, `fa18.b64.js`) and the `.glb`
-> files removed from the game dir, because the GitHub snapshot-push route
-> only accepts UTF-8 text files. The bytes are identical (SHA-256 below
-> matches the base64 payloads, verified on conversion); the rest of this
-> file still describes the models themselves.
+> Update 2026-11-25 (v1.4.0): the helicarrier model was replaced with
+> Nicholas's own STL (`Helicarrier_-_Full_Model_0_boii.stl`, same
+> Printables "roboticide" source family as the old model, but the full
+> 169,723-triangle file instead of the old 21,247-triangle decimation).
+> Converted by `/tmp/stl-convert/convert.mjs` (three.js + meshoptimizer):
+> spatial clustering split the triangle soup into 24 components, the
+> visible flight deck was re-extracted (up-facing tris at deck height),
+> Ford colours were applied from the old GLB's exact material values,
+> the Ford deck texture was re-injected, and the result was
+> meshopt-compressed with `gltf-transform meshopt` ONLY (the `optimize`
+> path joins meshes by material and destroys the per-fan rotor meshes).
+> The new `helicarrier.b64.js` is 357,198 chars (was 842,018); the game
+> tree drops from ~2.97 MB to ~2.48 MB. The old model's numbers below
+> are kept for reference; the live model is the v1.4.0 one.
 
 ## Files
 
 | File | Size | SHA-256 (first 16 hex) | GLB version |
 | --- | --- | --- | --- |
-| `helicarrier.glb` | 631,132 B | `84a31e2837f4ca20…` | 2.0 |
+| `helicarrier.glb` (v1.4.0) | 267,644 B | `3b112d5288fbad7d…` | 2.0 |
+| `helicarrier.glb` (v1.3.0, retired) | 631,132 B | `84a31e2837f4ca20…` | 2.0 |
 | `fa18.glb` | 234,512 B | `cf7b1f0cb8b1d08b…` | 2.0 |
 
 Full SHA-256:
-- helicarrier: `84a31e2837f4ca20d572a8c6d2986c8f7f2f798978c69675a2c0a5bfd76d30f3`
+- helicarrier (v1.4.0): `3b112d5288fbad7d8b330fe34c56d97a2e943962b80cbacf66117e1c2b4d1913`
+- helicarrier (v1.3.0): `84a31e2837f4ca20d572a8c6d2986c8f7f2f798978c69675a2c0a5bfd76d30f3`
 - fa18: `cf7b1f0cb8b1d08bb327231fb7905f97e119a338d002b9e13efb8db9abf8c22a`
 
 ## Sources
 
-- `helicarrier.glb` ← `~/workspace/pandora-planes-vite/src/assets/models/helicarrier.ts`
+- `helicarrier.glb` (v1.4.0) ← `~/workspace/user/files/Helicarrier_-_Full_Model_0_boii.stl`
+  (Printables, user "roboticide", SHIELD helicarrier; binary STL, Rhino
+  Aug 2015, 8,486,234 B, 169,723 triangles, single triangle soup, no
+  groups/UVs/textures). Conversion (`/tmp/stl-convert/convert.mjs`,
+  three 0.160.0 + meshoptimizer 0.20.0): components found by
+  vertex-welded spatial clustering (24 components); the model was
+  re-centred and re-oriented (length along Z, bow −Z, up Y) and scaled
+  to 333 m (×1.101786); per-component simplification with meshopt
+  `simplify` + `LockBorder` (fans 0.2/0.1, island 0.3, hull 0.15/0.2,
+  deck 0.12/0.2); smooth normals; planar UVs on the deck strip; Ford
+  colours from the v1.3.0 GLB's exact material values; the Ford deck
+  JPEG re-injected by `/tmp/stl-convert/inject-deck-texture.py`;
+  meshopt-compressed (`gltf-transform meshopt`, 1.08 MB → 268 KB).
+  169,723 → **35,667 tris**, 26 meshes. Deck: flat at the bow (game Y
+  −4.65), ramp to +0.86 over z −38…+6, flat at the stern; centreline
+  trench (x −12…+5, z −115…+6) closed in-game by an infill strip.
+  Fans: four separate shells (~3.4k tris each) at (±54, −6.6, −50.5)
+  and (±62, −6.6, +80.3), radius ~19 m — they ARE the rotors and spin
+  in place. Island: comp 4, a wedge (x 9.2…31.9, y 5.3…33.9,
+  z 46.6…98.2) rising toward the stern.
+- `helicarrier.glb` (v1.3.0, retired) ← `~/workspace/pandora-planes-vite/src/assets/models/helicarrier.ts`
   (`HELICARRIER_GLB`, data-URI `data:model/gltf-binary;base64,…`).
   Original source per the file header: `~/workspace/user/files/Helicarrier_-_Full_Model.stl`
   (Printables, user "roboticide", SHIELD helicarrier), decimated, interior
@@ -46,14 +76,54 @@ and SHA-256 prefixes recorded in the source files' own headers exactly.
 
 - Both files start with the `glTF` magic, version 2, and the header's total
   length field equals the actual file size.
-- helicarrier: JSON chunk 43,744 B + BIN chunk 587,360 B; 1 buffer
-  (532,784 B, no `uri` — embedded). Triangle count recomputed from the
-  index accessors: **21,247** — matches the source header.
+- helicarrier (v1.4.0): JSON chunk 18,520 B; 26 nodes / 26 meshes;
+  triangle count recomputed from the index accessors: **35,667**.
+  **Meshopt-compressed — loader must support `EXT_meshopt_compression`
+  and `KHR_mesh_quantization`** (both in `extensionsRequired`); the
+  loader already has MeshoptDecoder wired (as for the F-18). Plain
+  (uncompressed) geometry, `POSITION` + `NORMAL` on every primitive;
+  only `deck_top` also carries `TEXCOORD_0` (planar UVs for the Ford
+  deck texture). One embedded JPEG texture (56,619 B) on the `FordDeck`
+  material. Do NOT run `gltf-transform optimize` on this file: it joins
+  meshes by material (26 → 3) and destroys the per-fan `rotorSpin_*`
+  meshes the game spins.
+- helicarrier (v1.3.0, retired): JSON chunk 43,744 B + BIN chunk 587,360 B;
+  1 buffer (532,784 B, no `uri` — embedded). Triangle count recomputed
+  from the index accessors: **21,247** — matches the source header.
 - fa18: JSON chunk 8,596 B + BIN chunk 225,888 B; triangle count recomputed:
   **17,517** — matches the source header.
-- No Draco compression in either file.
+- No Draco compression in any file.
 
-## Helicarrier — structure
+## Helicarrier (v1.4.0) — structure
+
+- Generator: three.js GLTFExporter 0.160.0 + glTF-Transform meshopt.
+  Extensions used and required: `KHR_mesh_quantization`,
+  `EXT_meshopt_compression`.
+- Self-contained: embedded buffers, no external references.
+- 26 nodes / 26 meshes, all flat top-level scene nodes (no hierarchy).
+  Pre-normalised: 333 m long (Z), centred, bow −Z, deck up (+Y) — the
+  game does not rescale or rotate it. Groups by name prefix: `hull_*`
+  (17), `rotorSpin_*` (4, the STL fans), `deck_top` (1, textured runway
+  strip), `deck_outer` (1, pod/side decks), `island_6` (1).
+- Full node/mesh list: `deck_outer, deck_top, hull_0, hull_1, hull_2,
+  hull_3, hull_5, hull_6, hull_7, hull_8, hull_9, hull_10, hull_15,
+  hull_16, hull_17, hull_18, hull_19, hull_20, hull_21, hull_22,
+  hull_23, island_6, rotorSpin_0, rotorSpin_1, rotorSpin_2, rotorSpin_3`.
+  (Component numbers are the STL spatial-clustering labels; 4, 11–14
+  are the island and fans, the rest are hull pieces. `hull_1/9/10` are
+  the duct walls/lips above the fans, in Ford pod grey.)
+- Biggest meshes: `hull_16` (3,712 tris), `rotorSpin_3` (3,484),
+  `rotorSpin_0` (3,444), `rotorSpin_1` (3,412), `rotorSpin_2` (3,394),
+  `deck_top` (2,632).
+- Materials (5, all flat colours except the deck): `FordHullGrey`,
+  `FordPodGrey`, `FordIslandGrey`, `RotorDark`, `FordDeck` (exact
+  colour values from the v1.3.0 GLB's materials).
+- One embedded texture: the Ford flight-deck JPEG (56,619 B) used only
+  by the `FordDeck` material on `deck_top` (U across the central strip,
+  V along the length tiled twice; sampler: S clamp, T repeat). No other
+  textures.
+
+## Helicarrier (v1.3.0, retired) — structure
 
 - Generator: trimesh (`https://github.com/mikedh/trimesh`). No extensions
   used or required. Plain (uncompressed) geometry, `POSITION` + `NORMAL`

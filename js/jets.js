@@ -45,6 +45,35 @@ export const MISSILE_SPEED = 260;
 export const MISSILE_DMG = 25;
 export const AIR_WING_TOTAL = 12;
 
+// v1.4.0 (item 5) CAP — combat air patrol. A standing defensive fighter
+// patrol over the fleet: CAP flights orbit a station above the home
+// carrier and, when an inbound enemy strike flight closes, fly a pure-
+// pursuit intercept and make close-range gun passes against it. The
+// engagement model is deliberately NOT the dogfighting kit (proposal 1,
+// not chosen): no intercept/engage FSM, no skill table, no lead
+// pursuit (the CAP jet steers at the attacker's CURRENT position
+// through the existing steerJetTo), no missiles, no flares. One hit
+// roll per pass opportunity (fixed probability, fixed refractory
+// interval while in range, fixed ammo per sortie), damage through the
+// existing jet zone model, and the enemy side answers with the
+// existing SAM-evasion break (defensiveT) plus a harassment abort —
+// a hit in the dive forces an immediate pullout, two hits abort the
+// sortie. CAP is disruption + attrition, not a kill machine: one
+// 20-dmg gun hit cannot kill a jet on its own (wing 24 / engine 30
+// after zone mults, vs 80/90 HP), it takes AD damage stacked on top.
+export const CAP_PATROL_ALT = 250;       // m above the home deck
+export const CAP_PATROL_RADIUS = 450;    // m aim-point orbit radius around the station — the flown orbit runs tighter (~350 m) because the jet cuts the corner chasing a moving aim point at cruise speed; 450 aims the flown orbit at ~350 m (measured in the v14-cap patrol probe: aim 350 flew 274, aim 450 flies ~350)
+export const CAP_PATROL_STATION = 500;   // m from the home carrier toward the threat
+export const CAP_TRIGGER_RANGE = 1600;   // m from a live own-side carrier — inbound flight counts
+export const CAP_BREAKOFF_RANGE = 2200;  // m chase limit from the nearest own-side carrier
+export const CAP_GUN_RANGE = 250;        // m — a pass is a firing opportunity inside this
+export const CAP_BOUNCE_RANGE = 400;     // m — an attacker inside this jinks (defensive break)
+export const CAP_GUN_HIT_P = 0.35;       // fixed probability per gun pass, both sides alike
+export const CAP_GUN_DMG = 20;           // per hit, through damageZone (zone mults apply)
+export const CAP_GUN_REFRACTORY_S = 2.5; // s between passes while holding firing position
+export const CAP_GUN_AMMO = 4;           // gun passes per jet per CAP sortie
+export const CAP_PATROL_ENDURANCE_S = 240; // s on station before RTB for relief
+
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 
@@ -259,10 +288,13 @@ export class FighterJet {
     this.ordnance = 2; this.hp = 100;
     // v1.3.0 (B) per-zone jet damage (Pandora DamageZones /
     // DamageableEntity pattern): wing hits x1.2, engine hits x1.5.
-    // Zone HP is set so one SAM (55) cannot one-shot a zone: wing
-    // 80 (55*1.2=66), engine 90 (55*1.5=82), fuel 50 (a SAM fuel hit
-    // starts a fire instead of killing outright). Dying rule: lose a
-    // wing, lose both engines, or lose all HP -> spin-out fall.
+    // v1.4.0: one SAM is 40 (was 55), so one SAM cannot prime a zone
+    // for a single CIWS follow-up kill: wing 80 (40*1.2=48, +14.4
+    // CIWS = 62), engine 90 (40*1.5=60, +18 CIWS = 78), fuel 50 (a
+    // 40-dmg SAM fuel hit no longer destroys it outright). A kill
+    // needs two SAMs on one zone, or a SAM plus several CIWS hits on
+    // the same zone. Dying rule: lose a wing, lose both engines, or
+    // lose all HP -> spin-out fall.
     this.zones = {
       wingL: { hp: 80, max: 80 }, wingR: { hp: 80, max: 80 },
       engineL: { hp: 90, max: 90 }, engineR: { hp: 90, max: 90 },
@@ -272,6 +304,10 @@ export class FighterJet {
     this.fire = null; // {zone, intensity, t, spreadT}
     this.spinOut = false; this.spinRate = 0; this.spinT = 0;
     this.defensiveT = 0; this.defSide = 1; this.flareT = 0;
+    // v1.4.0 (item 5) CAP: gun-pass ammo / refractory timer per jet,
+    // and the bounce cooldown — a jet that just jinked off a closing
+    // CAP fighter does not jink again for 8 s.
+    this.capAmmo = 0; this.capGunT = 0; this.capBounceT = 0;
     this.rollBias = 0; this.speedMul = 1; this.turnMul = 1;
     this.deckLocal = null; // {lx,lz} — deck coupling (J): jets parked /
     // taxiing / rearming ride the carrier's deck when she climbs/descends
@@ -387,6 +423,8 @@ export class FighterJet {
   update(dt, ctx) {
     if (this.defensiveT > 0) this.defensiveT -= dt;
     if (this.flareT > 0) this.flareT -= dt;
+    if (this.capGunT > 0) this.capGunT -= dt;
+    if (this.capBounceT > 0) this.capBounceT -= dt;
     // v1.3.0 (B) fire state machine: intensity ramps, spreads to an
     // adjacent zone after ~8 s, can be blown out by high airspeed
     // (>175 m/s airflow) or — for an engine fire — by cutting throttle
@@ -500,6 +538,9 @@ export class AirSquadron {
     this.t = 0; this.attackPhase = 'popup'; this.diveT = 0;
     this.patLeg = 0; this.rearmT = 0; this.waypoint = null;
     this.queuedLoadout = null; this.queuedTarget = null; // launchQueued state
+    // v1.4.0 (item 5) CAP: patrol orbit clock, harassment count from
+    // CAP gunfire this sortie, and the jet currently being intercepted.
+    this.patT = 0; this.capHits = 0; this.interceptTarget = null;
   }
   get leader() { return this.jets[0]; }
   get wingman() { return this.jets[1]; }
@@ -510,13 +551,18 @@ export class AirSquadron {
     if (this.state !== 'deckReady' && this.state !== 'launchQueued') return false;
     const carrier = this.homeCarrier;
     if (!carrier || !carrier.alive || !carrier.canLaunch) return false;
-    if (!target || target.state === 'gone') return false;
+    // v1.4.0 (item 5) CAP: a patrol flight has no target carrier — it
+    // defends a station over the fleet, so a null target is legal for
+    // loadout 'cap' only. Strike loadouts still need a live target.
+    if (loadout !== 'cap' && (!target || target.state === 'gone')) return false;
     const avail = this.wing.availableToLaunch();
     if (avail <= 0) return false;
     const n = Math.min(2, avail);
     this.loadout = loadout; this.target = target;
     this.queuedLoadout = null; this.queuedTarget = null;
     this.state = 'catapult'; this.t = 0; this.diveT = 0; this.attackPhase = 'popup';
+    this.patT = 0; this.capHits = 0; this.interceptTarget = null;
+    if (loadout === 'cap' && ctx.cap) ctx.cap.launches++;
     // Reserve the catapult / climb-out for CATAPULT_CLEAR_S: no other
     // squadron of this wing launches until this flight is clear
     // (enforced in AirWing.launch).
@@ -540,7 +586,9 @@ export class AirSquadron {
       }
       j.formOffset = i === 0 ? { x: 0, z: 0 } : { x: 60, z: -40 };
       j.state = 'catapult'; j.catT = i === 0 ? 0 : -1; // wingman fires 1 s later
-      j.ordnance = 2; j.hp = 100; j.fired = false; j.stalled = false;
+      j.ordnance = loadout === 'cap' ? 0 : 2; // CAP jets carry no bombs — gun passes only
+      j.capAmmo = loadout === 'cap' ? CAP_GUN_AMMO : 0; j.capGunT = 0; j.capBounceT = 0;
+      j.hp = 100; j.fired = false; j.stalled = false;
       // v1.3.0 (B): a fresh sortie starts with fresh zones — a jet that
       // trapped with damage is repaired on rearm; a refilled slot is a
       // new jet object with fresh zones already.
@@ -570,6 +618,111 @@ export class AirSquadron {
     }
     if (['deckReady', 'rearm'].includes(this.state)) return;
     this.state = 'rtb'; this.t = 0; this.patLeg = 0;
+  }
+  // v1.4.0 (item 5) CAP harassment — the enemy side of a CAP gun hit.
+  // A hit breaks the jet off its run (the existing SAM-evasion
+  // defensive break, 2.5 s at steep bank — the dive aim is recomputed
+  // every frame, so a break ruins the release gate for that pass), and
+  // a hit taken in the dive forces an immediate pullout, so no bomb is
+  // released on that pass. Two harassment hits abort the sortie
+  // outright: the flight egresses with whatever ordnance it still
+  // carries, and the undelivered ordnance is counted, not silently
+  // dropped. This is the whole enemy reaction — no dogfighting FSM,
+  // no return fire, no pursuit of the CAP jets.
+  onCapHit(jet, ctx) {
+    this.capHits++;
+    jet.defensiveT = 2.5;
+    jet.defSide = Math.random() < 0.5 ? 1 : -1;
+    if (this.state === 'attack' && this.attackPhase === 'dive') { this.attackPhase = 'pullout'; this.t = 0; }
+    if (this.capHits >= 2 && (this.state === 'ingress' || this.state === 'attack')) {
+      const denied = this.aliveJets.reduce((a, j) => a + j.ordnance, 0);
+      this.state = 'egress'; this.t = 0;
+      if (ctx.cap) { ctx.cap.aborts++; ctx.cap.ordnanceDenied += denied; }
+      if (ctx.msg) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} flight aborted its strike under CAP fire (${denied} ordnance un-delivered)`);
+    }
+  }
+  // v1.4.0 (item 5) CAP helpers.
+  _sqOfJet(jet) {
+    const w = jet.wing;
+    return w ? w.squadrons.find(s => s.jets.includes(jet)) || null : null;
+  }
+  _capAmmoLeft() {
+    return this.aliveJets.reduce((a, j) => a + (j.capAmmo || 0), 0);
+  }
+  // Nearest inbound enemy flight: a jet of a squadron in 'ingress' or
+  // 'attack' (a flight still climbing out of its own deck is not yet
+  // a raid on us) inside CAP_TRIGGER_RANGE of any live carrier of our
+  // side. Pure range + state — no threat scoring, no skill table.
+  _nearestInboundFoe(ctx) {
+    const own = this.wing.side;
+    const carriers = ctx.carriers || [];
+    let best = null, bd = 1e18;
+    for (const c of carriers) {
+      if (c.side === own || !c.wing) continue;
+      for (const sq of c.wing.squadrons) {
+        if (!['ingress', 'attack'].includes(sq.state) || sq.loadout === 'cap') continue;
+        for (const j of sq.jets) {
+          if (['crashed', 'sinking', 'spinout'].includes(j.state)) continue;
+          let dOwn = 1e18;
+          for (const o of carriers) {
+            if (o.side !== own || !o.alive) continue;
+            dOwn = Math.min(dOwn, Math.hypot(j.x - o.x, j.z - o.z));
+          }
+          if (dOwn < CAP_TRIGGER_RANGE && dOwn < bd) { bd = dOwn; best = { jet: j, sq, dOwn }; }
+        }
+      }
+    }
+    return best;
+  }
+  // v1.4.0 (item 5) CAP gun passes. Each live CAP jet independently:
+  // an enemy jet closing inside CAP_BOUNCE_RANGE jinks (defensive
+  // break, at most once per 8 s per jet); inside CAP_GUN_RANGE the jet
+  // gets one probability roll per refractory window while it holds
+  // firing position, spending one ammo. A hit goes through the
+  // existing zone model and calls the target squadron's onCapHit.
+  // Tracer particles mark every pass, hit or miss, so a pass is
+  // visible in the sim even when the roll fails.
+  _capGunPasses(ctx) {
+    const foes = [];
+    for (const c of ctx.carriers || []) {
+      if (c.side === this.wing.side || !c.wing) continue;
+      for (const sq of c.wing.squadrons) {
+        if (!['ingress', 'attack'].includes(sq.state) || sq.loadout === 'cap') continue;
+        for (const j of sq.jets) if (!['crashed', 'sinking', 'spinout'].includes(j.state)) foes.push({ j, sq });
+      }
+    }
+    if (!foes.length) return;
+    for (const cj of this.aliveJets) {
+      let nearest = null, nd = 1e18;
+      for (const f of foes) {
+        const d = Math.hypot(f.j.x - cj.x, f.j.y - cj.y, f.j.z - cj.z);
+        if (d < nd) { nd = d; nearest = f; }
+      }
+      if (!nearest) continue;
+      if (nd < CAP_BOUNCE_RANGE && (nearest.j.capBounceT || 0) <= 0) {
+        nearest.j.capBounceT = 8;
+        nearest.j.defensiveT = 1.5;
+        nearest.j.defSide = Math.random() < 0.5 ? 1 : -1;
+      }
+      if (cj.capGunT > 0 || (cj.capAmmo || 0) <= 0 || nd > CAP_GUN_RANGE) continue;
+      cj.capGunT = CAP_GUN_REFRACTORY_S;
+      cj.capAmmo--;
+      if (ctx.cap) ctx.cap.gunPasses++;
+      const dx = nearest.j.x - cj.x, dy = nearest.j.y - cj.y, dz = nearest.j.z - cj.z;
+      const d = Math.hypot(dx, dy, dz) || 1;
+      for (let i = 1; i <= 3; i++) {
+        const k = i / 4;
+        ctx.vfx.spawnParticle(cj.x + dx * k, cj.y + dy * k, cj.z + dz * k, dx / d * 200, dy / d * 200, dz / d * 200, 0.15, 1, 0.9, 0.3, 0);
+      }
+      if (Math.random() < CAP_GUN_HIT_P) {
+        const zones = ['wingL', 'wingR', 'engineL', 'engineR', 'fuselage', 'fuel'];
+        const res = nearest.j.damageZone(CAP_GUN_DMG, zones[Math.floor(Math.random() * zones.length)], 'cap-gun', ctx);
+        if (ctx.cap) ctx.cap.gunHits++;
+        nearest.sq.onCapHit(nearest.j, ctx);
+        if (res === 'spinout' && ctx.cap) ctx.cap.capKills++;
+        ctx.vfx.burst(nearest.j.x, nearest.j.y, nearest.j.z, 8, [1, 0.7, 0.2], 3, 2);
+      }
+    }
   }
   // Dive aim, recomputed EVERY FRAME for both jets (the wingman fix):
   // 0.5 s target lead, release point 100 m out / 60 m above the deck on a
@@ -660,13 +813,84 @@ export class AirSquadron {
         // Climb-out lane (a): each squadron climbs out on its own
         // lateral lane and altitude, so two flights can never sit on the
         // identical climb point even if their timing ever coincides.
-        const laneX = this.id === 1 ? -120 : 120;
+        const laneX = (this.id === 1 ? -120 : 120) + (this.wing.strikeLaneOffset || 0);
         const aim = carrier.deckPoint(laneX, -160);
-        aim.y = deckY + 120 + (this.id - 1) * 60;
+        aim.y = deckY + 120 + (this.id - 1) * 60 + (this.wing.strikeAltOffset || 0);
         L.turnSide = 1;
         steerJetTo(L, aim, 120, JET_CRUISE_SPEED, dt, { flight: true, seaH });
         this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
-        if (L.y > deckY + 60 || this.t > 20) { this.state = 'ingress'; this.t = 0; }
+        // v1.4.0 (item 5) CAP: a patrol flight climbs out to its station
+        // instead of ingressing to a target.
+        if (L.y > deckY + 60 || this.t > 20) {
+          if (this.loadout === 'cap') { this.state = 'patrol'; this.t = 0; this.patT = 0; }
+          else { this.state = 'ingress'; this.t = 0; }
+        }
+        break;
+      }
+      // v1.4.0 (item 5) CAP patrol: orbit a station 500 m out from the
+      // home carrier toward the nearest live enemy carrier, 250 m above
+      // the deck, at 350 m radius. The station follows the carrier, so
+      // the patrol moves with the fleet. An inbound enemy flight inside
+      // trigger range breaks the orbit into an intercept.
+      case 'patrol': {
+        this.t += dt; this.patT += dt;
+        if (!carrier || !carrier.alive) { this.state = 'rtb'; this.t = 0; this.patLeg = 0; break; }
+        let sx = carrier.x + Math.sin(carrier.heading) * CAP_PATROL_STATION;
+        let sz = carrier.z - Math.cos(carrier.heading) * CAP_PATROL_STATION;
+        let bd = 1e18;
+        for (const o of ctx.carriers || []) {
+          if (o.side === this.wing.side || !o.alive) continue;
+          const d = Math.hypot(o.x - carrier.x, o.z - carrier.z);
+          if (d < bd) {
+            bd = d;
+            sx = carrier.x + (o.x - carrier.x) / (d || 1) * CAP_PATROL_STATION;
+            sz = carrier.z + (o.z - carrier.z) / (d || 1) * CAP_PATROL_STATION;
+          }
+        }
+        const ang = this.patT * (JET_CRUISE_SPEED / CAP_PATROL_RADIUS);
+        const aim = { x: sx + Math.cos(ang) * CAP_PATROL_RADIUS, y: deckY + CAP_PATROL_ALT, z: sz + Math.sin(ang) * CAP_PATROL_RADIUS };
+        steerJetTo(L, aim, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
+        this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
+        if (this._capAmmoLeft() > 0) {
+          const foe = this._nearestInboundFoe(ctx);
+          if (foe) {
+            this.state = 'intercept'; this.t = 0; this.interceptTarget = foe.jet;
+            if (ctx.cap) ctx.cap.intercepts++;
+            if (ctx.msg) ctx.msg(`🛡 CAP intercepting inbound flight — ${Math.round(foe.dOwn)} m out`);
+          }
+        }
+        // Endurance: after a quiet 240 s on station the flight RTBs
+        // for relief; the wing relaunches a fresh patrol while CAP is on.
+        if (this.t > CAP_PATROL_ENDURANCE_S) { this.state = 'rtb'; this.t = 0; this.patLeg = 0; }
+        break;
+      }
+      // v1.4.0 (item 5) CAP intercept: pure pursuit of the target's
+      // CURRENT position (no lead — that is the dogfighting kit's
+      // pursuit model, not this one) at attack speed, with gun passes
+      // while in range. Breaks off when the target is gone, egressing,
+      // beyond the chase limit, out of ammo, or after 120 s — and
+      // returns to patrol, not to the deck.
+      case 'intercept': {
+        this.t += dt;
+        const foe = this.interceptTarget;
+        const foeSq = foe ? this._sqOfJet(foe) : null;
+        let breakOff = !foe || ['crashed', 'sinking', 'spinout'].includes(foe.state)
+          || !foeSq || !['ingress', 'attack'].includes(foeSq.state)
+          || this._capAmmoLeft() <= 0 || this.t > 120;
+        if (!breakOff) {
+          let dOwn = 1e18;
+          for (const o of ctx.carriers || []) if (o.side === this.wing.side && o.alive) dOwn = Math.min(dOwn, Math.hypot(foe.x - o.x, foe.z - o.z));
+          if (dOwn > CAP_BREAKOFF_RANGE) breakOff = true;
+        }
+        if (breakOff || !carrier || !carrier.alive) {
+          if (!carrier || !carrier.alive) { this.state = 'rtb'; this.t = 0; this.patLeg = 0; }
+          else { this.state = 'patrol'; this.t = 0; }
+          this.interceptTarget = null;
+          break;
+        }
+        steerJetTo(L, { x: foe.x, y: foe.y, z: foe.z }, 60, JET_ATTACK_SPEED, dt, { flight: true, seaH });
+        this._formFly(W, L, dt, ctx, JET_ATTACK_SPEED, seaH);
+        this._capGunPasses(ctx);
         break;
       }
       case 'ingress': {
@@ -675,14 +899,15 @@ export class AirSquadron {
         const dx = tgt.x - L.x, dz = tgt.z - L.z;
         const d = Math.hypot(dx, dz);
         const ux = dx / d, uz = dz / d;
+        const altOff = this.wing.strikeAltOffset || 0; // v1.4.0 director route separation
         if (this.loadout === 'asm') {
           const ax = tgt.x - ux * 800, az = tgt.z - uz * 800;
-          steerJetTo(L, { x: ax, y: tgt.deckTopY() + 150, z: az }, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
+          steerJetTo(L, { x: ax, y: tgt.deckTopY() + 150 + altOff, z: az }, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
           this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
           if (d < 1000) { this.state = 'attack'; this.t = 0; }
         } else {
           const ax = tgt.x - ux * 500, az = tgt.z - uz * 500;
-          steerJetTo(L, { x: ax, y: tgt.deckTopY() + 60, z: az }, 120, JET_CRUISE_SPEED, dt, { flight: true, seaH });
+          steerJetTo(L, { x: ax, y: tgt.deckTopY() + 60 + altOff, z: az }, 120, JET_CRUISE_SPEED, dt, { flight: true, seaH });
           this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
           if (d < 600) { this.state = 'attack'; this.t = 0; this.attackPhase = 'popup'; this.diveT = 0; }
         }
@@ -696,7 +921,7 @@ export class AirSquadron {
           const dx = tgt.x - L.x, dz = tgt.z - L.z;
           const d = Math.hypot(dx, dz);
           const ux = dx / d, uz = dz / d;
-          const hold = { x: tgt.x - ux * 800, y: tgt.deckTopY() + 150, z: tgt.z - uz * 800 };
+          const hold = { x: tgt.x - ux * 800, y: tgt.deckTopY() + 150 + (this.wing.strikeAltOffset || 0), z: tgt.z - uz * 800 };
           steerJetTo(L, hold, 150, JET_ATTACK_SPEED, dt, { flight: true, seaH, attack: true });
           this._formFly(W, L, dt, ctx, JET_ATTACK_SPEED, seaH);
           if (d < 1000 && !L.fired) {
@@ -715,7 +940,7 @@ export class AirSquadron {
           const dx = tgt.x - L.x, dz = tgt.z - L.z;
           const d = Math.hypot(dx, dz) || 0.001;
           const ux = dx / d, uz = dz / d;
-          const aim = { x: L.x + ux * 150, y: tgt.deckTopY() + 180, z: L.z + uz * 150 };
+          const aim = { x: L.x + ux * 150, y: tgt.deckTopY() + 180 + (this.wing.strikeAltOffset || 0), z: L.z + uz * 150 };
           steerJetTo(L, aim, 100, JET_CRUISE_SPEED, dt, { flight: true, seaH, attack: true });
           this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
           if (L.y > tgt.deckTopY() + 150 || this.t > 6) { this.attackPhase = 'dive'; this.diveT = 0; }
@@ -793,12 +1018,13 @@ export class AirSquadron {
       }
       case 'egress': {
         this.t += dt;
+        const altOff = this.wing.strikeAltOffset || 0; // v1.4.0 director route separation
         if (tgtAlive) {
           const dx = L.x - tgt.x, dz = L.z - tgt.z;
           const d = Math.hypot(dx, dz) || 0.001;
-          steerJetTo(L, { x: tgt.x + dx / d * 800, y: tgt.deckTopY() + 200, z: tgt.z + dz / d * 800 }, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
+          steerJetTo(L, { x: tgt.x + dx / d * 800, y: tgt.deckTopY() + 200 + altOff, z: tgt.z + dz / d * 800 }, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
         } else {
-          steerJetTo(L, { x: L.x + 500, y: deckY + 150, z: L.z }, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
+          steerJetTo(L, { x: L.x + 500, y: deckY + 150 + altOff, z: L.z }, 150, JET_CRUISE_SPEED, dt, { flight: true, seaH });
         }
         this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
         if (this.t > 8 || !tgtAlive) { this.state = 'rtb'; this.t = 0; this.patLeg = 0; }
@@ -972,8 +1198,19 @@ export class AirWing {
     this.skill = skill || null; // enemy skill tiers only; player wings: null (aimErr 3 m)
     this.remaining = AIR_WING_TOTAL;
     this.squadrons = [new AirSquadron(this, 1), new AirSquadron(this, 2)];
+    // v1.4.0 (item 3) director-assigned strike separation: the enemy
+    // director gives each carrier its own climb-out lane / ingress
+    // altitude step so flights from different carriers never share a
+    // transit line. Player wings stay 0. Set by directorEvaluate.
+    this.strikeLaneOffset = 0;
+    this.strikeAltOffset = 0;
+    this._directorLaneSet = false;
     this.catapultClearAt = 0; // game time until which the catapults are reserved (see launch)
     this.lostLog = []; // {reason, remaining} per jet lost — honest loss accounting
+    // v1.4.0 (item 5) CAP: while capOn, the wing keeps one squadron on
+    // standing patrol (auto-launch + relief rotation, see update()).
+    // Player-only in practice — the enemy director never orders CAP.
+    this.capOn = false;
     carrier.wing = this;
   }
   airborneCount() {
@@ -999,6 +1236,21 @@ export class AirWing {
     return false;
   }
   recallAll() { for (const s of this.squadrons) s.recall(); }
+  // v1.4.0 (item 5) CAP: launch a patrol flight — same catapult guard
+  // as a strike launch (queued while the catapults are busy), but with
+  // a null target: a CAP flight defends a station, not a carrier.
+  launchCAP(ctx) {
+    const now = ctx && typeof ctx.time === 'number' ? ctx.time : 0;
+    if (this.squadrons.some(s => s.state === 'launchQueued')) return 'queued';
+    const busy = now < this.catapultClearAt;
+    for (const s of this.squadrons) {
+      if (s.state !== 'deckReady') continue;
+      if (busy) { s.queueLaunch('cap', null); return 'queued'; }
+      return s.launch('cap', null, ctx);
+    }
+    return false;
+  }
+  recallCAP() { for (const s of this.squadrons) if (s.loadout === 'cap') s.recall(); }
   onJetLost(jet) {
     this.remaining = Math.max(0, this.remaining - 1);
     this.lostLog.push({ reason: jet.crashReason || 'lost', remaining: this.remaining });
@@ -1048,6 +1300,21 @@ export class AirWing {
       if (!ok) {
         s.state = 'deckReady'; s.queuedLoadout = null; s.queuedTarget = null;
         if (ctx.msg) ctx.msg(`${this.carrier.name}: queued launch cancelled — cannot launch`);
+      }
+    }
+    // v1.4.0 (item 5) CAP: standing patrol. While capOn, keep exactly
+    // one squadron of this wing on CAP — launch when a squadron is
+    // deckReady and no CAP flight is out (catapult/climb/patrol/
+    // intercept, or taxiing/rearming back from one, all count as the
+    // patrol being up, so the relief rotation relaunches the same
+    // squadron instead of stealing the second one). A CAP flight that
+    // traps and rearms is relaunched by this rule; turning CAP off
+    // stops it (recallCAP brings the flight home first).
+    if (this.capOn) {
+      const capUp = this.squadrons.some(s => s.loadout === 'cap' &&
+        ['catapult', 'climb', 'patrol', 'intercept', 'taxi', 'rearm', 'launchQueued'].includes(s.state));
+      if (!capUp && this.carrier && this.carrier.alive && this.carrier.canLaunch) {
+        this.launchCAP(ctx);
       }
     }
     // Mid-air collisions (Hurricane L7168): flying jets within 10 m crash.
