@@ -10,6 +10,10 @@ export const STAGES = [
   { name: 'Calm',   speed: 20, amp: 0.35, wind: 5,  sky: 0x9fc3d8, sea: 0x1a5a78, sunI: 1.15 },
   { name: 'Rough',  speed: 25, amp: 0.70, wind: 10, sky: 0x7e9db4, sea: 0x174a64, sunI: 1.0 },
   { name: 'Storm',  speed: 30, amp: 1.05, wind: 15, sky: 0x5a7286, sea: 0x12394e, sunI: 0.85 },
+  // v1.3.0 Hurricane (Hurricane Fleet's 4th stage): wind 20, bigger Hs,
+  // heavier foam/rain feel. Only reached by the menu picker or by the
+  // distance-driven progression — never the default.
+  { name: 'Hurricane', speed: 35, amp: 1.4, wind: 20, sky: 0x46586a, sea: 0x0e2c40, sunI: 0.7 },
 ];
 const G_GAME = 9.81;
 const JONSWAP_FETCH = 300000, JONSWAP_GAMMA = 3.3, SPEC_N = 14;
@@ -32,6 +36,22 @@ export class Sea {
     this.HS = 0;
     this.buildSpectrum(STAGES[stageIdx].wind);
     this.makeOcean(scene);
+    // v1.3.0 freak wave (Hurricane v11.8-11.12, metric): one huge moving
+    // Gaussian crest added to the Gerstner field. Hurricane amp 8u /
+    // radius 22u / speed 22 u/s rescale to 8*5.74=46 m — far too tall for
+    // a 1 m = 1 m sea whose Storm Hs is ~4 m — so the crest is re-derived
+    // here: 14 m amp (still ~3x the Storm swell), 120 m radius, 30 m/s.
+    // Carriers fly at >=150 m, so they are safe; low jets are not.
+    this.freak = null; // {x,z,dirX,dirZ,amp,radius,speed,age,life}
+  }
+  // Gaussian crest height of the freak wave at (x,z), 0 when none/absent.
+  freakHeightAt(x, z) {
+    const fw = this.freak;
+    if (!fw) return 0;
+    const fdx = x - fw.x, fdz = z - fw.z;
+    const fd2 = fdx * fdx + fdz * fdz, fr2 = fw.radius * fw.radius;
+    if (fd2 >= fr2 * 9) return 0;
+    return fw.amp * Math.exp(-fd2 / (2 * fr2));
   }
   buildSpectrum(U) {
     const wp = 22 * Math.cbrt(9.81 * 9.81 / (U * JONSWAP_FETCH));
@@ -82,6 +102,7 @@ export class Sea {
       oz += Q * A * w.dz * Math.cos(th);
       y += A * Math.sin(th);
     }
+    y += this.freakHeightAt(x, z);
     return { x: x + ox, y, z: z + oz };
   }
   waveHeight(x, z, t) { return this.gerstner(x, z, t).y; }
@@ -100,6 +121,16 @@ export class Sea {
       doxdx += -Q * A * w.k * w.dx * w.dx * sn; doxdz += -Q * A * w.k * w.dx * w.dz * sn;
       dozdx += -Q * A * w.k * w.dz * w.dx * sn; dozdz += -Q * A * w.k * w.dz * w.dz * sn;
       ovx += Q * A * w.dx * w.w * sn; ovy += -A * w.w * cs; ovz += Q * A * w.dz * w.w * sn;
+    }
+    // v1.3.0 freak wave in the shared ocean query too (Hurricane v11.8):
+    // height and slope, so wave push / swamping see the same crest.
+    if (this.freak) {
+      const fg = this.freakHeightAt(x, z);
+      if (fg > 0) {
+        const fw = this.freak, fr2 = fw.radius * fw.radius;
+        y += fg;
+        dydx += -fg * (x - fw.x) / fr2; dydz += -fg * (z - fw.z) / fr2;
+      }
     }
     const tx = 1 + doxdx, ty = dydx, tz = dozdx;
     const ux = doxdz, uy = dydz, uz = 1 + dozdz;

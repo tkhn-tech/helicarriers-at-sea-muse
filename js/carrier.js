@@ -36,6 +36,10 @@ function hideBadSlabs(obj) {
       o.material.side = THREE.DoubleSide;
       o.material.polygonOffset = true; o.material.polygonOffsetFactor = -2;
     }
+    // v1.2.1 solidity backstop: every GLB shell renders double-sided,
+    // so an open shell never vanishes from its back face and no
+    // see-through path opens through a missing backface.
+    if (o.isMesh && o.material) o.material.side = THREE.DoubleSide;
     // v1.2.0: the GLB's own rotor discs/hubs are retired — flat star
     // shapes in near-black RotorDark that read as static discs from
     // every angle (Nicholas's screenshot). Procedural rotors built in
@@ -64,12 +68,119 @@ const DM = {
   greenNav: new THREE.MeshStandardMaterial({ color: 0x44ff66, emissive: 0x11aa33, emissiveIntensity: 1.2 }),
   exhaustGlow: new THREE.MeshStandardMaterial({ color: 0xff7a1e, emissive: 0xcc4400, emissiveIntensity: 1.4 }),
   panelGrey: new THREE.MeshStandardMaterial({ color: 0x5a6a72, roughness: 0.7, metalness: 0.25 }),
+  // v1.2.1: inner hull core + caps — haze grey like the GLB hull.
+  hullCore: new THREE.MeshStandardMaterial({ color: 0x7e8b96, roughness: 0.7, metalness: 0.25, side: THREE.DoubleSide }),
+  hullGrey: new THREE.MeshStandardMaterial({ color: 0x8a9aa8, roughness: 0.6, metalness: 0.3, side: THREE.DoubleSide }),
+  // v1.3.2: torn section caps — dark scorched steel, so a cut face reads
+  // as a broken edge, not a clean light panel.
+  capSteel: new THREE.MeshStandardMaterial({ color: 0x33383d, roughness: 0.9, metalness: 0.3, side: THREE.DoubleSide }),
 };
 function dbox(w, h, d, mat, x, y, z, ry = 0) {
   const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
   m.position.set(x, y, z);
   if (ry) m.rotation.y = ry;
   return m;
+}
+
+// v1.2.1 — closed inner hull core (Hurricane-style extruded planform,
+// done here as a loft so the keel follows the GLB's own depth profile).
+// Stations [z, halfWidth, keelY] measured from the GLB hull vertices,
+// inset ~1.5 m inside the shell. Cross-section is a rounded-V ring
+// closed across the top just under the deck, so the loft is a solid:
+// sides, belly, bow/stern end caps, and a top face backing the deck.
+const HULL_CORE_STATIONS = [
+  [-166, 8, -6.5], [-150, 11, -10], [-130, 16, -16], [-110, 21, -19],
+  [-90, 24.5, -21.5], [-70, 26.5, -22.5], [-50, 28.5, -22], [-30, 30.5, -20],
+  [-10, 32, -16], [10, 33, -12], [30, 33.5, -7.5], [50, 33.5, -7],
+  // Stern keel drops steeply past z 60 (centreline keel strip
+  // detail_34 reaches y -30.9 at z 58..109; hull_2/4 flare to -32.8).
+  [70, 34, -12], [80, 36, -29], [90, 38, -30], [110, 41, -30], [130, 44, -28],
+  [150, 42, -24], [170, 30, -18], [184, 12, -10],
+];
+function hullCoreGeometry(topY) {
+  const ringPts = (w, k) => {
+    const midY = (topY + k) / 2;
+    return [[-w, topY], [-w, midY], [-w * 0.55, k + 1.5], [0, k],
+      [w * 0.55, k + 1.5], [w, midY], [w, topY]];
+  };
+  const pos = [], idx = [];
+  const rings = HULL_CORE_STATIONS.map(([z, w, k]) => ({ z, pts: ringPts(w, k) }));
+  rings.forEach(r => r.pts.forEach(([x, y]) => pos.push(x, y, r.z)));
+  const N = 7;
+  for (let s = 0; s < rings.length - 1; s++) {
+    for (let i = 0; i < N; i++) {
+      const a = s * N + i, b = s * N + (i + 1) % N;
+      const c = (s + 1) * N + i, d = (s + 1) * N + (i + 1) % N;
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+  // End caps: fan from each end ring's centroid.
+  const capFan = (s, flip) => {
+    const base = s * N;
+    let cx = 0, cy = 0;
+    for (let i = 0; i < N; i++) { cx += pos[(base + i) * 3]; cy += pos[(base + i) * 3 + 1]; }
+    cx /= N; cy /= N;
+    const cz = HULL_CORE_STATIONS[s][0];
+    const ci = pos.length / 3; pos.push(cx, cy, cz);
+    for (let i = 0; i < N; i++) {
+      const a = base + i, b = base + (i + 1) % N;
+      if (flip) idx.push(ci, b, a); else idx.push(ci, a, b);
+    }
+  };
+  capFan(0, false); capFan(rings.length - 1, true);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// v1.3.2 — section caps: a torn-off piece must read as a solid part of
+// one ship, not a hollow open shell. Interpolate the hull profile at a
+// cut (local z) and cap the cross-section with a solid face.
+function hullSectionAt(z) {
+  const st = HULL_CORE_STATIONS;
+  if (z <= st[0][0]) return { w: st[0][1], k: st[0][2] };
+  if (z >= st[st.length - 1][0]) return { w: st[st.length - 1][1], k: st[st.length - 1][2] };
+  for (let i = 0; i < st.length - 1; i++) {
+    if (z >= st[i][0] && z <= st[i + 1][0]) {
+      const f = (z - st[i][0]) / (st[i + 1][0] - st[i][0]);
+      return { w: st[i][1] + f * (st[i + 1][1] - st[i][1]), k: st[i][2] + f * (st[i + 1][2] - st[i][2]) };
+    }
+  }
+  return { w: 30, k: -20 };
+}
+function addSectionCap(group, zc, deckY, islBox) {
+  const { w, k } = hullSectionAt(zc);
+  const w2 = w + 1.5, k2 = k - 1; // GLB hull sits ~1.5 m outside the core
+  const topY = deckY + 0.3;
+  const midY = (topY + k2) / 2;
+  const s = new THREE.Shape();
+  s.moveTo(-w2, topY);
+  s.lineTo(w2, topY);
+  s.lineTo(w2, midY);
+  s.lineTo(w2 * 0.55, k2 + 1.5);
+  s.lineTo(0, k2);
+  s.lineTo(-w2 * 0.55, k2 + 1.5);
+  s.lineTo(-w2, midY);
+  s.closePath();
+  const cap = new THREE.Mesh(new THREE.ShapeGeometry(s), DM.capSteel);
+  cap.position.set(0, 0, zc);
+  cap.name = 'breakCap';
+  group.add(cap);
+  // Island cap: a solid rectangle where the cut passes through the tower.
+  if (islBox && zc >= islBox.min.z && zc <= islBox.max.z) {
+    const is = new THREE.Shape();
+    is.moveTo(islBox.min.x, deckY);
+    is.lineTo(islBox.max.x, deckY);
+    is.lineTo(islBox.max.x, islBox.max.y);
+    is.lineTo(islBox.min.x, islBox.max.y);
+    is.closePath();
+    const icap = new THREE.Mesh(new THREE.ShapeGeometry(is), DM.capSteel);
+    icap.position.set(0, 0, zc);
+    icap.name = 'breakCapIsland';
+    group.add(icap);
+  }
 }
 
 // v1.2.0 — procedural detail layered on the SHIELD GLB (template group,
@@ -87,7 +198,10 @@ function dbox(w, h, d, mat, x, y, z, ry = 0) {
 function buildCarrierDetail(group, podLocals, deckLocalY, deckHalfX, deckHalfZ) {
   const dy = deckLocalY;
   // --- 1. Close the deck hole ---
-  const under = dbox(deckHalfX * 2 + 2, 0.5, deckHalfZ * 2 + 8, DM.deckGrey, 0, dy - 0.35, 15);
+  // v1.2.1: the under-plate now runs the full deck length (to the stern
+  // tip, z 187) instead of stopping at z 160, so no stern-corner gap
+  // remains past it.
+  const under = dbox(deckHalfX * 2 + 2, 0.5, 322, DM.deckGrey, 0, dy - 0.35, 26);
   under.name = 'deckUnderPlate';
   group.add(under);
   const infill = dbox(38, 0.5, 268, DM.deckInfill, 0, dy - 0.05, 50);
@@ -164,9 +278,62 @@ function buildCarrierDetail(group, podLocals, deckLocalY, deckHalfX, deckHalfZ) 
   // --- Hull: a single rub strip tucked right under the deck edge,
   // where the hull is at full width. (Side plates lower down floated
   // clear of the hull — it narrows with depth — so they are gone.) ---
+  // v1.2.1: runs the full length, to the stern tip.
   for (const sx of [-1, 1]) {
-    group.add(dbox(0.3, 1.0, 260, DM.darkMark, sx * (deckHalfX + 0.1), dy - 1, 10));
+    group.add(dbox(0.3, 1.0, 304, DM.darkMark, sx * (deckHalfX + 0.1), dy - 1, 32));
   }
+  // --- Inner hull core: a closed solid loft, Hurricane-style ---
+  // v1.2.1 solidity fix. The GLB hull is a set of open shell patches:
+  // the mid-body side band (z -20..0, y -18..-13) is open and the belly
+  // is hollow — rays from below first hit the recessed under-plate at
+  // y -5.9 instead of a keel (64% of belly rays were "shallow" pre-fix).
+  // The core is a closed loft whose sections follow the GLB hull profile
+  // (measured per-z from the GLB vertices), inset ~1.5 m inside the
+  // shell, so it never pokes through — but it IS the visible hull where
+  // the GLB leaves nothing (stern overhang z 142..184, mid-body belly).
+  // It also backs the deck, so no see-through path reaches the sky.
+  const core = new THREE.Mesh(hullCoreGeometry(dy - 0.3), DM.hullCore);
+  core.name = 'hullCore';
+  group.add(core);
+  // --- Bow and stern caps ---
+  // Flat transom closing the stern face below the deck overhang, and a
+  // cap closing the thin bow tip.
+  const transom = dbox(deckHalfX * 2, 24, 1.5, DM.hullGrey, 0, dy - 17, 183.5);
+  transom.name = 'sternTransom';
+  group.add(transom);
+  const bowCap = dbox(22, 4, 1.5, DM.hullGrey, 0, dy - 0.5, -165.5);
+  bowCap.name = 'bowCap';
+  group.add(bowCap);
+  // --- Island base coaming ---
+  // A low coaming ring around the island base seals the island/deck
+  // junction and reads as real structure.
+  const islX0 = -40.8, islX1 = -14.2, islZ0 = -20.3, islZ1 = 119.1;
+  const islCx = (islX0 + islX1) / 2, islCz = (islZ0 + islZ1) / 2;
+  const coam = (w, h, d, x, z) => { const m = dbox(w, h, d, DM.panelGrey, x, dy + 0.7, z); m.name = 'islandCoaming'; group.add(m); return m; };
+  coam(1.2, 1.4, islZ1 - islZ0 + 2.4, islX0, islCz);
+  coam(1.2, 1.4, islZ1 - islZ0 + 2.4, islX1, islCz);
+  coam(islX1 - islX0 + 2.4, 1.4, 1.2, islCx, islZ0);
+  coam(islX1 - islX0 + 2.4, 1.4, 1.2, islCx, islZ1);
+  // Island inner core: island_23 is an open shell with a missing band
+  // (rays at y +2, z 0..20 passed straight through it), so a solid
+  // box inside the island footprint closes every path through it.
+  const islCore = dbox(25, 9.4, 137, DM.panelGrey, -27.5, -0.7, 49.5);
+  islCore.name = 'islandCore';
+  group.add(islCore);
+  // --- Pod sponson plates and duct caps ---
+  // A solid plate under each lift-fan pod closes the view from below
+  // into the pod housing, and a cap disc closes the bottom of the
+  // exhaust cone. (Both are assigned to the pod's mesh set so they
+  // disappear with the pod when it is destroyed.)
+  podLocals.forEach((p, i) => {
+    const sx = Math.sign(p.x);
+    const plate = dbox(76, 2, 2 * p.r + 4, DM.panelGrey, sx * 55, p.y - 13, p.z);
+    plate.name = 'podSponson_' + i;
+    group.add(plate);
+    const cap = new THREE.Mesh(new THREE.CircleGeometry(p.r * 0.55, 24), DM.ductDark);
+    cap.rotation.x = -Math.PI / 2; cap.position.set(p.x, p.y - 11, p.z); cap.name = 'podDuctCap_' + i;
+    group.add(cap);
+  });
   // --- Stern engine exhausts (MCU: twin rear engine arrays) ---
   for (const sx of [-1, 1]) {
     const ex = new THREE.Mesh(new THREE.CylinderGeometry(3.5, 4.2, 12, 14), DM.gunmetal);
@@ -342,7 +509,7 @@ export function applyEnemyLivery(group) {
     if (!o.isMesh) return;
     o.material = o.material.clone();
     const n = o.name;
-    if (n.startsWith('hull_') || n.startsWith('island_') || n.startsWith('pod_housing_')) {
+    if (n.startsWith('hull_') || n.startsWith('island_') || n === 'islandCore' || n.startsWith('pod_housing_') || n === 'hullCore' || n.startsWith('podSponson') || n === 'sternTransom' || n === 'bowCap' || n === 'islandCoaming') {
       o.material.color.setHex(0x7a2e26);
     } else if (n.startsWith('duct_ring_')) {
       o.material.color.setHex(0x4a1a16);
@@ -360,7 +527,28 @@ export class BreakupPiece {
     this.state = 'falling'; this.sinkT = 0; this.y = group.position.y;
     this.roll = group.rotation.z; this.pitch = group.rotation.x; this.heading = -group.rotation.y;
     this.impactY = 0; this.bubbleT = 0; this.boilT = 0;
+    this.clipMats = []; // v1.3.2: materials whose clip planes follow the piece
     scene.add(group);
+  }
+  // v1.3.2: the cut planes travel with the piece. Hurricane's splitShip
+  // re-aims its clip planes every frame so the cut follows each half as
+  // it drifts and turns; the v1.3.0 port baked the planes once in world
+  // space, so a tumbling clone was sliced by a fixed slab and showed
+  // other sections of the ship — the "glitching duplicates" Nicholas
+  // reported. Planes are stored in the piece's local space (cut along
+  // local Z) and re-transformed to world space from the piece's matrix
+  // every frame, so each piece always shows exactly its own section.
+  refreshClipPlanes() {
+    if (!this.clipMats || !this.clipMats.length) return;
+    this.group.updateMatrix();
+    this.group.matrixWorld.copy(this.group.matrix);
+    for (const m of this.clipMats) {
+      const locals = m.userData.clipLocals;
+      if (!locals) continue;
+      for (let i = 0; i < locals.length; i++) {
+        m.clippingPlanes[i].copy(locals[i]).applyMatrix4(this.group.matrixWorld);
+      }
+    }
   }
   update(dt, ctx) {
     if (this.state === 'falling') {
@@ -385,14 +573,28 @@ export class BreakupPiece {
       this.sinkT += dt / 30;
       const f = Math.min(1, this.sinkT);
       this.group.position.y = this.impactY - f * f * 55;
+      // v1.3.2: sinking pieces keep drifting apart horizontally (with
+      // drag) and slowly tumbling instead of freezing in a pile at the
+      // impact point. Water-impact fragments are born at the same spot;
+      // without this they sink as one overlapping mass and read as the
+      // same "duplicates" glitch the clip fix addresses.
+      const drag = Math.exp(-dt * 0.15);
+      this.vx *= drag; this.vz *= drag;
+      this.group.position.x += this.vx * dt;
+      this.group.position.z += this.vz * dt;
+      this.roll += this.rollRate * dt * 0.3;
+      this.pitch += this.pitchRate * dt * 0.3;
+      this.heading += this.yawRate * dt * 0.3;
       this.roll += (0.4 - this.roll) * dt * 0.5;
-      this.group.rotation.z = this.roll;
+      this.group.rotation.set(this.pitch, -this.heading, this.roll);
       this.bubbleT -= dt;
       if (this.bubbleT <= 0) { this.bubbleT = 0.12; ctx.vfx.bubbles(this.group.position.x, this.impactY, this.group.position.z, 4, 60); }
       this.boilT -= dt;
       if (this.boilT <= 0 && f > 0.1 && f < 0.9) { this.boilT = 0.4; ctx.vfx.boil(this.group.position.x, this.impactY, this.group.position.z, 40); }
       if (f >= 1) { this.state = 'gone'; this.group.visible = false; }
     }
+    // v1.3.2: re-aim the cut planes every frame (see refreshClipPlanes).
+    if (this.state !== 'gone') this.refreshClipPlanes();
   }
   get gone() { return this.state === 'gone'; }
 }
@@ -429,6 +631,9 @@ export class Helicarrier {
     this.breakupT = 0; this.pieces = [];
     this.scorches = [];
     this.pitchInput = 0; // v1.2.0 helm pitch command, -1..1 (+ = nose up)
+    this.heelKick = 0; // v1.3.0 blast heel (decays in update)
+    this.blastVx = 0; this.blastVz = 0; // v1.3.0 blast shove velocity
+    this.blastYaw = 0; // v1.3.0 blast yaw kick rate
     this.lastHit = null; // v1.2.0: killing-blow context for varied breakup
     this.radar = null; // island radar bar (spins)
     // Zones
@@ -472,7 +677,7 @@ export class Helicarrier {
   _assignPodMeshes() {
     const podMeshes = [];
     this.group.traverse(o => {
-      if (o.isMesh && (o.name.startsWith('pod_housing_') || o.name.startsWith('rotor_disc_') || o.name.startsWith('rotor_hub_') || o.name.startsWith('duct_ring_'))) {
+      if (o.isMesh && (o.name.startsWith('pod_housing_') || o.name.startsWith('rotor_disc_') || o.name.startsWith('rotor_hub_') || o.name.startsWith('duct_ring_') || o.name.startsWith('podSponson_') || o.name.startsWith('podDuctCap_'))) {
         const b = new THREE.Box3().setFromObject(o);
         const c = b.getCenter(new THREE.Vector3());
         podMeshes.push({ o, c });
@@ -540,7 +745,27 @@ export class Helicarrier {
       _across: rAcross,
     };
   }
-  // Map a hit in carrier-local coords to a damage zone.
+  // v1.3.0 blastImpulse (Hurricane v10.1, metric): an inverse-square
+  // physical blast. A detonation shoves the hull away from the blast,
+  // heels it away, and kicks the yaw if the blast is off-centre. Nearby
+  // ships feel it too, falling off with the square of the distance.
+  // Hurricane blastRadius 40u -> 40*5.74 = 230 m; falloff P/(1+d2/100)
+  // is in Hurricane units, so here fall = power/(1+d2/2500) with the
+  // same shape at metre scale. Called from damage() for hard hits and
+  // from detonate()/breakUp() — never for light bumps.
+  blastImpulse(bx, bz, power) {
+    if (this.state !== 'alive') return;
+    const dx = this.x - bx, dz = this.z - bz;
+    const d2 = dx * dx + dz * dz, d = Math.sqrt(d2) || 1;
+    if (d > 230) return;
+    const fall = power / (1 + d2 / 2500);
+    const nx = dx / d, nz = dz / d;
+    this.blastVx += nx * fall * 0.35;
+    this.blastVz += nz * fall * 0.35;
+    const lat = dx * Math.cos(this.heading) + dz * Math.sin(this.heading);
+    this.heelKick -= Math.sign(lat || 1) * 0.1 * Math.min(1, fall / 6);
+    this.blastYaw += (Math.random() - 0.5) * 0.05 * Math.min(1, fall / 6);
+  }
   zoneAt(lx, lz, fromAbove) {
     const along = -lz / (CARRIER_LEN / 2); // +1 = bow, -1 = stern
     if (along > 0.5) return 'magazine';
@@ -573,12 +798,20 @@ export class Helicarrier {
     const szF = CARRIER_LEN / 42;
     const magHit = zoneKey === 'magazine';
     // Collision grind ticks pass { quiet: true } — zone damage only, no
-    // hit flash/scorch per tick (the collision code sparks instead).
+    // hit flash per tick (the collision code sparks instead).
     // { noIgnite: true } keeps light collision bumps from starting fires.
+    // v1.3.0 (H): a scorch decal is applied on EVERY hit, quiet or not —
+    // Hurricane calls addScorch in both damage paths. Only the flash/FX
+    // is skipped for quiet ticks.
+    this.scorches.push(ctx.vfx.addScorch(this.group, lx, this.deckLocalY + 1, lz, 14));
+    if (this.scorches.length > 20) { const s = this.scorches.shift(); this.group.remove(s); }
     if (!opts || !opts.quiet) {
       ctx.vfx.hitFX(wp.x, wp.y + 4, wp.z, amount, szF, magHit);
-      this.scorches.push(ctx.vfx.addScorch(this.group, lx, this.deckLocalY + 1, lz, 14));
-      if (this.scorches.length > 20) { const s = this.scorches.shift(); this.group.remove(s); }
+    }
+    // v1.3.0 (H): hard hits physically shove this carrier and her
+    // neighbours (inverse-square blast impulse).
+    if (amount >= 15 && ctx.carriers) {
+      for (const c of ctx.carriers) c.blastImpulse(wp.x, wp.z, amount * 0.6);
     }
     let detonate = false;
     if (zoneKey.startsWith('pod:')) {
@@ -588,14 +821,14 @@ export class Helicarrier {
         pod.alive = false;
         pod.meshes.forEach(m => { m.visible = false; });
         ctx.vfx.burst(wp.x, wp.y, wp.z, 40, [1, 0.6, 0.2], 10, 6);
-        this.ignite('pod:' + this.pods.indexOf(pod), lx, lz, amount / 20);
+        this.ignite('pod:' + this.pods.indexOf(pod), lx, lz, amount / 20, ctx);
         ctx.msg(`${this.name}: lift pod destroyed — lift ${(this.lift * 100) | 0}%`);
       }
     } else {
       const z = this.zones[zoneKey];
       const before = z.hp;
       z.hp = Math.max(0, z.hp - amount);
-      if (amount >= 8 && !(opts && opts.noIgnite)) this.ignite(zoneKey, lx, lz, amount / 20);
+      if (amount >= 8 && !(opts && opts.noIgnite)) this.ignite(zoneKey, lx, lz, amount / 20, ctx);
       if (zoneKey === 'magazine' && amount >= 15 && (z.hp <= 0 || this.hpFrac <= 0.5)) detonate = true;
       if (zoneKey === 'reactor') {
         if (z.hp <= 0) detonate = true;
@@ -612,21 +845,38 @@ export class Helicarrier {
       this.startFall(ctx, this.lift <= 0 ? 'all lift pods lost' : 'structural failure');
     }
   }
-  ignite(zoneKey, lx, lz, severity = 1) {
+  ignite(zoneKey, lx, lz, severity = 1, ctx) {
     if (this.fires.some(f => f.zone === zoneKey)) return;
     if (this.fires.length >= 6) return; // one fire per zone, max 6 concurrent
     // v1.2.0: fire severity rides along for the visuals (flame/smoke
     // size by zone and hit strength). The HP drain stays exactly as
     // before — intensity still starts at 0.5 and grows at the same rate.
-    this.fires.push({ zone: zoneKey, lx, lz, intensity: 0.5, t: 0, sev: Math.max(0.5, Math.min(2, severity)) });
+    this.fires.push({ zone: zoneKey, lx, lz, intensity: 0.5, t: 0, sev: Math.max(0.5, Math.min(2, severity)), cookT: 2 + Math.random() * 2 });
+    // v1.3.1: a new fire flares up visibly at the hit point.
+    if (ctx && ctx.vfx) {
+      const wp = this.deckPoint(lx, lz);
+      ctx.vfx.burst(wp.x, wp.y + 3, wp.z, 12, [1, 0.6, 0.2], 7, 4);
+      ctx.vfx.spawnSprite(wp.x, wp.y + 4, wp.z, 0.35, 10, 10, 3, 0xff8c2e, 0.85);
+    }
   }
   detonate(ctx, zoneKey) {
     // v1.2.0: explosions scale with what blew up — a reactor breach is
     // bigger and more violent than a magazine hit, which is bigger than
     // a deck hit. (Damage amounts and detonation gates are unchanged.)
+    // v1.3.1: also scaled by the killing blow's severity, plus a debris
+    // smoke ring thrown outward from the blast.
     const scale = zoneKey === 'reactor' ? 1.35 : zoneKey === 'magazine' ? 1.2 : 1;
-    ctx.vfx.magazineSecondary(this.x, this.y, this.z, CARRIER_LEN / 42 * scale);
+    const sev = Math.max(0.6, Math.min(2, (this.lastHit ? this.lastHit.amount : 30) / 40));
+    ctx.vfx.magazineSecondary(this.x, this.y, this.z, CARRIER_LEN / 42 * scale * (0.8 + 0.2 * sev));
     ctx.vfx.burst(this.x, this.y, this.z, Math.round(40 * scale), [0.9, 0.9, 0.9], 12, 8);
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 + Math.random() * 0.5;
+      const s = ctx.vfx.spawnSprite(this.x + Math.cos(a) * 40, this.y + 4, this.z + Math.sin(a) * 40, 4, 18, 18, 0.4, 0x1a1a1a, 0.6);
+      s.vx = Math.cos(a) * 8; s.vz = Math.sin(a) * 8; s.vy = 1;
+    }
+    if (ctx.audio) ctx.audio.boom(true);
+    if (ctx.noteDetonation) ctx.noteDetonation(this.x, this.y, this.z, 'detonation');
+    if (ctx.carriers) for (const c of ctx.carriers) if (c !== this) c.blastImpulse(this.x, this.z, 60 * scale);
     ctx.msg(`${this.name}: ${zoneKey === 'reactor' ? 'REACTOR' : 'MAGAZINE'} DETONATION`);
     this.breakUp(ctx, 'detonation');
   }
@@ -635,6 +885,7 @@ export class Helicarrier {
     this.state = 'falling';
     this.fallT = 0;
     this.vy = 0;
+    this.fallStartAlt = this.y; this.lastImpact = null; this.lastBreakup = null;
     const deadX = this.pods.filter(p => !p.alive).reduce((a, p) => a + p.local.x, 0);
     this.fallRollRate = (deadX >= 0 ? 1 : -1) * (0.06 + 0.1 * (1 - this.lift)) + (Math.random() - 0.5) * 0.05;
     this.fallPitchRate = (Math.random() - 0.5) * 0.08;
@@ -642,16 +893,23 @@ export class Helicarrier {
     ctx.msg(`${this.name} is FALLING — ${reason}`);
     if (this.wing) this.wing.handleCarrierFalling(ctx);
   }
-  // Split into 2-4 tumbling pieces (Hurricane splitShip clipping-plane trick,
-  // extended: each piece is a clone with 1-2 world-space clipping planes).
-  // v1.2.0: the breakup varies with the damage — the cut runs through
-  // where she was hit, the piece count grows with the killing blow,
-  // pieces inherit her velocity plus a blast separation impulse, and
-  // tumble rates scale with her speed and attitude at the time. No two
-  // kills play out the same. (Damage amounts/gates are unchanged.)
-  breakUp(ctx, reason) {
+  // Split into a VARIABLE number of tumbling pieces (Hurricane splitShip
+  // clipping-plane trick, generalised). The breakup is driven by the
+  // killing blow — no fixed piece count, no single canned split:
+  //   v1.3.2: each piece is a genuine section — the cut planes live in
+  //   the piece's local space and are re-aimed every frame, and each
+  //   interior cut face gets a solid section cap. The v1.3.0 port baked
+  //   world-space planes once, so tumbling clones showed each other's
+  //   decks/islands/pods (the "duplicates" glitch).
+  //   energy  = severity x speed x altitude x attitude (x1.3 detonation)
+  //   cuts    = 1 + one per energy band (2..6 pieces)
+  //   cut positions: first through the hit, the rest spread around it
+  //     with jitter, min 40 m apart — so piece sizes vary too
+  //   tumble: faster near the blast, wilder at speed/altitude
+  //   separation: pieces fly away from the hit along the hull
+  // (Damage amounts/gates are unchanged.)
+  breakUp(ctx, reason, opts = {}) {
     if (this.state === 'gone') return;
-    const wasAlive = this.state === 'alive';
     const fallVy = this.state === 'falling' ? this.vy : -5; // capture before state flips
     const hit = this.lastHit || {
       zone: 'reactor', amount: 30, lx: 0, lz: 0,
@@ -659,10 +917,41 @@ export class Helicarrier {
       heading: this.heading, lift: this.lift,
     };
     const severity = Math.max(0.6, Math.min(2, hit.amount / 40));
-    const hitAlong = Math.max(-1, Math.min(1, -hit.lz / (CARRIER_LEN / 2))); // +1 = bow
-    const cutOff = hitAlong * 55; // cut plane offset from centre, toward the hit
     const speedF = 1 + Math.min(1.5, Math.abs(hit.speed) / 16); // faster ship = wilder tumble
-    const sepV = 3 + 4 * severity; // blast separation impulse along the hull
+    const altF = 1 + Math.min(0.5, hit.alt / 800);
+    const attF = 1 + Math.min(0.5, (Math.abs(hit.pitch) + Math.abs(hit.roll)) / 0.4);
+    let energy = severity * speedF * altF * attF;
+    if (reason === 'detonation') energy *= 1.3;
+    if (opts.energy) energy = opts.energy;
+    // Cut count from energy: 2 pieces for a light kill, up to 6 for a
+    // violent one. A forced count (water impact) overrides.
+    let nCuts = 1;
+    if (energy > 1.2) nCuts = 2;
+    if (energy > 2.0) nCuts = 3;
+    if (energy > 3.0) nCuts = 4;
+    if (energy > 4.5) nCuts = 5;
+    if (opts.cuts) nCuts = opts.cuts;
+    nCuts = Math.max(1, Math.min(5, nCuts));
+    const hitAlong = Math.max(-1, Math.min(1, -hit.lz / (CARRIER_LEN / 2))); // +1 = bow
+    const cutOff = hitAlong * 55; // first cut through the hit
+    const cuts = [cutOff];
+    // Extra cuts: alternate sides of the hit at growing radii (58 m,
+    // then 104 m each side), jittered — so every cut lands ≥35 m from
+    // the others and the piece sizes genuinely vary. (A single fixed
+    // spread radius could only ever place one cut per side, capping
+    // every violent kill at 4 pieces no matter the energy.)
+    const radii = [58, 104];
+    let sideSign = Math.random() < 0.5 ? 1 : -1;
+    for (let i = 1; i < nCuts; i++) {
+      const radius = radii[Math.floor((i - 1) / 2)] || 145;
+      const cand = cutOff + sideSign * (radius + (Math.random() - 0.5) * 8);
+      sideSign = -sideSign;
+      if (cand < -150 || cand > 150) continue;
+      if (cuts.some(c => Math.abs(c - cand) < 35)) continue;
+      cuts.push(cand);
+    }
+    cuts.sort((a, b) => a - b);
+    const sepV = (3 + 4 * severity) * (energy > 2 ? 1.3 : 1); // blast separation impulse along the hull
     this.state = 'gone';
     this.group.visible = false;
     // Object3D.clone() JSON-deep-clones userData; group.userData.carrier
@@ -672,51 +961,67 @@ export class Helicarrier {
     // the original is dead and no longer needs click-pick identity.
     this.group.userData.carrier = undefined;
     const fwd = { x: Math.sin(this.heading), z: -Math.cos(this.heading) };
-    const side = { x: Math.cos(this.heading), z: Math.sin(this.heading) };
-    const cx = this.x, cz = this.z;
-    const mkPiece = (planes, rollRate, pitchRate, vx, vz) => {
+    const bounds = [-CARRIER_LEN / 2, ...cuts, CARRIER_LEN / 2];
+    const impactVx = opts.impactVx || 0, impactVz = opts.impactVz || 0;
+    // Island footprint in the carrier's local space, for section caps.
+    this.group.updateMatrixWorld(true);
+    const invM = new THREE.Matrix4().copy(this.group.matrixWorld).invert();
+    let islBox = null;
+    this.group.traverse(o => {
+      if (o.isMesh && o.name.startsWith('island_')) {
+        const b = new THREE.Box3().setFromObject(o).applyMatrix4(invM);
+        islBox = islBox ? islBox.union(b) : b;
+      }
+    });
+    const mkPiece = (lo, hi, segCentre) => {
+      // v1.3.2: the cut lives in the piece's LOCAL space — a segment
+      // [lo,hi] in along-hull d maps to local z in [-hi,-lo] (bow is
+      // -Z, d = -lz). The planes are re-aimed to world space every
+      // frame in BreakupPiece.refreshClipPlanes (the Hurricane re-aim
+      // the v1.3.0 port dropped). A world plane baked once slices a
+      // moving, tumbling clone at a different section every frame, so
+      // pieces showed each other's decks, islands and pods — the
+      // "glitching duplicates" Nicholas reported.
+      const locals = [];
+      if (lo > -CARRIER_LEN / 2 + 1) locals.push(new THREE.Plane(new THREE.Vector3(0, 0, -1), -lo)); // keep z <= -lo
+      if (hi < CARRIER_LEN / 2 - 1) locals.push(new THREE.Plane(new THREE.Vector3(0, 0, 1), hi));    // keep z >= -hi
       const clone = this.group.clone(true);
       clone.visible = true;
+      const clipMats = [];
       clone.traverse(o => {
         if (o.isMesh) {
           o.material = o.material.clone();
-          o.material.clippingPlanes = planes.map(p => new THREE.Plane(new THREE.Vector3(p.nx, 0, p.nz), p.c));
+          o.material.clippingPlanes = locals.map(() => new THREE.Plane());
+          o.material.userData.clipLocals = locals;
+          clipMats.push(o.material);
         }
       });
+      // End caps: a solid cross-section at each interior cut face, so
+      // a piece reads as a torn-off part of one ship, not a hollow shell.
+      if (lo > -CARRIER_LEN / 2 + 1) addSectionCap(clone, -lo, this.deckLocalY, islBox);
+      if (hi < CARRIER_LEN / 2 - 1) addSectionCap(clone, -hi, this.deckLocalY, islBox);
       clone.position.set(this.x, this.y, this.z);
       clone.rotation.set(this.pitch, -this.heading, this.roll);
-      const piece = new BreakupPiece(ctx.scene, clone, fallVy, rollRate, pitchRate, (Math.random() - 0.5) * 0.1 * speedF,
-        (this.vx || 0) + vx, (this.vz || 0) + vz);
+      // Tumble: faster near the blast, wilder with speed/altitude.
+      const dHit = Math.abs(segCentre - cutOff);
+      const tumble = (0.7 + 0.6 * severity) * (1 + 0.5 * (1 - Math.min(1, dHit / 150))) * speedF;
+      const away = Math.sign(segCentre - cutOff) || (Math.random() < 0.5 ? 1 : -1);
+      const piece = new BreakupPiece(ctx.scene, clone, fallVy,
+        (0.2 + Math.random() * 0.4) * tumble * (Math.random() < 0.5 ? 1 : -1),
+        (Math.random() - 0.5) * 0.4 * tumble,
+        (Math.random() - 0.5) * 0.1 * speedF,
+        (this.vx || 0) + impactVx + fwd.x * away * sepV * (0.7 + Math.random() * 0.6),
+        (this.vz || 0) + impactVz + fwd.z * away * sepV * (0.7 + Math.random() * 0.6));
+      piece.clipMats = clipMats;
+      piece.refreshClipPlanes(); // aim the planes before the first frame
       this.pieces.push(piece);
     };
-    // Bow piece: keep forward side of the cut plane through the hit
-    // (plane keeps n·p + c >= 0, so c = -fwd·centre - cutOff keeps d >= cutOff).
-    mkPiece([{ nx: fwd.x, nz: fwd.z, c: -(fwd.x * cx + fwd.z * cz) - cutOff }],
-      (0.25 + Math.random() * 0.2) * speedF * severity, 0.1 * speedF, fwd.x * sepV, fwd.z * sepV);
-    // Stern piece: keep aft side (d <= cutOff).
-    mkPiece([{ nx: -fwd.x, nz: -fwd.z, c: (fwd.x * cx + fwd.z * cz) + cutOff }],
-      (-0.25 - Math.random() * 0.2) * speedF * severity, -0.1 * speedF, -fwd.x * sepV, -fwd.z * sepV);
-    // Mid piece (only if the carrier was still flying — a 3-way split).
-    // Heavy killing blows split her more often; the slab sits on the hit.
-    if (wasAlive && (severity > 1.1 ? Math.random() < 0.85 : Math.random() < 0.6)) {
-      mkPiece([
-        { nx: fwd.x, nz: fwd.z, c: -(fwd.x * cx + fwd.z * cz) - (cutOff - 45) },
-        { nx: -fwd.x, nz: -fwd.z, c: (fwd.x * cx + fwd.z * cz) + (cutOff + 45) },
-      ], (Math.random() - 0.5) * 0.5 * speedF, 0.3 * speedF,
-        side.x * sepV * 0.6, side.z * sepV * 0.6);
-    }
-    // Very heavy blows at altitude shed a fourth fragment — a pod-side
-    // chunk torn off sideways by the blast.
-    if (wasAlive && severity > 1.5 && hit.alt > 250 && Math.random() < 0.6) {
-      const sgn = Math.random() < 0.5 ? 1 : -1;
-      mkPiece([
-        { nx: fwd.x, nz: fwd.z, c: -(fwd.x * cx + fwd.z * cz) - (cutOff - 90) },
-        { nx: -fwd.x, nz: -fwd.z, c: (fwd.x * cx + fwd.z * cz) + (cutOff - 45) },
-      ], (Math.random() - 0.5) * 0.7 * speedF, (Math.random() - 0.5) * 0.4 * speedF,
-        side.x * sepV * sgn, side.z * sepV * sgn);
-    }
+    for (let i = 0; i < bounds.length - 1; i++) mkPiece(bounds[i], bounds[i + 1], (bounds[i] + bounds[i + 1]) / 2);
+    this.lastBreakup = { reason, pieces: this.pieces.length, energy: +energy.toFixed(2), cuts: cuts.map(c => +c.toFixed(0)), hitZone: hit.zone, hitAmount: hit.amount, alt: +hit.alt.toFixed(0), speed: +hit.speed.toFixed(1) };
     ctx.vfx.magazineSecondary(this.x, this.y, this.z, CARRIER_LEN / 42 * Math.max(0.9, Math.min(1.6, 0.8 + severity * 0.3)));
     ctx.vfx.burst(this.x, this.y, this.z, Math.round(30 * severity), [0.25, 0.25, 0.25], 11, 7);
+    if (ctx.audio) ctx.audio.boom(true);
+    if (ctx.carriers) for (const c of ctx.carriers) if (c !== this) c.blastImpulse(this.x, this.z, 60 * severity);
     ctx.msg(`${this.name} broke up ${reason ? '(' + reason + ')' : ''} — ${this.pieces.length} pieces falling`);
     if (this.wing) this.wing.handleCarrierFalling(ctx);
     if (ctx.onCarrierLost) ctx.onCarrierLost(this);
@@ -739,7 +1044,7 @@ export class Helicarrier {
       pod.spinRate += (target - pod.spinRate) * Math.min(1, dt * 1.2); // spool lag
       pod.spinAngle += pod.spinRate * dt * pod.spinDir;
       pod.rotorSpin.rotation.y = pod.spinAngle;
-      if (pod.blur) pod.blur.material.opacity = 0.04 + 0.16 * Math.max(0, Math.min(1, pod.spinRate / 30));
+      if (pod.blur) pod.blur.material.opacity = 0.10 + 0.22 * Math.max(0, Math.min(1, pod.spinRate / 30)); // v1.2.1: fan disc reads solid from below
     }
     // Island radar bar sweeps while the carrier lives.
     if (this.radar && this.state === 'alive') this.radar.rotation.y += dt * 1.5;
@@ -747,13 +1052,22 @@ export class Helicarrier {
     // v1.2.0 visuals are tied to the zone and the hit severity — a
     // reactor fire is bigger, hotter and smokier than a pod fire, and
     // a hard hit burns harder. (Drain rate and spread are unchanged.)
+    // v1.3.1: the visuals also EVOLVE as the zone burns down — the
+    // flame/smoke scale grows with the burn fraction, reactor fires
+    // burn white-blue at the core, magazine fires red-orange, and
+    // smoke darkens as the fire matures. Hot magazine/reactor fires
+    // throw visual-only cook-off bursts as they near burnout.
     this.fireT -= dt;
     for (const f of this.fires) {
       f.t += dt;
       f.intensity = Math.min(1, f.intensity + dt * 0.05);
       const zoneScale = f.zone === 'reactor' ? 1.5 : f.zone === 'magazine' ? 1.35 : f.zone === 'deck' ? 1.1 : f.zone.startsWith('pod:') ? 0.85 : 1;
       const sevScale = 0.7 + 0.3 * (f.sev || 1);
-      const visScale = zoneScale * sevScale;
+      const zoneHpFrac = f.zone.startsWith('pod:')
+        ? ((this.pods[+f.zone.split(':')[1]] || { hp: 0 }).hp / 100)
+        : (this.zones[f.zone] ? this.zones[f.zone].hp / this.zones[f.zone].max : 0);
+      const burnFrac = 1 - Math.max(0, Math.min(1, zoneHpFrac));
+      const visScale = zoneScale * sevScale * (0.8 + 0.6 * burnFrac);
       const drain = f.intensity * 2.0 * dt;
       if (f.zone.startsWith('pod:')) {
         const pod = this.pods[+f.zone.split(':')[1]];
@@ -765,9 +1079,11 @@ export class Helicarrier {
       if (this.fireT <= 0) {
         const wp = this.deckPoint(f.lx, f.lz);
         const nFl = 2 + Math.floor(f.intensity * 4);
+        const fc = f.zone === 'magazine' ? [1, 0.4, 0.15] : [1, 0.65, 0.2];
         for (let i = 0; i < nFl; i++) {
+          const col = f.zone === 'reactor' && i % 3 === 0 ? [0.75, 0.85, 1] : fc; // reactor core burns white-blue
           ctx.vfx.spawnParticle(wp.x + (Math.random() - 0.5) * 6, wp.y + 2, wp.z + (Math.random() - 0.5) * 6,
-            (Math.random() - 0.5) * 2, (2 + Math.random() * 2.5) * visScale, (Math.random() - 0.5) * 2, 0.8 * visScale, 1, 0.65, 0.2, -0.5);
+            (Math.random() - 0.5) * 2, (2 + Math.random() * 2.5) * visScale, (Math.random() - 0.5) * 2, 0.8 * visScale, col[0], col[1], col[2], -0.5);
         }
         // Hot fires throw embers; reactor/magazine fires throw more.
         if (f.intensity > 0.7) {
@@ -776,33 +1092,82 @@ export class Helicarrier {
               (Math.random() - 0.5) * 4, 4 + Math.random() * 3, (Math.random() - 0.5) * 4, 1.2, 1, 0.5, 0.1, -6);
           }
         }
-        const sm = ctx.vfx.spawnSprite(wp.x, wp.y + 8, wp.z, 3.5, (8 + f.intensity * 4) * visScale, (8 + f.intensity * 4) * visScale, 0.5,
-          f.zone === 'reactor' || f.zone === 'magazine' ? 0x241812 : 0x141414, 0.6);
+        const smokeCol = burnFrac > 0.5 ? 0x0a0a0a : (f.zone === 'reactor' || f.zone === 'magazine' ? 0x241812 : 0x141414);
+        const sm = ctx.vfx.spawnSprite(wp.x, wp.y + 8, wp.z, 3.5, (8 + f.intensity * 4 + burnFrac * 6) * visScale, (8 + f.intensity * 4 + burnFrac * 6) * visScale, 0.5,
+          smokeCol, 0.6);
         sm.vy = 3;
+      }
+      // Cook-off: a hot magazine/reactor fire throws secondary bursts
+      // as it matures — visual only, no extra damage.
+      if ((f.zone === 'magazine' || f.zone === 'reactor') && f.intensity > 0.85) {
+        const z = this.zones[f.zone];
+        if (z && z.hp < 45) {
+          f.cookT -= dt;
+          if (f.cookT <= 0) {
+            f.cookT = 3 + Math.random() * 3;
+            const wp2 = this.deckPoint(f.lx, f.lz);
+            ctx.vfx.burst(wp2.x, wp2.y + 4, wp2.z, 18, [1, 0.55, 0.15], 9, 5);
+            ctx.vfx.spawnSprite(wp2.x, wp2.y + 4, wp2.z, 0.4, 12 * (CARRIER_LEN / 42), 12 * (CARRIER_LEN / 42), 3, 0xff8c2e, 0.9);
+            if (ctx.audio) ctx.audio.boom(false);
+          }
+        }
       }
       // Spread: every ~5 s, 8% chance to ignite another damaged zone.
       if (f.t > 5 && Math.random() < dt * 0.016) {
         const keys = ['reactor', 'magazine', 'bridge', 'deck', 'engines'];
         const k = keys[Math.floor(Math.random() * keys.length)];
-        if (this.zones[k].hp < this.zones[k].max) this.ignite(k, (Math.random() - 0.5) * 40, (Math.random() - 0.5) * 200);
+        if (this.zones[k].hp < this.zones[k].max) this.ignite(k, (Math.random() - 0.5) * 40, (Math.random() - 0.5) * 200, 1, ctx);
       }
     }
     if (this.fireT <= 0) this.fireT = 0.15;
-    // Hurt smoke (no fire): hp < 70% dark smoke, < 40% + embers.
+    // Hurt smoke (no fire): hp < 70% dark smoke, < 40% thicker + embers
+    // (v1.3.0 H grading — was smoke-only at both thresholds).
     this.hurtT -= dt;
     if (this.hurtT <= 0 && this.hpFrac < 0.7 && this.state === 'alive') {
       this.hurtT = this.hpFrac < 0.4 ? 0.3 : 0.45;
       const wp = this.deckPoint((Math.random() - 0.5) * 40, (Math.random() - 0.5) * 200);
       const sm = ctx.vfx.spawnSprite(wp.x, wp.y + 6, wp.z, 3.0, 10, 10, 0.4, 0x1a1a1a, 0.5);
       sm.vy = 2.5;
+      if (this.hpFrac < 0.4) {
+        // Thicker smoke + embers below 40%.
+        const sm2 = ctx.vfx.spawnSprite(wp.x, wp.y + 10, wp.z, 3.5, 16, 16, 0.5, 0x141414, 0.65);
+        sm2.vy = 3;
+        for (let i = 0; i < 2; i++) {
+          ctx.vfx.spawnParticle(wp.x + (Math.random() - 0.5) * 6, wp.y + 3, wp.z + (Math.random() - 0.5) * 6,
+            (Math.random() - 0.5) * 3, 3 + Math.random() * 3, (Math.random() - 0.5) * 3, 1.0, 1, 0.5, 0.1, -6);
+        }
+      }
+      // v1.3.1: a dying ship (below 25%) flickers with small flames at
+      // scorched deck points even where no fire object is burning.
+      if (this.hpFrac < 0.25 && Math.random() < 0.35) {
+        const fp = this.deckPoint((Math.random() - 0.5) * 50, (Math.random() - 0.5) * 220);
+        for (let i = 0; i < 3; i++) {
+          ctx.vfx.spawnParticle(fp.x + (Math.random() - 0.5) * 4, fp.y + 2, fp.z + (Math.random() - 0.5) * 4,
+            (Math.random() - 0.5) * 2, 2 + Math.random() * 2, (Math.random() - 0.5) * 2, 0.7, 1, 0.6, 0.2, -0.5);
+        }
+      }
     }
 
     if (this.state === 'alive') {
+      // v1.3.0 blast shove: the impulse velocity decays and drags the
+      // hull with it; the heel kick decays back to level and the yaw
+      // kick nudges the heading. All three decay, so a blast rocks the
+      // ship instead of permanently displacing her.
+      if (Math.abs(this.blastVx) > 0.01 || Math.abs(this.blastVz) > 0.01) {
+        this.x += this.blastVx * dt; this.z += this.blastVz * dt;
+        const bd = Math.exp(-dt * 0.8);
+        this.blastVx *= bd; this.blastVz *= bd;
+      }
+      if (Math.abs(this.blastYaw) > 0.0001) {
+        this.heading += this.blastYaw * dt;
+        this.blastYaw *= Math.exp(-dt * 1.5);
+      }
+      this.heelKick *= Math.exp(-dt * 1.2);
       // Lift layer (Pandora lift/list rules, adapted): list toward dead pods.
       const deadX = this.pods.filter(p => !p.alive).reduce((a, p) => a + p.local.x, 0);
       const listTarget = (1 - this.lift) * 0.12 * (deadX >= 0 ? 1 : -1);
       this.list += (listTarget - this.list) * Math.min(1, dt * 0.5);
-      this.roll += (this.list - this.roll) * Math.min(1, dt * 2);
+      this.roll += (this.list + this.heelKick - this.roll) * Math.min(1, dt * 2);
       // v1.2.0 pitch: the spring-return pitch command drives attitude
       // and climb. Pitch up climbs, pitch down descends; at neutral
       // the altitude hold below resumes at the new altitude.
@@ -849,22 +1214,52 @@ export class Helicarrier {
       this.heading += this.fallYawRate * dt;
       this.group.position.set(this.x, this.y, this.z);
       this.group.rotation.set(this.pitch, -this.heading, this.roll);
-      // Breakup re-check during the fall: structural stress from fall
-      // speed + spin + existing damage.
+      // Breakup re-check during the fall: structural stress from the
+      // damage already taken and the tumble — NOT from fall speed
+      // alone. A lightly damaged ship (one pod lost, hp ~90%) mostly
+      // rides the fall out intact; a wreck at 12% HP mostly comes
+      // apart on the way down. No breakup in the last 80 m — the
+      // water impact decides that. (v1.3.1: the old 0.35-per-check
+      // rate broke up almost every fall in the air, so intact falls
+      // never happened.)
       this.breakupT -= dt;
       if (this.breakupT <= 0) {
         this.breakupT = 0.4;
         const speed = Math.abs(this.vy);
-        const stress = (speed / vt) * 0.5 + (1 - this.hpFrac) * 0.5;
-        if (speed > 25 && Math.random() < stress * 0.35) { this.breakUp(ctx, 'stressed in the fall'); return; }
+        const stress = (1 - this.hpFrac) * 0.7 + (Math.abs(this.fallRollRate) + Math.abs(this.fallPitchRate)) * 0.5 + (this.lift <= 0 ? 0.1 : 0);
+        const seaH0 = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+        if (speed > 25 && this.y > seaH0 + 80 && Math.random() < stress * 0.05) { this.breakUp(ctx, 'stressed in the fall'); return; }
       }
       const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
       if (this.y <= seaH + 2) {
+        // v1.3.1 water-impact evaluation: the breakup decision is made
+        // HERE, not only at the kill — a carrier can fall whole and
+        // then fragment (or not) on how she hits the water. Level +
+        // slower stays largely intact and sinks; hard or nose-first
+        // shatters into many pieces, which inherit the impact
+        // velocity and attitude.
+        const impactSpeed = Math.abs(this.vy);
+        const rollW = Math.atan2(Math.sin(this.roll), Math.cos(this.roll));
+        // frag: impact speed relative to a 65 m/s reference, attitude
+        // (nose-down and rolled entries hit far harder than level ones),
+        // and remaining structural health. Level + slower + healthy
+        // stays intact; hard or nose-first shatters.
+        const attF = 1 + 2 * Math.abs(this.pitch) + 1.2 * Math.abs(rollW);
+        const frag = (impactSpeed / 65) * attF * (1.3 - 0.6 * this.hpFrac);
+        const outcome = frag < 1.0 ? 'intact' : frag < 1.8 ? 'partial' : 'shatter';
+        this.lastImpact = { speed: +impactSpeed.toFixed(1), pitch: +this.pitch.toFixed(2), roll: +rollW.toFixed(2), hpFrac: +this.hpFrac.toFixed(2), frag: +frag.toFixed(2), outcome };
+        ctx.vfx.splash(this.x, seaH, this.z, impactSpeed);
+        ctx.msg(`${this.name} hit the sea at ${impactSpeed.toFixed(0)} m/s — ${outcome === 'intact' ? 'staying intact' : outcome === 'partial' ? 'breaking apart' : 'shattering'}`);
+        if (outcome !== 'intact') {
+          const fwd = { x: Math.sin(this.heading), z: -Math.cos(this.heading) };
+          const ivx = fwd.x * (this.forwardSpeed || 0) * 0.3, ivz = fwd.z * (this.forwardSpeed || 0) * 0.3;
+          if (outcome === 'shatter') this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz });
+          else this.breakUp(ctx, 'water impact', { cuts: 1, energy: 1.4, impactVx: ivx, impactVz: ivz });
+          return;
+        }
         this.state = 'sinking';
         this.sinkT = 0;
         this.impactY = seaH;
-        ctx.vfx.splash(this.x, seaH, this.z, Math.abs(this.vy));
-        ctx.msg(`${this.name} hit the sea at ${Math.abs(this.vy).toFixed(0)} m/s`);
         if (this.wing) this.wing.handleCarrierSinking(ctx);
       }
     } else if (this.state === 'sinking') {

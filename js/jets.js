@@ -55,11 +55,22 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
   const d = Math.hypot(dx, dy, dz) || 0.001;
   const ux = dx / d, uy = dy / d, uz = dz / d;
   jet.speed = Math.hypot(jet.vx, jet.vy, jet.vz);
-  // Stall hysteresis
+  // v1.3.0 zone effects (B): damaged engines cut speed/turn, a lost
+  // wing cuts lift — applied here so every steering path feels them.
+  const speedMul = jet.speedMul !== undefined ? jet.speedMul : 1;
+  const turnMul = jet.turnMul !== undefined ? jet.turnMul : 1;
   if (!jet.stalled && jet.speed < JET_STALL_SPEED) { jet.stalled = true; jet.stallSide = Math.random() < 0.5 ? 1 : -1; }
   if (jet.stalled && jet.speed > JET_RECOVER_SPEED) jet.stalled = false;
   let tx = ux, ty = uy, tz = uz;
-  let sp = maxSpeed * Math.min(1, d / slowingR);
+  // v1.3.0 SAM evasion (Hurricane v11.45 F5): while the defensive timer
+  // runs the jet breaks 90 deg to its evasion side — the aim vector is
+  // rotated, so the jet actually turns away from the SAM, not just banks.
+  if (jet.defensiveT > 0 && !jet.stalled) {
+    const s = jet.defSide || 1;
+    const rx = Math.cos(jet.heading), rz = Math.sin(jet.heading);
+    tx = rx * s; ty = 0; tz = rz * s;
+  }
+  let sp = maxSpeed * Math.min(1, d / slowingR) * speedMul;
   if (jet.stalled) {
     // Dive ~34 deg, gain speed by falling, mushy controls.
     const fx = Math.sin(jet.heading), fz = -Math.cos(jet.heading);
@@ -84,7 +95,7 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
   let dAlong = clamp(sp - curAlong, -accel * dt, accel * dt);
   jet.vx += tx * dAlong; jet.vy += ty * dAlong; jet.vz += tz * dAlong;
   // Lateral (turn) accel — cap order: longitudinal first, then lateral.
-  const latCap = jet.stalled ? 15 : 45;
+  const latCap = (jet.stalled ? 15 : 45) * turnMul;
   const pvx = jet.vx - tx * (jet.vx * tx + jet.vy * ty + jet.vz * tz);
   const pvy = jet.vy - ty * (jet.vx * tx + jet.vy * ty + jet.vz * tz);
   const pvz = jet.vz - tz * (jet.vx * tx + jet.vy * ty + jet.vz * tz);
@@ -128,6 +139,11 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
   else if (opts.defensive) rollT = opts.defSide * 1.05;
   else if (jet.stalled) rollT = jet.stallSide * 0.5;
   else rollT = clamp(-Math.atan2(jet.speed * jet.omegaSm, 9.81), -1.31, 1.31);
+  // v1.3.0: a damaged wing rolls the jet toward the dead side even in
+  // level flight (roll bias), and SAM evasion is driven from the jet's
+  // own defensive timer when the squadron did not pass opts.defensive.
+  if (jet.rollBias) rollT += jet.rollBias;
+  if (jet.defensiveT > 0 && !opts.pullout) rollT = (jet.defSide || 1) * 1.05;
   jet.roll += clamp(rollT - jet.roll, -3.8 * dt, 3.8 * dt);
 }
 
@@ -178,6 +194,13 @@ export class AntiShipMissile {
     const ax = (Math.random() - 0.5) * 0.7 * 333, az = (Math.random() - 0.5) * 0.7 * 70;
     this.aimAlong = ax; this.aimAcross = az;
     this.trailT = 0;
+  }
+  // v1.3.0: intercepted by CIWS/SAM — geyser splash, no damage dealt.
+  splash() {
+    if (!this.alive) return;
+    this.alive = false;
+    const seaH = this.ctx.sea.waveHeight(this.x, this.z, this.ctx.time);
+    this.ctx.vfx.splash(this.x, Math.max(seaH, this.y), this.z, 12);
   }
   update(dt) {
     if (!this.alive) return;
@@ -234,6 +257,24 @@ export class FighterJet {
     this.stalled = false; this.stallSide = 1; this.omegaSm = 0; this.turnSide = 1;
     this.state = 'deck';
     this.ordnance = 2; this.hp = 100;
+    // v1.3.0 (B) per-zone jet damage (Pandora DamageZones /
+    // DamageableEntity pattern): wing hits x1.2, engine hits x1.5.
+    // Zone HP is set so one SAM (55) cannot one-shot a zone: wing
+    // 80 (55*1.2=66), engine 90 (55*1.5=82), fuel 50 (a SAM fuel hit
+    // starts a fire instead of killing outright). Dying rule: lose a
+    // wing, lose both engines, or lose all HP -> spin-out fall.
+    this.zones = {
+      wingL: { hp: 80, max: 80 }, wingR: { hp: 80, max: 80 },
+      engineL: { hp: 90, max: 90 }, engineR: { hp: 90, max: 90 },
+      fuselage: { hp: 100, max: 100 }, fuel: { hp: 50, max: 50 },
+    };
+    this.zoneMult = { wingL: 1.2, wingR: 1.2, engineL: 1.5, engineR: 1.5, fuselage: 1, fuel: 1 };
+    this.fire = null; // {zone, intensity, t, spreadT}
+    this.spinOut = false; this.spinRate = 0; this.spinT = 0;
+    this.defensiveT = 0; this.defSide = 1; this.flareT = 0;
+    this.rollBias = 0; this.speedMul = 1; this.turnMul = 1;
+    this.deckLocal = null; // {lx,lz} — deck coupling (J): jets parked /
+    // taxiing / rearming ride the carrier's deck when she climbs/descends
     this.formOffset = { x: 0, z: 0 };
     this.aimPoint = { x: 0, y: 0, z: 0 };
     this.diveT = 0; this.fired = false; this.catT = 0; this.parkSpot = 0;
@@ -242,11 +283,90 @@ export class FighterJet {
   }
   placeOnDeck(carrier, lx, lz) {
     const p = carrier.deckPoint(lx, lz);
+    this.deckLocal = { lx, lz, carrier };
     this.x = p.x; this.y = p.y + 2.4; this.z = p.z;
     this.heading = carrier.heading; this.pitch = carrier.pitch; this.roll = carrier.roll;
     this.vx = carrier.vx; this.vy = 0; this.vz = carrier.vz;
     this.group.visible = true;
     this.syncModel();
+  }
+  // v1.3.0 (J) deck coupling: a jet sitting on the deck rides it. Called
+  // from update() for deck/taxi/rearm jets — the carrier's climb/descent
+  // and motion carry the jet, so it never clips through a moving deck.
+  rideDeck() {
+    const d = this.deckLocal;
+    if (!d || !d.carrier || !d.carrier.alive) return;
+    const p = d.carrier.deckPoint(d.lx, d.lz);
+    this.x = p.x; this.y = p.y + 2.4; this.z = p.z;
+    this.heading = d.carrier.heading; this.pitch = d.carrier.pitch; this.roll = d.carrier.roll;
+    this.vx = d.carrier.vx; this.vy = d.carrier.vy || 0; this.vz = d.carrier.vz;
+  }
+  // v1.3.0 (B): apply damage to one jet zone. Returns 'lost' (zone just
+  // destroyed), 'spinout' (dying rule met), 'fire' (fuel ignited) or null.
+  damageZone(amount, zoneKey, source, ctx) {
+    if (this.state === 'crashed' || this.state === 'sinking' || this.state === 'spinout') return null;
+    const z = this.zones[zoneKey] || this.zones.fuselage;
+    const key = this.zones[zoneKey] ? zoneKey : 'fuselage';
+    const mult = this.zoneMult[key] || 1;
+    const before = z.hp;
+    z.hp = Math.max(0, z.hp - amount * mult);
+    this._syncZoneEffects();
+    let out = null;
+    if (before > 0 && z.hp <= 0) {
+      out = 'lost';
+      if (ctx && ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet: ${key} destroyed (${source || 'hit'})`);
+      if (key === 'fuel') { this.ignite(key, ctx); out = 'fire'; }
+    }
+    if (key === 'fuel' && z.hp <= 0 && !this.fire) this.ignite(key, ctx);
+    // Dying rule: a wing, both engines, or all HP.
+    const wingLost = this.zones.wingL.hp <= 0 || this.zones.wingR.hp <= 0;
+    const bothEngines = this.zones.engineL.hp <= 0 && this.zones.engineR.hp <= 0;
+    const total = Object.values(this.zones).reduce((a, zz) => a + zz.hp, 0);
+    if (wingLost || bothEngines || total <= 0) {
+      this.startSpinOut(ctx, `${key} destroyed by ${source || 'damage'}`);
+      return 'spinout';
+    }
+    return out;
+  }
+  _syncZoneEffects() {
+    // Roll bias toward the dead wing, lift/speed/turn penalties.
+    const wingL = this.zones.wingL.hp <= 0, wingR = this.zones.wingR.hp <= 0;
+    this.rollBias = (wingL ? 0.35 : 0) + (wingR ? -0.35 : 0);
+    const engLost = (this.zones.engineL.hp <= 0 ? 1 : 0) + (this.zones.engineR.hp <= 0 ? 1 : 0);
+    const wingDmg = (1 - this.zones.wingL.hp / 80) + (1 - this.zones.wingR.hp / 80);
+    this.speedMul = Math.max(0.55, 1 - 0.22 * engLost - 0.08 * wingDmg);
+    this.turnMul = Math.max(0.6, 1 - 0.18 * engLost);
+    const total = Object.values(this.zones).reduce((a, z) => a + z.hp, 0);
+    const max = Object.values(this.zones).reduce((a, z) => a + z.max, 0);
+    this.hp = total / max * 100;
+  }
+  ignite(zoneKey, ctx) {
+    if (this.fire) return;
+    this.fire = { zone: zoneKey, intensity: 0.3, t: 0, spreadT: 0 };
+    if (ctx && ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet on FIRE — ${zoneKey}`);
+  }
+  // v1.3.0 (B): spin-out fall instead of vanishing. Yaw-rate spin,
+  // nose-down bias, lift scale ~0.15 — the jet tumbles down and only
+  // becomes a crash when it reaches the sea (update()).
+  startSpinOut(ctx, reason) {
+    if (this.state === 'crashed' || this.state === 'sinking' || this.state === 'spinout') return;
+    this.state = 'spinout';
+    this.spinOut = true;
+    this.spinT = 0;
+    this.spinRate = (Math.random() < 0.5 ? -1 : 1) * (1.5 + Math.random());
+    this.spinReason = reason;
+    if (ctx && ctx.vfx) ctx.vfx.burst(this.x, this.y, this.z, 20, [1, 0.6, 0.2], 6, 3);
+    if (ctx && ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet spinning out — ${reason}`);
+  }
+  // v1.3.0 (A): SAM-evasion flare dump (Hurricane v11.45 F5). Bright
+  // decoy particles behind the jet; the SAM checks flareT in flight.
+  dumpFlares(ctx) {
+    this.flareT = 2.0;
+    if (!ctx || !ctx.vfx) return;
+    for (let i = 0; i < 12; i++) {
+      ctx.vfx.spawnParticle(this.x + (Math.random() - 0.5) * 10, this.y - 2, this.z + (Math.random() - 0.5) * 10,
+        (Math.random() - 0.5) * 8, -6 - Math.random() * 6, (Math.random() - 0.5) * 8, 1.2, 1, 0.8, 0.2, 0);
+    }
   }
   syncModel() {
     this.group.position.set(this.x, this.y, this.z);
@@ -265,6 +385,66 @@ export class FighterJet {
     if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet lost — ${reason} (${this.wing.remaining} jets left in wing)`);
   }
   update(dt, ctx) {
+    if (this.defensiveT > 0) this.defensiveT -= dt;
+    if (this.flareT > 0) this.flareT -= dt;
+    // v1.3.0 (B) fire state machine: intensity ramps, spreads to an
+    // adjacent zone after ~8 s, can be blown out by high airspeed
+    // (>175 m/s airflow) or — for an engine fire — by cutting throttle
+    // (slow flight, speed < 100 m/s, throttle back).
+    if (this.fire && this.state !== 'crashed' && this.state !== 'sinking') {
+      const f = this.fire;
+      f.t += dt; f.spreadT += dt;
+      f.intensity = Math.min(1, f.intensity + dt * 0.08);
+      const spd = Math.hypot(this.vx, this.vy, this.vz);
+      if (spd > 175) f.intensity -= dt * 0.15; // blown out by airflow
+      if (f.zone.startsWith('engine') && spd < 100) f.intensity -= dt * 0.10; // throttle cut
+      if (f.intensity <= 0) { this.fire = null; }
+      else {
+        const z = this.zones[f.zone];
+        if (z) {
+          z.hp = Math.max(0, z.hp - f.intensity * 2.0 * dt);
+          this._syncZoneEffects();
+          const wingLost = this.zones.wingL.hp <= 0 || this.zones.wingR.hp <= 0;
+          const bothEngines = this.zones.engineL.hp <= 0 && this.zones.engineR.hp <= 0;
+          if (wingLost || bothEngines) this.startSpinOut(ctx, 'fire burned through ' + f.zone);
+        }
+        if (Math.random() < dt * 12) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 0.8, 1, 0.5, 0.1, -0.5);
+        if (Math.random() < dt * 8) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 1.2, 0.15, 0.15, 0.15, 0.5);
+        if (f.spreadT > 8) {
+          f.spreadT = 0;
+          const adj = { fuel: 'fuselage', fuselage: 'engineL', engineL: 'wingL', engineR: 'wingR', wingL: 'fuselage', wingR: 'fuselage' };
+          const next = adj[f.zone];
+          if (next && this.zones[next].hp > 0) {
+            this.fire = { zone: next, intensity: 0.3, t: 0, spreadT: 0 };
+            if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet fire spread to ${next}`);
+          }
+        }
+      }
+    }
+    // v1.3.0 (B) spin-out fall: yaw-rate spin, nose-down bias, lift
+    // scale ~0.15 (gravity wins, the jet falls). Ends as a crash at the sea.
+    if (this.state === 'spinout') {
+      this.spinT += dt;
+      this.heading += this.spinRate * dt;
+      this.roll += this.spinRate * 0.8 * dt;
+      this.pitch += (-0.55 - this.pitch) * Math.min(1, dt * 2);
+      this.vy -= 9.81 * (1 - 0.15) * dt;
+      this.vx *= (1 - dt * 0.1); this.vz *= (1 - dt * 0.1);
+      this.x += this.vx * dt; this.y += this.vy * dt; this.z += this.vz * dt;
+      if (Math.random() < dt * 10) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 0, 0, 0.7, 1, 0.5, 0.1, 0);
+      const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+      if (this.y <= seaH) {
+        this.state = 'crashed'; this.crashT = 0;
+        this.crashReason = this.spinReason || 'spun out';
+        ctx.vfx.burst(this.x, this.y, this.z, 30, [1, 0.6, 0.2], 8, 4);
+        ctx.vfx.splash(this.x, seaH, this.z, Math.abs(this.vy));
+        this.group.visible = false;
+        if (this.wing) this.wing.onJetLost(this);
+        if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet lost — ${this.crashReason} (${this.wing.remaining} jets left in wing)`);
+      }
+      this.syncModel();
+      return;
+    }
     if (this.state === 'crashed') {
       this.crashT += dt;
       this.vy -= 9.81 * dt * 0.5;
@@ -280,7 +460,13 @@ export class FighterJet {
       this.syncModel();
       return;
     }
-    if (this.state === 'sinking' || this.state === 'deck' || this.state === 'rearm') { this.syncModel(); return; }
+    if (this.state === 'sinking' || this.state === 'deck' || this.state === 'rearm') {
+      // v1.3.0 (J): parked / rearming jets ride the deck.
+      if (this.state !== 'sinking') this.rideDeck();
+      this.syncModel(); return;
+    }
+    // v1.3.0 (J): taxiing jets ride the deck too.
+    if (this.state === 'taxi') this.rideDeck();
     // Damaged-jet FX
     if (this.hp < 50 && Math.random() < dt * 10) {
       ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 1.2, 0.15, 0.15, 0.15, 0.5);
@@ -318,7 +504,7 @@ export class AirSquadron {
   get leader() { return this.jets[0]; }
   get wingman() { return this.jets[1]; }
   get homeCarrier() { return this.wing.carrier; }
-  get aliveJets() { return this.jets.filter(j => j.state !== 'crashed' && j.state !== 'sinking'); }
+  get aliveJets() { return this.jets.filter(j => j.state !== 'crashed' && j.state !== 'sinking' && j.state !== 'spinout'); }
 
   launch(loadout, target, ctx) {
     if (this.state !== 'deckReady' && this.state !== 'launchQueued') return false;
@@ -355,11 +541,19 @@ export class AirSquadron {
       j.formOffset = i === 0 ? { x: 0, z: 0 } : { x: 60, z: -40 };
       j.state = 'catapult'; j.catT = i === 0 ? 0 : -1; // wingman fires 1 s later
       j.ordnance = 2; j.hp = 100; j.fired = false; j.stalled = false;
+      // v1.3.0 (B): a fresh sortie starts with fresh zones — a jet that
+      // trapped with damage is repaired on rearm; a refilled slot is a
+      // new jet object with fresh zones already.
+      for (const k in j.zones) j.zones[k].hp = j.zones[k].max;
+      j.fire = null; j.spinOut = false; j.spinT = 0;
+      j.defensiveT = 0; j.flareT = 0; j.rollBias = 0; j.speedMul = 1; j.turnMul = 1;
+      j._syncZoneEffects();
       j.parkSpot = i;
       j.placeOnDeck(carrier, CATAPULTS[i].x, CATAPULTS[i].z0);
       j.group.visible = true;
       ctx.scene.add(j.group);
     }
+    if (ctx.audio) ctx.audio.whoosh();
     return true;
   }
   // (d) Hold a launch until the catapult is clear. The squadron waits in
@@ -395,10 +589,12 @@ export class AirSquadron {
     };
   }
   update(dt, ctx) {
-    // If the leader is down but the wingman flies on, the wingman takes
-    // the lead — the sortie steers off a live jet, never a falling wreck.
-    if ((this.leader.state === 'crashed' || this.leader.state === 'sinking') &&
-        this.wingman.state !== 'crashed' && this.wingman.state !== 'sinking') {
+    // v1.3.0 (B): a spinning-out jet is as dead as a crashed one for
+    // sortie purposes — the wingman takes the lead, and a squadron with
+    // no live jets aborts. Spin-out jets are never steered.
+    const _down = j => j.state === 'crashed' || j.state === 'sinking' || j.state === 'spinout';
+    if (_down(this.leader) &&
+        ! _down(this.wingman)) {
       this.jets.reverse();
     }
     // No ghost sorties (b): a squadron with no live jets aborts to a
@@ -670,6 +866,7 @@ export class AirSquadron {
             j.state = 'taxi'; j.rolloutV = 28; j.rolloutZ = WIRE.z + i * 25;
             const p = carrier.deckPoint(WIRE.x, j.rolloutZ);
             j.x = p.x; j.y = p.y + 2.4; j.z = p.z; j.heading = carrier.heading; j.vx = 0; j.vy = 0; j.vz = 0;
+            j.deckLocal = { lx: WIRE.x, lz: j.rolloutZ, carrier }; // v1.3.0 (J): taxi rides the deck
           });
         } else {
           const l = carrier.localFromWorld(L.x, L.z);
@@ -696,7 +893,7 @@ export class AirSquadron {
           // Only jets that actually trapped come back. A crashed jet
           // stays dead here too — its slot is refilled from the wing
           // pool at the next launch, never silently revived (c).
-          this.jets.forEach(j => { if (j.state === 'taxi' || j.state === 'rearm') { j.ordnance = 2; j.hp = 100; j.state = 'deck'; j.group.visible = false; } });
+          this.jets.forEach(j => { if (j.state === 'taxi' || j.state === 'rearm') { j.ordnance = 2; j.hp = 100; j.state = 'deck'; j.group.visible = false; for (const k in j.zones) j.zones[k].hp = j.zones[k].max; j.fire = null; j.spinOut = false; j.rollBias = 0; j.speedMul = 1; j.turnMul = 1; } });
         }
         break;
       }
@@ -734,7 +931,7 @@ export class AirSquadron {
     return this.wing.squadrons.some(s => s !== this && s.state === 'trap');
   }
   _formFly(wingman, leader, dt, ctx, speed, seaH) {
-    if (!wingman || wingman.state === 'crashed' || wingman.state === 'sinking') return;
+    if (!wingman || wingman.state === 'crashed' || wingman.state === 'sinking' || wingman.state === 'spinout') return;
     if (wingman.state === 'deck' || wingman.state === 'catapult' || wingman.state === 'taxi' || wingman.state === 'rearm') return;
     const fx = Math.sin(leader.heading), fz = -Math.cos(leader.heading);
     const rx = Math.cos(leader.heading), rz = Math.sin(leader.heading);
@@ -781,7 +978,7 @@ export class AirWing {
   }
   airborneCount() {
     let n = 0;
-    for (const s of this.squadrons) for (const j of s.jets) if (['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap', 'divert'].includes(j.state)) n++;
+    for (const s of this.squadrons) for (const j of s.jets) if (['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap', 'divert', 'spinout'].includes(j.state)) n++;
     return n;
   }
   availableToLaunch() { return Math.max(0, this.remaining - this.airborneCount()); }
@@ -874,10 +1071,35 @@ export class AirWing {
       if (d2 < 100) {
         const mx = (aj.x + bj.x) / 2, my = (aj.y + bj.y) / 2, mz = (aj.z + bj.z) / 2;
         ctx.vfx.burst(mx, my, mz, 30, [1, 0.6, 0.2], 8, 4);
-        aj.crash('mid-air collision', ctx); bj.crash('mid-air collision', ctx);
+        // v1.3.0 (B): collision losses go through the spin-out fall,
+        // not an instant vanish.
+        aj.startSpinOut(ctx, 'mid-air collision'); bj.startSpinOut(ctx, 'mid-air collision');
       }
     }
   }
+}
+
+// ---------------- CCIP bomb-impact predictor (v1.3.0, I) ----------------
+// Pure projection math using the SAME ballistics AirBomb integrates
+// (vy -= 9.81 dt, no drag): given a jet in its attack dive and a target,
+// return the predicted impact point {x, y, z, valid, tFall} on the
+// target deck level, leading the target by the fall time. No balance
+// change — this only draws where the bomb would land if dropped now.
+// Returns valid:false when the jet is climbing or too low to drop.
+export function predictBombImpact(jet, target) {
+  if (!jet || !target || target.state === 'gone') return { valid: false, x: 0, y: 0, z: 0, tFall: 0 };
+  const deckY = target.deckTopY();
+  const dy = jet.y - deckY;
+  if (dy <= 5 || jet.vy >= -5) return { valid: false, x: jet.x, y: deckY, z: jet.z, tFall: 0 };
+  const tFall = (jet.vy + Math.sqrt(jet.vy * jet.vy + 19.62 * dy)) / 9.81;
+  if (!(tFall > 0)) return { valid: false, x: jet.x, y: deckY, z: jet.z, tFall: 0 };
+  return {
+    valid: true,
+    x: jet.x + jet.vx * tFall,
+    y: deckY,
+    z: jet.z + jet.vz * tFall,
+    tFall,
+  };
 }
 
 // ---------------- Bomb ballistics probe ----------------

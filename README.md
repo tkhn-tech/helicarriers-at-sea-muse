@@ -1,8 +1,22 @@
-# Helicarriers at Sea — v1.2.0
+# Helicarriers at Sea — v1.3.0
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
 home. **Jets strike only in v1 — no dogfighting, no air-to-air combat.**
+
+v1.3.0: solid helicarrier models from every angle (closed inner hull core
+following the GLB's own keel profile, bow/stern caps, island coaming and
+core, pod sponson plates and duct caps, double-sided shells, full-length
+deck under-plate); physics-driven fragmentation in an unfixed number of
+ways — piece count, split locations, sizes and tumble vary with the killing
+blow, and a carrier can fall whole then fragment (or not) on how she hits
+the water; fire/explosion visuals that evolve with the damage (burn-fraction
+scaling, zone flame colours, cook-off bursts, dying-ship flickers); CIWS +
+SAM air defence on both sides with jet SAM-evasion and flares; per-zone jet
+damage with fires and spin-outs; synth audio; a Hurricane stage with freak
+waves and lightning; a tactical camera that cycles every jet and holds on
+detonations; radar sweep and squadron chevrons; pause and a remembered best
+result; CCIP bomb-impact prediction in the dive.
 
 v1.2.0: spectate a destroyed carrier as she falls/breaks up/sinks (fleet-row
 or 3D tap, helm stays live, R or a live ship exits); rebuilt lift fans —
@@ -391,6 +405,73 @@ overlay text unchanged and true, zero errors.
 - Performance is untested beyond a headless load probe; 4v4 with all
   wings airborne is the heaviest case (~16 jets + 8 carriers).
 
+## v1.3.0 — solidity, fragmentation, refinement pass (staged — awaiting push)
+
+- **Solid models (v1.2.1 work, folded in):** the GLB hull is open shell
+  patches — the mid-body side band was open and the belly hollow (rays
+  from below first hit the recessed deck under-plate at y −5.9 instead of
+  a keel, 64% of belly rays). A closed inner hull core (a loft whose
+  sections follow the GLB's own measured keel profile, inset ~1.5 m)
+  now backs the deck and closes the belly; bow/stern caps, an island
+  coaming + inner core (the island shell had a see-through band), pod
+  sponson plates and duct caps, double-sided shells everywhere, and a
+  full-length deck under-plate. Verified by raycast + rendered-pixel
+  checks from top, bottom, both sides, bow, stern and obliques: 0 misses
+  in every band (side 0/61, top 0/375, belly 0 shallow/297, stern 0/35,
+  bow 0/21, island 0/36).
+- **Fragmentation (v1.3.1 work, folded in):** breakups are driven by the
+  killing blow — energy = severity × speed × altitude × attitude
+  (×1.3 detonation) sets 1–5 cuts (2–6 pieces) at growing radii around
+  the hit, so piece sizes, split locations and tumble all vary; pieces
+  inherit impact velocity and attitude. A lightly damaged ship mostly
+  rides her fall out intact; a wreck mostly comes apart on the way down.
+  At the water, the impact is re-evaluated — level + slower + healthy
+  stays intact and sinks, a hard or nose-first impact shatters.
+  v1.3.2 fix: each piece is a genuine section, never a full copy — the
+  cut planes live in the piece's local space and are re-aimed every
+  frame as it tumbles (the v1.3.1 port baked world-space planes once, so
+  pieces showed each other's decks, islands and pods — a glitching
+  mess of duplicates); every interior cut face gets a solid dark
+  scorched section cap, and sinking pieces keep drifting apart and
+  tumbling instead of freezing in a pile at the impact point. Verified
+  by rendered frames plus a silhouette check: a clean two-half split
+  renders 134 m + 184 m = 318 m (one 333 m ship in two parts).
+  Forced-kill probes: reactor kill at speed/altitude 6 pieces; magazine
+  kills 5 (slow/low) and 6 (fast/high); moderate magazine kill 3;
+  structural fall from 500 m broke up in the air (4 pieces); light
+  pod-loss fall from 150 m fell intact and sank intact (frag 0.83);
+  nose-first impact shattered (5 pieces, frag 2.14); light fall from
+  550 m broke into 2 at the water (frag 1.22).
+- **Fire/explosion visuals:** flame/smoke scale grows with the zone's
+  burn fraction, reactor fires burn white-blue at the core, magazine
+  fires red-orange, smoke darkens as fires mature, hot magazine/reactor
+  fires throw visual-only cook-off bursts (verified: 0 while gated,
+  bursts at the fire location once intensity > 0.85 and zone HP < 45),
+  new fires flare up on ignition, dying ships (< 25% HP) flicker with
+  flames at scorched deck points, detonations scale with the killing
+  blow and throw a debris smoke ring. No damage amounts changed.
+- **Refinement pass (A–J):** CIWS (~700 m) + SAM (~1,600 m, max 2 out,
+  6 s reload) on both sides, jets break 90° and dump flares on SAM
+  launch; per-zone jet damage (wing/engine/fuel, fires, spin-out);
+  WebAudio synth (boom, thunder, whoosh, SAM launch, click, flagship
+  alarm, mute toggle); 4th Hurricane weather stage, distance-driven
+  progression, lightning + thunder, freak waves; tactical camera cycles
+  every jet/ordnance and holds 2.5 s on nearby detonations; minimap
+  sweep, ring labels, squadron chevrons, ordnance streaks, storm
+  clutter; pause (P/Esc) with resume/restart/menu, attract mode behind
+  the menu, best result persisted; blast impulses, graded hurt smoke,
+  scorch on every hit; CCIP bomb-impact prediction in the dive; loop
+  substep cap (≤0.05 s, max 0.10 s/frame) and deck coupling (parked
+  jets ride a climbing deck — verified: carrier +31.4 m, jet +31.4 m,
+  gap steady at 2.4 m). No dogfighting, no real Sparrow/JDAM models,
+  no new modes, no damage-balance changes except tuning the new systems.
+  Verified headless: boot 8/8 alive, zero console errors, zero failed
+  requests; bomb probe 4/4 hits with air defence live (16 SAMs fired,
+  1 ordnance intercepted); SAM evasion observed on the targeted jet
+  (defensiveT 2.05, flareT 1.55); CCIP marker live through the dive
+  (53 samples, tFall 3.23 → 2.28 s); detonation hold set and cleared
+  after ~2.5 game-s.
+
 ## v1.1.0 — HUD rework (live)
 
 - Hurricane Fleet's anchored HUD layout: top pill bar (ship / nav / air),
@@ -409,7 +490,8 @@ overlay text unchanged and true, zero errors.
 - Live verification of a full round (launch → strike → trap → win/lose)
   and tuning of enemy skill balance from that data.
 - Tactical enemy AI (target selection, recalls, coordinated strikes).
-- True geometry breakup + floating wreckage that stays solid.
 - Rotor downwash rings on the sea under hovering/low carriers.
 - Air-to-air combat (explicitly out of v1 scope — needs its own design).
-- Sound (engine/rotor wash, explosions, radio chatter).
+- Sound: engine/rotor wash and radio chatter (explosions, thunder,
+  whooshes, SAM launches, UI clicks and the flagship alarm are in
+  since v1.3.0).

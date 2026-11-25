@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>Helicarriers at Sea — v1.2.0</title>
+<title>Helicarriers at Sea — v1.3.0</title>
 <style>
   html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0b1c26;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#dfeef5;}
   #app{position:fixed;inset:0;}
@@ -104,7 +104,7 @@
   #hint{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(10px + env(safe-area-inset-bottom));z-index:5;
     pointer-events:none;font-size:11.5px;color:#9db8cc;text-shadow:0 1px 6px rgba(0,0,0,.8);text-align:center;
     max-width:calc(100vw - 430px);}
-  #menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%,#12394e,#06121a 75%);z-index:10;overflow:auto;}
+  #menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%,rgba(18,57,78,.55),rgba(6,18,26,.88) 75%);z-index:10;overflow:auto;}
   #menuCard{width:min(680px,94vw);padding:22px 26px;margin:20px;}
   #menuCard h1{margin:0 0 2px;font-size:30px;letter-spacing:.5px;}
   #menuCard h1 span{color:#ffd166;}
@@ -116,6 +116,9 @@
   .seg button{padding:7px 12px;} .seg button.on{background:#ffd166;color:#1a2a33;border-color:#ffd166;font-weight:700;}
   #startBtn{width:100%;font-size:19px;padding:13px;margin-top:14px;}
   #endOverlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(3,10,16,.72);z-index:9;}
+  #pauseOverlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(3,10,16,.72);z-index:9;}
+  #pauseCard{padding:26px 34px;text-align:center;} #pauseCard h2{margin:0 0 8px;font-size:30px;}
+  #pauseCard button{display:block;width:220px;margin:8px auto;}
   #endCard{padding:26px 34px;text-align:center;} #endCard h2{margin:0 0 8px;font-size:30px;}
   #debugPanel{position:fixed;left:192px;top:calc(56px + env(safe-area-inset-top));width:230px;padding:10px;display:none;z-index:8;pointer-events:auto;font-size:12px;}
   #debugPanel.on{display:block;} #debugPanel button{display:block;width:100%;margin:4px 0;padding:6px;font-size:12px;text-align:left;}
@@ -189,6 +192,8 @@
     <span class="pill" id="pillShip"><b>SHIELD-1</b></span>
     <span class="pill" id="pillNav">ALT 350 m · SPD 0 m/s</span>
     <span class="pill" id="pillAir">✈ 48 jets</span>
+    <button id="btnPause" class="miniBtn pill" title="Pause (P / Esc)" style="pointer-events:auto;">⏸ Pause</button>
+    <button id="btnMute" class="miniBtn pill" title="Mute / unmute sound" style="pointer-events:auto;">🔊 Sound</button>
   </div>
   <div id="msg" class="panel">—</div>
   <div id="fleetPanel" class="panel">
@@ -246,12 +251,15 @@
     <span class="joyLab" style="left:10px">PORT</span><span class="joyLab" style="right:10px">STBD</span>
     <div id="joyKnob"></div>
   </div>
-  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · click a carrier to follow it · click a falling carrier to watch her go down</div>
+  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · <kbd>P</kbd>/<kbd>Esc</kbd> pause · click a carrier to follow it · click a falling carrier to watch her go down</div>
 </div>
+
+<div id="pauseOverlay"><div id="pauseCard" class="panel"><h2>⏸ PAUSED</h2><p id="pauseText">The fleet holds position. The sea keeps moving.</p><button id="btnResume" class="go">▶ Resume</button><button id="btnRestart">↻ Restart round</button><button id="btnMenu">☰ Back to menu</button></div></div>
 
 <div id="menu"><div id="menuCard" class="panel">
   <h1>HELICARRIERS <span>AT SEA</span></h1>
-  <p class="sub">v1.2.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: spectate a destroyed carrier as she falls, rebuilt lift fans with real spinning rotors, pitch control (vertical track / ↑↓), and deeper fire, explosion and breakup physics.</p>
+  <p class="sub">v1.3.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result.</p>
+  <p class="hint" id="bestLine">No rounds played yet — your best result will be remembered here.</p>
   <div class="pick"><label>Fleet size (you)</label><div class="seg" id="segPlayerFleet">
     <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4" class="on">4</button></div></div>
   <div class="pick"><label>Fleet size (enemy)</label><div class="seg" id="segEnemyFleet">
@@ -259,7 +267,8 @@
   <div class="pick"><label>Enemy skill</label><div class="seg" id="segSkill">
     <button data-v="cadet">Cadet</button><button data-v="veteran" class="on">Veteran</button><button data-v="elite">Elite</button></div></div>
   <div class="pick"><label>Weather / sea</label><div class="seg" id="segStage">
-    <button data-v="0" class="on">Calm</button><button data-v="1">Rough</button><button data-v="2">Storm</button></div></div>
+    <button data-v="0" class="on">Calm</button><button data-v="1">Rough</button><button data-v="2">Storm</button><button data-v="3">Hurricane</button></div></div>
+  <div class="pick"><label>Weather progression</label><select id="selWeatherProg"><option value="fixed" selected>Fixed (stage stays as picked)</option><option value="distance">Distance-driven (worsens as the flagship sails: Rough 1500 m, Storm 3000 m, Hurricane 5000 m)</option></select></div>
   <div class="pick"><label>Formation</label><div class="seg" id="segForm">
     <button data-v="C" class="on">Cruising (wedge)</button><button data-v="A">Attack (line)</button></div></div>
   <div class="pick"><label>Cruise altitude</label><select id="selAlt"><option value="300">300 m</option><option value="350" selected>350 m</option><option value="450">450 m</option><option value="550">550 m</option></select></div>

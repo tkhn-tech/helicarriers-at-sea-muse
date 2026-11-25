@@ -6,7 +6,9 @@ import { Sea, STAGES } from './sea.js';
 import { VFX } from './vfx.js';
 import { Helicarrier, loadModels, CARRIER_LEN } from './carrier.js';
 import { checkCarrierCollisions } from './collisions.js';
-import { AirWing, AirBomb, AntiShipMissile, bombBallisticsProbe, JET_CRUISE_SPEED } from './jets.js';
+import { AirWing, AirBomb, AntiShipMissile, bombBallisticsProbe, JET_CRUISE_SPEED, predictBombImpact } from './jets.js';
+import { GameAudio } from './audio.js';
+import { AirDefenseSystem } from './airdefense.js';
 
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -60,6 +62,14 @@ const G = {
   enemyTimers: new Map(), enemyLoadout: new Map(),
   over: false, bombStats: { drops: 0, hits: 0, log: [] },
   msgT: 0,
+  // v1.3.0
+  paused: false, audio: null, airDefense: null,
+  weatherProg: 'fixed', sailedDist: 0, lastFlagPos: null,
+  freakT: 45, freakMesh: null, lightningT: 12, flashT: 0, pendingThunder: 0,
+  ccip: [], ccipMeshes: [],
+  tacMode: null, tacKind: null, tacTarget: null, tacHoldPos: null, tacHoldUntil: 0,
+  tacJetsIdx: -1, tacOrdIdx: -1,
+  best: null, attract: false, attractT: 0, alarmCool: 0,
   collLog: [], // collision events {t, kind, a, b, closing, dmgA, dmgB, zoneA, zoneB, x, y, z, shake}
   collCool: {}, grindCool: {}, scrapeCool: {}, // per-pair cooldowns (collisions.js)
   collidePair: null, // [a, b] carriers forced onto a collision course (?collide= / debug button)
@@ -97,6 +107,24 @@ function initScene() {
   scene.add(amb);
   G.sea = new Sea(scene, G.stage);
   G.vfx = new VFX(scene);
+  // v1.3.0 (I) CCIP rings: gold (leader) + white (wingman), hidden until a dive.
+  G.ccipMeshes = [];
+  for (let i = 0; i < 2; i++) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(8, 11, 32),
+      new THREE.MeshBasicMaterial({ color: i === 0 ? 0xffd166 : 0xffffff, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false }));
+    ring.rotation.x = -Math.PI / 2;
+    ring.visible = false;
+    scene.add(ring);
+    G.ccipMeshes.push(ring);
+  }
+  // v1.3.0 (D) freak-wave crest wall: a translucent wall that travels
+  // with the crest, oriented across its direction of travel.
+  const fwGeo = new THREE.PlaneGeometry(700, 20, 24, 1);
+  const fwMat = new THREE.MeshBasicMaterial({ color: 0xbfe3f0, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false });
+  G.freakMesh = new THREE.Mesh(fwGeo, fwMat);
+  G.freakMesh.visible = false;
+  scene.add(G.freakMesh);
   addEventListener('resize', () => {
     G.camera.aspect = innerWidth / innerHeight;
     G.camera.updateProjectionMatrix();
@@ -509,6 +537,25 @@ function cameraTarget() {
     G.camSpectate = null; // wreck resolved — back to the fleet
     renderFleetPanels();
   }
+  // v1.3.0 (E) detonation hold: while the hold runs the camera frames
+  // the blast point (wide — see updateCamera's hold distance boost).
+  if (G.tacHoldPos) {
+    if (G.time < G.tacHoldUntil) return { x: G.tacHoldPos.x, y: G.tacHoldPos.y, z: G.tacHoldPos.z };
+    G.tacHoldPos = null;
+    // Hold over: back to the tracked target if it is still valid,
+    // otherwise back to the fleet.
+    if (!tacTargetValid()) {
+      G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null;
+      $('btnCam').textContent = 'Camera: fleet [C]';
+    } else {
+      $('btnCam').textContent = 'Camera: ' + G.tacMode + ' [C]';
+    }
+  }
+  // v1.3.0 (E): a tracked target that died / landed ends the track.
+  if (G.camTac && G.tacTarget && !tacTargetValid()) {
+    G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null;
+    $('btnCam').textContent = 'Camera: fleet [C]';
+  }
   if (G.camTac) return G.camTac;
   if (G.camFollow) return G.camFollow.group ? { x: G.camFollow.x, y: G.camFollow.y, z: G.camFollow.z } : G.camFollow;
   const s = G.selected;
@@ -517,7 +564,10 @@ function cameraTarget() {
 function updateCamera(dt) {
   const t = cameraTarget();
   const tx = t.x + G.camPan.x, ty = t.y + G.camPan.y, tz = t.z; // camPan is {x, y}: x = lateral, y = vertical; no z component
-  const want = orbitPos({ x: tx, y: ty, z: tz }, G.camYaw, G.camPitch, G.camDist);
+  // v1.3.0 (E): during a detonation hold the camera pulls back for a
+  // wide framing of the blast, then eases back when the hold ends.
+  const dist = G.tacHoldPos ? Math.max(G.camDist, 900) : G.camDist;
+  const want = orbitPos({ x: tx, y: ty, z: tz }, G.camYaw, G.camPitch, dist);
   const seaH = G.sea.waveHeight(want.x, want.z, G.time);
   const midX = (want.x + tx) / 2, midZ = (want.z + tz) / 2;
   const midSea = G.sea.waveHeight(midX, midZ, G.time);
@@ -533,17 +583,75 @@ function updateCamera(dt) {
   }
 }
 function cycleTactical() {
+  // v1.3.0 (E) TacticalCameraSystem (Hurricane v11.35): C steps through
+  // EVERY airborne jet in order, then EVERY ordnance in flight, then
+  // off. Within each category the index advances (next jet, next
+  // missile/bomb) instead of always tracking the first one. A crashed
+  // jet still in her dive stays trackable; a spin-out jet too.
   const jets = [];
-  for (const c of G.allCarriers) if (c.wing) for (const s of c.wing.squadrons) for (const j of s.jets) if (['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap'].includes(j.state)) jets.push(j);
-  const ord = [...G.bombs, ...G.missiles].filter(o => o.alive);
-  const carriers = G.allCarriers.filter(c => c.alive);
-  const modes = [['fleet', null], ['jet', jets[0] || null], ['ordnance', ord[0] || null], ['carrier', carriers[0] || null]];
-  G.camTacIdx = (G.camTacIdx + 1) % modes.length;
-  const [name, tgt] = modes[G.camTacIdx];
-  if (name === 'fleet') { G.camTac = null; $('btnCam').textContent = 'Camera: fleet [C]'; return; }
-  if (!tgt) { G.camTacIdx = 0; G.camTac = null; $('btnCam').textContent = 'Camera: fleet [C]'; return; }
-  G.camTac = tgt;
-  $('btnCam').textContent = 'Camera: ' + name + ' [C]';
+  for (const c of G.allCarriers) if (c.wing) for (const s of c.wing.squadrons) for (const j of s.jets)
+    if (['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap', 'spinout', 'crashed'].includes(j.state) && j.group.visible) jets.push(j);
+  const ord = [...G.bombs, ...G.missiles, ...(G.airDefense ? G.airDefense.sams : [])].filter(o => o.alive);
+  const setBtn = (label) => { $('btnCam').textContent = 'Camera: ' + label + ' [C]'; };
+  const clearTac = () => { G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null; G.tacJetsIdx = -1; G.tacOrdIdx = -1; };
+  if (G.tacMode === 'jet') {
+    G.tacJetsIdx++;
+    if (G.tacJetsIdx < jets.length) {
+      G.tacTarget = jets[G.tacJetsIdx]; G.camTac = G.tacTarget;
+      setBtn(`jet ${G.tacJetsIdx + 1}/${jets.length}`);
+      return;
+    }
+    // Jets exhausted — move to ordnance.
+    G.tacMode = 'ordnance'; G.tacOrdIdx = 0;
+    if (ord.length) { G.tacTarget = ord[0]; G.camTac = ord[0]; setBtn(`ordnance 1/${ord.length}`); return; }
+    clearTac(); setBtn('fleet'); return;
+  }
+  if (G.tacMode === 'ordnance') {
+    G.tacOrdIdx++;
+    if (G.tacOrdIdx < ord.length) {
+      G.tacTarget = ord[G.tacOrdIdx]; G.camTac = ord[G.tacOrdIdx];
+      setBtn(`ordnance ${G.tacOrdIdx + 1}/${ord.length}`);
+      return;
+    }
+    clearTac(); setBtn('fleet'); return;
+  }
+  // Not tracking: start with jets, else ordnance, else stay on fleet.
+  if (jets.length) {
+    G.tacMode = 'jet'; G.tacKind = 'jet'; G.tacJetsIdx = 0;
+    G.tacTarget = jets[0]; G.camTac = jets[0];
+    setBtn(`jet 1/${jets.length}`);
+    return;
+  }
+  if (ord.length) {
+    G.tacMode = 'ordnance'; G.tacKind = 'ordnance'; G.tacOrdIdx = 0;
+    G.tacTarget = ord[0]; G.camTac = ord[0];
+    setBtn(`ordnance 1/${ord.length}`);
+    return;
+  }
+  clearTac(); setBtn('fleet');
+  msg('No jets or ordnance airborne — launch a flight first');
+}
+// v1.3.0 (E): detonation hold (Hurricane TacticalCameraSystem
+// noteDetonation). Only takes over while a track is active and the blast
+// is near what we are watching; holds a wide framing of the blast for
+// ~2.5 s before easing back to the track (or to the fleet if the target
+// is gone). Helm stays live throughout — this only moves the camera.
+function noteDetonation(x, y, z, kind) {
+  if (!G.tacMode || G.tacHoldPos) return;
+  const t = G.tacTarget;
+  if (t) {
+    const d = Math.hypot(t.x - x, t.z - z);
+    if (d > 300) return; // Hurricane used 120u (~689 m); 300 m is tighter for a 333 m carrier
+  }
+  G.tacHoldPos = { x, y, z };
+  G.tacHoldUntil = G.time + 2.5;
+  $('btnCam').textContent = 'Camera: impact hold [C]';
+}
+function tacTargetValid() {
+  const t = G.tacTarget;
+  if (!t) return false;
+  if (t.state !== undefined) return ['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap', 'spinout', 'crashed'].includes(t.state);
+  return t.alive === true;
 }
 
 // ---------- HUD ----------
@@ -640,15 +748,51 @@ function updateStatus() {
     `YOU <b>${G.playerFleet.filter(c => c.alive).length}/${G.playerFleet.length}</b> · FOE <b>${G.enemyFleet.filter(c => c.alive).length}/${G.enemyFleet.length}</b>`;
 }
 
-// ---------- Minimap ----------
+// ---------- Minimap / tactical radar (v1.3.0, F) ----------
+// Hurricane TacticalRadarHUD layers on the existing minimap: rotating
+// sweep, range-ring labels, airborne squadrons as chevrons coloured by
+// mission state, ordnance as tracking streaks, storm clutter
+// (dimmed/flickering contacts in Storm/Hurricane).
+const SQ_COLORS = { climb: '#dfeef5', ingress: '#ffd166', attack: '#ff7a3c', egress: '#e8b13c', rtb: '#58c98a', trap: '#7ad4f5', divert: '#c98ad4', spinout: '#ff5a5a' };
 function drawMinimap() {
   const cv = $('minimap'), g = cv.getContext('2d');
   const W = cv.width, R = 4200; // world half-range shown
   const px = x => (x / R * 0.5 + 0.5) * W;
   const pz = z => (z / R * 0.5 + 0.5) * W;
   g.fillStyle = '#0d2839'; g.fillRect(0, 0, W, W);
+  // Range rings with labels (1 km / 2 km / 3 km / 4 km).
   g.strokeStyle = 'rgba(140,200,230,.15)';
-  for (let i = 1; i < 4; i++) { g.beginPath(); g.arc(W / 2, W / 2, W / 2 * i / 4, 0, Math.PI * 2); g.stroke(); }
+  g.fillStyle = 'rgba(157,184,204,.8)';
+  g.font = '11px system-ui, sans-serif';
+  for (let i = 1; i < 4; i++) {
+    g.beginPath(); g.arc(W / 2, W / 2, W / 2 * i / 4, 0, Math.PI * 2); g.stroke();
+    g.fillText((i) + ' km', W / 2 + 3, W / 2 - W / 2 * i / 4 + 12);
+  }
+  // Rotating sweep (one revolution per ~6 s of game time).
+  const sweepA = (G.time * Math.PI * 2 / 6) % (Math.PI * 2);
+  g.save();
+  g.translate(W / 2, W / 2);
+  g.rotate(sweepA);
+  const sg = g.createLinearGradient(0, 0, W / 2, 0);
+  sg.addColorStop(0, 'rgba(120,220,140,0.25)'); sg.addColorStop(1, 'rgba(120,220,140,0)');
+  g.fillStyle = sg;
+  g.beginPath(); g.moveTo(0, 0); g.arc(0, 0, W / 2, -0.35, 0); g.closePath(); g.fill();
+  g.strokeStyle = 'rgba(120,220,140,0.7)'; g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(0, 0); g.lineTo(W / 2, 0); g.stroke();
+  g.restore();
+  g.lineWidth = 1;
+  // Storm clutter: dimmed, flickering false contacts in Storm/Hurricane.
+  if (G.stage >= 2) {
+    for (let i = 0; i < 14; i++) {
+      const seed = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+      const fx = (seed - Math.floor(seed)) * W;
+      const seed2 = Math.sin(i * 57.3 + 91.7) * 24634.6345;
+      const fz = (seed2 - Math.floor(seed2)) * W;
+      const flick = 0.15 + 0.35 * Math.abs(Math.sin(G.time * 2 + i * 1.7));
+      g.fillStyle = `rgba(120,180,200,${flick.toFixed(2)})`;
+      g.fillRect(fx - 2, fz - 2, 4, 4);
+    }
+  }
   const drawCarrier = (c, color) => {
     g.save();
     g.translate(px(c.x), pz(c.z));
@@ -660,8 +804,48 @@ function drawMinimap() {
   };
   for (const c of G.playerFleet) drawCarrier(c, G.selected === c ? '#ffd166' : '#58c98a');
   for (const c of G.enemyFleet) drawCarrier(c, '#e4572e');
-  g.fillStyle = '#dfeef5';
-  for (const c of G.allCarriers) if (c.wing) for (const s of c.wing.squadrons) for (const j of s.jets) if (['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap'].includes(j.state)) g.fillRect(px(j.x) - 1, pz(j.z) - 1, 3, 3);
+  // Airborne squadrons as chevrons coloured by mission state.
+  for (const c of G.allCarriers) if (c.wing) for (const s of c.wing.squadrons) for (const j of s.jets) {
+    if (!['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap', 'spinout'].includes(j.state)) continue;
+    const col = SQ_COLORS[s.state] || '#dfeef5';
+    g.save();
+    g.translate(px(j.x), pz(j.z));
+    g.rotate(j.heading);
+    g.fillStyle = col;
+    g.beginPath(); g.moveTo(0, -7); g.lineTo(5, 5); g.lineTo(0, 2); g.lineTo(-5, 5); g.closePath(); g.fill();
+    g.restore();
+  }
+  // Ordnance as tracking streaks (short trail behind each live bomb/ASM/SAM).
+  const streak = (o, color) => {
+    if (!o._trail) o._trail = [];
+    o._trail.push([o.x, o.z]);
+    if (o._trail.length > 14) o._trail.shift();
+    g.strokeStyle = color; g.lineWidth = 2;
+    g.beginPath();
+    o._trail.forEach(([tx, tz], i) => { if (i === 0) g.moveTo(px(tx), pz(tz)); else g.lineTo(px(tx), pz(tz)); });
+    g.stroke();
+    g.lineWidth = 1;
+    g.fillStyle = color;
+    g.beginPath(); g.arc(px(o.x), pz(o.z), 3, 0, Math.PI * 2); g.fill();
+  };
+  for (const b of G.bombs) if (b.alive) streak(b, '#ffd166');
+  for (const m of G.missiles) if (m.alive) streak(m, '#ff7a3c');
+  if (G.airDefense) for (const s of G.airDefense.sams) if (s.alive) streak(s, '#ffffff');
+  // v1.3.0 (I) CCIP markers on the minimap.
+  for (const p of G.ccip) {
+    if (!p || !p.valid) continue;
+    g.strokeStyle = '#ffd166'; g.lineWidth = 2;
+    g.beginPath(); g.arc(px(p.x), pz(p.z), 6, 0, Math.PI * 2); g.stroke();
+    g.beginPath(); g.moveTo(px(p.x) - 9, pz(p.z)); g.lineTo(px(p.x) + 9, pz(p.z)); g.stroke();
+    g.lineWidth = 1;
+  }
+  // Freak wave on the radar (v1.3.0 D): a pale arc at the crest.
+  if (G.sea && G.sea.freak) {
+    const fw = G.sea.freak;
+    g.strokeStyle = 'rgba(190,230,245,0.85)'; g.lineWidth = 3;
+    g.beginPath(); g.arc(px(fw.x), pz(fw.z), fw.radius / R * W, 0, Math.PI * 2); g.stroke();
+    g.lineWidth = 1;
+  }
   if (G.waypoint) {
     g.strokeStyle = '#ffd166'; g.lineWidth = 2;
     g.beginPath(); g.arc(px(G.waypoint.x), pz(G.waypoint.z), 7, 0, Math.PI * 2); g.stroke();
@@ -738,18 +922,29 @@ function endGame(result) {
   // Survivors: 'alive' only — a falling/sinking carrier is not one.
   const pSurv = G.playerFleet.filter(c => c.state === 'alive').length;
   const eSurv = G.enemyFleet.filter(c => c.state === 'alive').length;
+  // v1.3.0 (G): score + persisted best result (localStorage).
+  // Score: 100 per surviving carrier + 50 per enemy carrier destroyed
+  // + 5 per bomb hit. Best = highest score, with the victory that earned it.
+  const eDestroyed = G.enemyFleet.length - G.enemyFleet.filter(c => c.state === 'alive').length;
+  const score = pSurv * 100 + eDestroyed * 50 + G.bombStats.hits * 5;
+  const best = { result, survivors: pSurv, score, date: new Date().toISOString().slice(0, 10) };
+  if (!G.best || score > G.best.score) {
+    G.best = best;
+    try { localStorage.setItem('helicarriers_best', JSON.stringify(best)); } catch (_) {}
+  }
+  const bestLine = `Score ${score} · Best: ${G.best.result.toUpperCase()} ${G.best.score} pts (${G.best.survivors} survived, ${G.best.date})`;
   if (result === 'win') {
     $('endTitle').textContent = '🏆 VICTORY';
     $('endTitle').style.color = '#ffd166';
-    $('endText').textContent = `All enemy helicarriers destroyed. ${pSurv} of your carriers survived.`;
+    $('endText').textContent = `All enemy helicarriers destroyed. ${pSurv} of your carriers survived. ${bestLine}`;
   } else if (result === 'lose') {
     $('endTitle').textContent = '💥 DEFEAT';
     $('endTitle').style.color = '#e4572e';
-    $('endText').textContent = `Your fleet is gone. The sea keeps the wreckage. ${eSurv} enemy carrier${eSurv === 1 ? '' : 's'} survived.`;
+    $('endText').textContent = `Your fleet is gone. The sea keeps the wreckage. ${eSurv} enemy carrier${eSurv === 1 ? '' : 's'} survived. ${bestLine}`;
   } else { // draw — both fleets gone at once is not a victory
     $('endTitle').textContent = '💥 MUTUAL DESTRUCTION';
     $('endTitle').style.color = '#e8b13c';
-    $('endText').textContent = 'Both fleets are gone — mutual destruction. No carriers survived.';
+    $('endText').textContent = 'Both fleets are gone — mutual destruction. No carriers survived. ' + bestLine;
   }
   $('endOverlay').style.display = 'flex';
 }
@@ -758,6 +953,10 @@ function makeCtx() {
   return {
     scene: G.scene, sea: G.sea, vfx: G.vfx, time: G.time,
     bombs: G.bombs, missiles: G.missiles,
+    audio: G.audio, carriers: G.allCarriers,
+    // v1.3.0 (E): a detonation near the tactical-camera target holds
+    // the camera on the blast (see noteDetonation below).
+    noteDetonation: (x, y, z, kind) => noteDetonation(x, y, z, kind),
     msg, onCarrierLost: (c) => { ensureLiveCommand(c); renderFleetPanels(); checkEnd(); },
     bombLog: (hit, along, across, by) => {
       G.bombStats.drops++;
@@ -768,8 +967,141 @@ function makeCtx() {
   };
 }
 
+// ---------- v1.3.0: pause, weather, freak wave, CCIP ----------
+// Pause screen (P or Esc): resume / restart / back to menu. The sim
+// freezes; rendering, the sea and the camera keep running underneath.
+function togglePause() {
+  if (!G.started || G.over) return;
+  G.paused = !G.paused;
+  $('pauseOverlay').style.display = G.paused ? 'flex' : 'none';
+  if (G.audio) G.audio.click();
+}
+function loadBest() {
+  try {
+    const b = JSON.parse(localStorage.getItem('helicarriers_best') || 'null');
+    if (b && typeof b.score === 'number') G.best = b;
+  } catch (_) { G.best = null; }
+  const el = $('bestLine');
+  if (el) el.textContent = G.best
+    ? `Best result: ${G.best.result.toUpperCase()} — ${G.best.score} pts, ${G.best.survivors} carrier${G.best.survivors === 1 ? '' : 's'} survived (${G.best.date})`
+    : 'No rounds played yet — your best result will be remembered here.';
+}
+// Distance-driven weather progression (D, optional): as the flagship
+// sails, the weather worsens — Calm -> Rough at 1500 m sailed,
+// Storm at 3000 m, Hurricane at 5000 m. Fixed mode never changes stage.
+function updateWeatherProgression(dt) {
+  if (G.weatherProg !== 'distance' || !G.selected) return;
+  const s = G.selected;
+  if (G.lastFlagPos) {
+    G.sailedDist += Math.hypot(s.x - G.lastFlagPos.x, s.z - G.lastFlagPos.z);
+  }
+  G.lastFlagPos = { x: s.x, z: s.z };
+  const want = G.sailedDist >= 5000 ? 3 : G.sailedDist >= 3000 ? 2 : G.sailedDist >= 1500 ? 1 : 0;
+  if (want !== G.stage) {
+    G.stage = want;
+    G.sea.setStage(want);
+    msg(`Weather worsening — ${STAGES[want].name} sea (${Math.round(G.sailedDist)} m sailed)`);
+  }
+}
+// Freak wave (D, Hurricane v11.8-11.12): spawns only in Storm/Hurricane,
+// travels across the sea toward the flagship, threatens anything low.
+function spawnFreakWave() {
+  const flag = G.playerFleet.find(c => c.alive) || G.allCarriers.find(c => c.alive);
+  if (!flag) return;
+  const ang = Math.random() * Math.PI * 2;
+  const dist = 2500;
+  const sx = flag.x + Math.cos(ang) * dist, sz = flag.z + Math.sin(ang) * dist;
+  const toX = flag.x - sx, toZ = flag.z - sz, tl = Math.hypot(toX, toZ) || 1;
+  G.sea.freak = { x: sx, z: sz, dirX: toX / tl, dirZ: toZ / tl, amp: 14, radius: 120, speed: 30, age: 0, life: 60 };
+  msg('⚠️ FREAK WAVE — a wall of water is coming! Low jets: climb!');
+  if (G.audio) G.audio.alarm(G.time);
+}
+function updateFreakWave(dt, ctx) {
+  const fw = G.sea.freak;
+  if (!fw) {
+    if (G.stage >= 2) {
+      G.freakT -= dt;
+      if (G.freakT <= 0) spawnFreakWave();
+    }
+    return;
+  }
+  fw.age += dt;
+  fw.x += fw.dirX * fw.speed * dt;
+  fw.z += fw.dirZ * fw.speed * dt;
+  if (fw.age > fw.life) { G.sea.freak = null; G.freakT = 45 + Math.random() * 30; return; }
+  // Swamp check: a low jet caught by the crest is swamped/crashes.
+  // Carriers fly at >=150 m — the 14 m crest cannot reach them (safe
+  // by altitude, by design). Beam/bow rule, Hurricane-style: a jet
+  // flying INTO the wave face (head-on to its travel) is swamped at a
+  // lower crest than one running with it — here: any jet below the
+  // crest + 3 m inside 1.5 radii is caught.
+  for (const c of G.allCarriers) {
+    if (!c.wing) continue;
+    for (const s of c.wing.squadrons) for (const j of s.jets) {
+      if (!['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap'].includes(j.state)) continue;
+      const crest = G.sea.freakHeightAt(j.x, j.z);
+      if (crest > 6) {
+        const seaH = G.sea.waveHeight(j.x, j.z, G.time);
+        if (j.y < seaH + crest + 3) {
+          j.startSpinOut(ctx, 'swamped by the freak wave');
+          ctx.vfx.splash(j.x, seaH + crest, j.z, 20);
+        }
+      }
+    }
+  }
+}
+// Lightning (D): Storm/Hurricane only. A flash brightens the sky for
+// ~0.15 s; thunder follows after a distance delay.
+function updateLightning(dt) {
+  if (G.stage < 2) return;
+  G.lightningT -= dt;
+  if (G.lightningT <= 0) {
+    G.lightningT = 8 + Math.random() * 12;
+    G.flashT = 0.15;
+    G.pendingThunder = G.time + 0.5 + Math.random() * 1.5;
+    if (G.scene) G.scene.background.setHex(0xd8e8f2);
+  }
+  if (G.flashT > 0) {
+    G.flashT -= dt;
+    if (G.flashT <= 0 && G.scene) G.scene.background.setHex(STAGES[G.stage].sky);
+  }
+  if (G.pendingThunder && G.time >= G.pendingThunder) {
+    G.pendingThunder = 0;
+    if (G.audio) G.audio.thunder();
+  }
+}
+// CCIP (I): while a player strike flight is in its attack dive, show
+// the predicted bomb impact point — a small ring in 3D on the target
+// deck/sea plus the minimap marker (drawn in drawMinimap from G.ccip).
+function updateCCIP() {
+  G.ccip = [];
+  if (!G.started || G.over) return;
+  let mi = 0;
+  for (const c of G.playerFleet) {
+    if (!c.wing) continue;
+    for (const s of c.wing.squadrons) {
+      if (s.state !== 'attack' || s.attackPhase !== 'dive' || !s.target) continue;
+      for (const j of s.aliveJets) {
+        if (j.ordnance <= 0) continue;
+        const p = predictBombImpact(j, s.target);
+        G.ccip.push(p);
+        const mesh = G.ccipMeshes[mi++];
+        if (mesh) {
+          mesh.visible = p.valid;
+          if (p.valid) mesh.position.set(p.x, p.y + 3, p.z);
+        }
+      }
+    }
+  }
+  for (; mi < G.ccipMeshes.length; mi++) G.ccipMeshes[mi].visible = false;
+}
+
 // ---------- Input ----------
 function bindInput() {
+  // v1.3.0 (C): lazy AudioContext on the first user gesture.
+  const ensureAudio = () => { if (G.audio) G.audio.ensure(); };
+  addEventListener('pointerdown', ensureAudio, { once: false });
+  addEventListener('keydown', ensureAudio, { once: false });
   const cv = G.renderer.domElement;
   let dragging = false, lastX = 0, lastY = 0, moved = 0, shiftDrag = false;
   let pinchD = 0;
@@ -899,6 +1231,9 @@ function bindInput() {
 
   addEventListener('keydown', e => {
     if (!G.started) return;
+    // v1.3.0 (G): P or Esc pauses (before any other key handling).
+    if (e.key === 'p' || e.key === 'P' || e.key === 'Escape') { togglePause(); return; }
+    if (G.paused) return;
     G.keys[e.key] = true;
     if (e.key === 'Tab') { e.preventDefault(); cycleShip(); }
     if (e.key >= '1' && e.key <= '8') setTelegraph(+e.key - 1);
@@ -939,6 +1274,21 @@ function bindInput() {
     updateTeleBox();
   });
   $('btnAgain').addEventListener('click', () => location.reload());
+  // v1.3.0 (G/C): pause overlay + mute toggle.
+  $('btnResume').addEventListener('click', togglePause);
+  $('btnRestart').addEventListener('click', () => location.reload());
+  $('btnMenu').addEventListener('click', () => location.reload());
+  $('btnPause').addEventListener('click', togglePause);
+  const muteBtn = $('btnMute');
+  const syncMute = () => { muteBtn.textContent = G.audio && G.audio.muted ? '🔇 Muted' : '🔊 Sound'; };
+  muteBtn.addEventListener('click', () => {
+    if (!G.audio) return;
+    G.audio.ensure();
+    G.audio.setMuted(!G.audio.muted);
+    syncMute();
+  });
+  G._syncMute = syncMute;
+  syncMute();
 }
 function cycleShip() {
   const alive = G.playerFleet.filter(c => c.alive);
@@ -954,6 +1304,7 @@ function adjustAlt(d) {
 function resetCamera() {
   G.camYaw = 0.6; G.camPitch = 0.32; G.camDist = 1100;
   G.camPan = { x: 0, y: 0 }; G.camTac = null; G.camTacIdx = 0; G.camFollow = G.selected;
+  G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.tacHoldPos = null; G.tacJetsIdx = -1; G.tacOrdIdx = -1;
   G.camSpectate = null; // v1.2.0: R also ends a spectate follow (Hurricane v11.15)
   $('btnCam').textContent = 'Camera: fleet [C]';
 }
@@ -1029,6 +1380,41 @@ function runBombProbe() {
   window.__probeResult = res;
 }
 
+// ---------- v1.3.0 (G) attract mode ----------
+// Idle attract behind the start menu: two small fleets gently cruising
+// on a living sea. No launches, no combat — just the world alive behind
+// the menu. startGame() clears these fleets and spawns the real round.
+function attractUpdate(dt) {
+  G.time += dt;
+  G.attractT += dt;
+  G.camYaw += dt * 0.03;
+  G.camDist = 1600;
+  updateSteering(dt);
+  const ctx = makeCtx();
+  for (const c of G.allCarriers) c.update(dt, ctx);
+}
+async function startAttract() {
+  try {
+    G.playerN = 2; G.enemyN = 2; G.stage = 0; G.form = 'C'; G.baseAlt = 350;
+    initScene();
+    G.models = await loadModels();
+    G.playerFleet = spawnFleet('player', 2, 1200, 0);
+    G.enemyFleet = spawnFleet('enemy', 2, -1200, Math.PI);
+    G.allCarriers = [...G.playerFleet, ...G.enemyFleet];
+    G.selected = G.playerFleet[0];
+    G.camFollow = G.selected;
+    G.telegraphIdx = 1;
+    for (const c of G.playerFleet) c.telegraphIdx = 1;
+    G.attract = true;
+    G._loopStarted = true;
+    window.__game = G; // debug handle (attract phase)
+    window.__bombBallisticsProbe = bombBallisticsProbe;
+    window.__predictBombImpact = predictBombImpact;
+    window.__noteDetonation = noteDetonation;
+    requestAnimationFrame(loop);
+  } catch (err) { console.error('attract failed', err); }
+}
+
 // ---------- Start / main loop ----------
 function readMenu() {
   const seg = (id) => { const b = document.querySelector(`#${id} button.on`); return b ? b.dataset.v : null; };
@@ -1039,22 +1425,37 @@ function readMenu() {
   G.form = seg('segForm') || 'C';
   G.baseAlt = +$('selAlt').value;
   G.enemyAI = $('selEnemyAI').value;
+  G.weatherProg = $('selWeatherProg') ? $('selWeatherProg').value : 'fixed';
 }
 async function startGame() {
   readMenu();
   if (params.has('fleet')) G.playerN = G.enemyN = +params.get('fleet');
   if (params.has('skill')) G.skill = params.get('skill');
-  if (params.has('stage')) G.stage = params.get('stage') === 'storm' ? 2 : params.get('stage') === 'rough' ? 1 : 0;
+  if (params.has('stage')) G.stage = params.get('stage') === 'hurricane' ? 3 : params.get('stage') === 'storm' ? 2 : params.get('stage') === 'rough' ? 1 : 0;
+  if (params.has('weatherprog')) G.weatherProg = params.get('weatherprog');
   $('menu').style.display = 'none';
   $('hud').classList.add('on');
-  initScene();
-  G.sea.setStage(G.stage);
-  try {
-    G.models = await loadModels();
-  } catch (err) {
-    $('loadErr').style.display = 'flex';
-    $('loadErrText').textContent = 'GLB load failed: ' + (err && err.message ? err.message : err) + '\nModels are embedded as base64 modules (assets/helicarrier.b64.js, assets/fa18.b64.js). Check they exist and the page is served over HTTP.';
-    throw err;
+  // v1.3.0: if the attract scene is already running, reuse it — clear
+  // the demo fleets and spawn the real round into the same scene.
+  if (G.attract) {
+    for (const c of G.allCarriers) G.scene.remove(c.group);
+    G.playerFleet = []; G.enemyFleet = []; G.allCarriers = [];
+    G.attract = false; G.selected = null; G.camFollow = null;
+    G.sea.setStage(G.stage);
+  } else {
+    initScene();
+  }
+  G.audio = new GameAudio();
+  G.airDefense = new AirDefenseSystem();
+  if (G._syncMute) G._syncMute();
+  if (!G.models) {
+    try {
+      G.models = await loadModels();
+    } catch (err) {
+      $('loadErr').style.display = 'flex';
+      $('loadErrText').textContent = 'GLB load failed: ' + (err && err.message ? err.message : err) + '\nModels are embedded as base64 modules (assets/helicarrier.b64.js, assets/fa18.b64.js). Check they exist and the page is served over HTTP.';
+      throw err;
+    }
   }
   G.playerFleet = spawnFleet('player', G.playerN, 1500, 0);
   G.enemyFleet = spawnFleet('enemy', G.enemyN, -1500, Math.PI);
@@ -1071,6 +1472,8 @@ async function startGame() {
   G.started = true;
   window.__game = G; // debug handle for the verification agent
   window.__bombBallisticsProbe = bombBallisticsProbe;
+  window.__predictBombImpact = predictBombImpact;
+  window.__noteDetonation = noteDetonation;
   if (params.has('timescale')) G.timeScale = clamp(+params.get('timescale') || 1, 1, 8);
   // Debug URL hooks
   if (params.has('collide')) forceCollisionCourse(params.get('collide') === '1' ? 'headon' : params.get('collide'));
@@ -1078,22 +1481,22 @@ async function startGame() {
   if (params.get('killplayer') === '1') setTimeout(() => killCarrier(G.playerFleet[0], 'reactor'), 3000);
   if (params.get('probe') === 'bombs') setTimeout(runBombProbe, 1500);
   if (params.get('autostart') === '1' && G.enemyAI === 'auto') { /* enemy director runs anyway */ }
-  requestAnimationFrame(loop);
+  if (!G._loopStarted) { G._loopStarted = true; requestAnimationFrame(loop); }
   // HUD refresh
   setInterval(() => { if (G.started) { renderFleetPanels(); updateStatus(); updateTeleBox(); } }, 500);
 }
 
 let lastT = performance.now();
-function loop(now) {
-  requestAnimationFrame(loop);
-  // dt clamp 0.10 s: at low frame rates (software rendering in a probe)
-  // game time still tracks wall time at ~0.5x instead of stalling; the
-  // flight/damage integrators stay stable at 0.1 s steps.
-  const rawDt = Math.min(0.10, (now - lastT) / 1000);
-  lastT = now;
-  const dt = rawDt * G.timeScale;
+// v1.3.0 (J) substepped sim: one frame's sim time is split into
+// substeps of at most 0.05 s (Pandora's cap), so a slow device (or a
+// debug timeScale) can never feed a 0.8 s integrator step to the
+// flight/damage code. Total sim per frame is capped at 0.10 s at
+// timeScale 1 — at low frame rates the game runs in slow motion
+// instead of spiralling (each frame still advances, never catching up
+// unboundedly). Debug timeScale multiplies the cap, as before.
+function stepSim(dt) {
   G.time += dt;
-  if (G.msgT > 0) { G.msgT -= rawDt; if (G.msgT <= 0) $('msg').textContent = '—'; }
+  if (G.msgT > 0) { G.msgT -= dt; if (G.msgT <= 0) $('msg').textContent = '—'; }
   // Post-game freeze (Job B): once G.over is set, the world stops — no
   // steering, carrier/wing, ordnance or director updates — so the frozen
   // scene stays exactly the end state the overlay describes (a survivor
@@ -1120,7 +1523,17 @@ function loop(now) {
     G.bombs = G.bombs.filter(b => b.alive);
     for (const m of G.missiles) m.update(dt);
     G.missiles = G.missiles.filter(m => m.alive);
+    // v1.3.0 (A): air defence on both sides.
+    if (G.airDefense) G.airDefense.update(dt, ctx, G);
     enemyDirector(dt);
+    updateWeatherProgression(dt);
+    updateFreakWave(dt, ctx);
+    updateLightning(dt);
+    // v1.3.0 (C): alarm when the flagship takes fire.
+    if (G.selected && G.selected.fires.length && G.audio && G.time > (G.alarmCool || 0)) {
+      G.audio.alarm(G.time);
+      G.alarmCool = G.time + 5;
+    }
     checkEnd(); // every frame: a breakup's pieces take ~40 s of game time to sink
   }
   // (c) Keep a command-transfer announcement on screen for 8 s of game
@@ -1129,17 +1542,55 @@ function loop(now) {
     if (G.time < G.transferAnnounce.until && !G.over) { $('msg').textContent = G.transferAnnounce.text; G.msgT = 4; }
     else G.transferAnnounce = null;
   }
+}
+function loop(now) {
+  requestAnimationFrame(loop);
+  const rawDt = Math.min(0.10, (now - lastT) / 1000);
+  lastT = now;
+  // v1.3.0 (G) attract mode: before the round starts the menu floats
+  // over a living scene (fleet cruising on a living sea).
+  if (G.attract && !G.started) {
+    attractUpdate(rawDt);
+    const alive = G.allCarriers.filter(c => c.state !== 'gone');
+    const fx = alive.reduce((a, c) => a + c.x, 0) / Math.max(1, alive.length);
+    const fz = alive.reduce((a, c) => a + c.z, 0) / Math.max(1, alive.length);
+    G.sea.update(G.time, rawDt, fx, fz, []);
+    G.vfx.update(rawDt);
+    updateCamera(rawDt);
+    G.renderer.render(G.scene, G.camera);
+    return;
+  }
+  // v1.3.0 (G) pause: the sim freezes, the scene keeps rendering.
+  if (!G.paused) {
+    const totalDt = rawDt * G.timeScale;
+    const cap = 0.10 * G.timeScale;
+    const simDt = Math.min(totalDt, cap);
+    const steps = Math.max(1, Math.ceil(simDt / 0.05));
+    const sub = simDt / steps;
+    for (let i = 0; i < steps; i++) stepSim(sub);
+  }
+  updateCCIP();
   // Ocean follows the midpoint of the action; wakes only for hulls at the water.
   const alive = G.allCarriers.filter(c => c.state !== 'gone');
   const fx = alive.reduce((a, c) => a + c.x, 0) / Math.max(1, alive.length);
   const fz = alive.reduce((a, c) => a + c.z, 0) / Math.max(1, alive.length);
   const wakeShips = G.allCarriers.filter(c => c.y < 60).map(c => ({ x: c.x, z: c.z, heading: c.heading, forwardSpeed: c.forwardSpeed, len: CARRIER_LEN, beam: 70 }));
-  G.sea.update(G.time, dt, fx, fz, wakeShips);
-  G.vfx.update(dt);
+  G.sea.update(G.time, rawDt, fx, fz, wakeShips);
+  // v1.3.0 (D) freak-wave crest wall follows the crest.
+  if (G.freakMesh) {
+    const fw = G.sea.freak;
+    if (fw) {
+      G.freakMesh.visible = true;
+      G.freakMesh.position.set(fw.x, fw.amp * 0.5, fw.z);
+      G.freakMesh.rotation.y = Math.atan2(fw.dirX, fw.dirZ) + Math.PI / 2;
+      G.freakMesh.material.opacity = 0.3 + 0.2 * Math.sin(G.time * 2);
+    } else G.freakMesh.visible = false;
+  }
+  G.vfx.update(rawDt);
   updateCamera(rawDt);
   drawMinimap();
   if (DEBUG) {
-    $('dbgInfo').textContent = `t=${G.time.toFixed(0)}s · jets up ${G.allCarriers.reduce((a, c) => a + (c.wing ? c.wing.airborneCount() : 0), 0)} · bombs ${G.bombs.length} · missiles ${G.missiles.length} · parts steal: P ${G.vfx.pCursor}/${1600} S ${G.vfx.spCursor}/${420}`;
+    $('dbgInfo').textContent = `t=${G.time.toFixed(0)}s · jets up ${G.allCarriers.reduce((a, c) => a + (c.wing ? c.wing.airborneCount() : 0), 0)} · bombs ${G.bombs.length} · missiles ${G.missiles.length} · SAMs ${G.airDefense ? G.airDefense.sams.length : 0} · parts steal: P ${G.vfx.pCursor}/${1600} S ${G.vfx.spCursor}/${420}`;
   }
   G.renderer.render(G.scene, G.camera);
 }
@@ -1154,8 +1605,12 @@ document.querySelectorAll('.seg').forEach(seg => {
 });
 $('startBtn').addEventListener('click', () => { startGame().catch(err => console.error(err)); });
 
-// Autostart for verification (?autostart=1): skip the menu with defaults.
+// v1.3.0 (G): show the persisted best result on the menu, and run the
+// idle attract scene behind it. Autostart (?autostart=1) skips both.
+loadBest();
 if (params.get('autostart') === '1') {
   startGame().catch(err => console.error(err));
+} else {
+  startAttract();
 }
 window.__booted = true;
