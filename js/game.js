@@ -85,12 +85,14 @@ const G = {
   bombs: [], missiles: [],
   camYaw: 0.6, camPitch: 0.32, camDist: 1100, camPan: { x: 0, y: 0 },
   camFollow: null, camTac: null, camTacIdx: 0,
-  // v1.4.0 (item 8) dive camera (Hurricane v11.14, metric): a low /
-  // below-surface inspection view of a sinking wreck / wreckage field.
-  // diveCam = requested on/off; diveBlend eases 0..1 in updateCamera;
-  // _underwater tracks whether the lens is actually submerged (fog /
-  // background / tint switch). See setDiveCam / updateCamera.
-  diveCam: false, diveBlend: 0, _underwater: false,
+  // v1.4.1: one free-orbit camera — the dive camera mode (v1.4.0,
+  // item 8) is removed entirely (button, mode and U key). The orbit
+  // camera itself can now go anywhere, including below the surface:
+  // the pitch clamp is widened to ±1.45 and the camera floor is gone,
+  // so spectating a sinking carrier pans continuously through the
+  // waterline. _underwater still tracks whether the lens is submerged
+  // (fog / background / tint switch).
+  _underwater: false,
   // v1.4.0 (item 7, touch spec §2/§8): rudder stick mode — 'float'
   // (default on coarse pointers) or 'fixed' (menu opt-out, persisted
   // as localStorage 'helicarriers_joy_mode'); joyGhost = rest
@@ -153,7 +155,7 @@ const G = {
 
 function msg(text) {
   const el = $('msg');
-  if (el) el.textContent = text;
+  if (el) { el.textContent = text; el.style.display = 'block'; } // v1.4.1: hidden by default — the idle '—' pill sat in open sea (39212)
   G.msgT = 4;
 }
 
@@ -320,7 +322,10 @@ function switchShip(next) {
 }
 // (c) Flagship death must never leave the helm on a dead carrier. The
 // moment the selected carrier stops being alive (falling, sinking or
-// gone), command passes to the next live carrier of the same side.
+// gone), command passes to the next live carrier of the same side —
+// EXCEPT a zero-throttle fall (v1.4.1): the pods are alive and the
+// player can spool her back up, so the helm stays on her while she is
+// falling-and-recoverable (see the guard in ensureLiveCommand).
 // Called every frame from updateSteering — so the transfer lands within
 // a frame of the loss, even for a fall (onCarrierLost only fires once
 // the wreck is 'gone', ~40 s of game time later) — and from
@@ -335,6 +340,13 @@ function switchShip(next) {
 function ensureLiveCommand(dead) {
   if (G.over) return false;
   if (G.selected && G.selected.alive) return false;
+  // v1.4.1: a zero-throttle fall is not a loss — the pods are alive and
+  // the player can spool her back up, so the helm stays on her while
+  // she is falling-and-recoverable. (switchShip/Tab refuse non-alive
+  // carriers, so transferring away would make recovery impossible.)
+  // The moment she stops being falling-and-recoverable (sinking,
+  // breakup, gone) the transfer below proceeds as before.
+  if (G.selected && G.selected.state === 'falling' && G.selected._fallZeroThrottle) return false;
   if (!G.selected) return false; // already cleared; Tab/click re-takes command
   const fleet = G.playerFleet;
   if (!fleet.length) return false;
@@ -804,15 +816,15 @@ function cameraTarget() {
     // otherwise back to the fleet.
     if (!tacTargetValid()) {
       G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null;
-      $('btnCam').textContent = 'Camera: fleet [C]';
+      $('btnCam').textContent = '📷 Fleet [C]';
     } else {
-      $('btnCam').textContent = 'Camera: ' + G.tacMode + ' [C]';
+      $('btnCam').textContent = '📷 ' + G.tacMode[0].toUpperCase() + G.tacMode.slice(1) + ' [C]';
     }
   }
   // v1.3.0 (E): a tracked target that died / landed ends the track.
   if (G.camTac && G.tacTarget && !tacTargetValid()) {
     G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null;
-    $('btnCam').textContent = 'Camera: fleet [C]';
+    $('btnCam').textContent = '📷 Fleet [C]';
   }
   if (G.camTac) return G.camTac;
   if (G.camFollow) return G.camFollow.group ? { x: G.camFollow.x, y: G.camFollow.y, z: G.camFollow.z } : G.camFollow;
@@ -826,53 +838,10 @@ function updateCamera(dt) {
   // wide framing of the blast, then eases back when the hold ends.
   const dist = G.tacHoldPos ? Math.max(G.camDist, 900) : G.camDist;
   const want = orbitPos({ x: tx, y: ty, z: tz }, G.camYaw, G.camPitch, dist);
-  // v1.4.0 (item 8) dive camera (Hurricane v11.14, metric): when on,
-  // the camera dives below the surface near the dive target — a
-  // falling/sinking carrier (the spectated wreck first), else the
-  // newest wreckage field, else the flagship's hull — and looks at
-  // her from below, so a sinking can be inspected from underneath.
-  // The dive position blends with the orbit position by diveBlend, so
-  // the transition is a smooth submersion, not a cut. Orbit drag and
-  // zoom keep working there (the same yaw/pitch basis); the helm is
-  // NOT locked. If the target resolves to nothing (wreck gone, no
-  // wreckage, no flagship) the dive ends itself.
-  G.diveBlend += ((G.diveCam ? 1 : 0) - G.diveBlend) * (1 - Math.exp(-dt * 2.5));
-  G.diveBlend = clamp(G.diveBlend, 0, 1);
-  if (G.diveBlend > 0.001 && (G.started || G.over)) {
-    const dp = diveTargetPos();
-    if (!dp) {
-      G.diveCam = false; G.diveBlend = 0;
-      const b = $('btnDive'); if (b) b.textContent = '🌊 Dive cam [U]';
-      msg('Dive camera off — nothing left to inspect');
-    } else {
-      const seaH = G.sea.waveHeight(dp.x, dp.z, G.time);
-      // Hurricane diveDist was len/2 + 10..60 (Hurricane units, 5.74 m
-      // each); metric for a 333 m hull at camDist 120..4000 m: 180..400 m.
-      const diveDist = 180 + (clamp(G.camDist, 120, 4000) - 120) / 3880 * 220;
-      const dtx = dp.x - Math.sin(G.camYaw) * diveDist;
-      const dtz = dp.z - Math.cos(G.camYaw) * diveDist;
-      // ~5 m below the local surface, clamped 2-12 m below (Hurricane
-      // v11.14), with the orbit pitch nudging it inside that band.
-      const dty = clamp(seaH - 5 + Math.tan(G.camPitch) * diveDist, seaH - 12, seaH - 2);
-      const b = G.diveBlend;
-      want.x += (dtx - want.x) * b;
-      want.y += (dty - want.y) * b;
-      want.z += (dtz - want.z) * b;
-      tx += (dp.x - tx) * b;
-      ty += (dp.lookY - ty) * b;
-      tz += (dp.z - tz) * b;
-    }
-  }
-  const seaH = G.sea.waveHeight(want.x, want.z, G.time);
-  const midX = (want.x + tx) / 2, midZ = (want.z + tz) / 2;
-  const midSea = G.sea.waveHeight(midX, midZ, G.time);
-  // The camera floor (clear of the sea) does NOT apply while diving —
-  // the whole point is to go below the surface. It eases back in as
-  // the blend falls.
-  if (G.diveBlend <= 0.01) {
-    const floor = Math.max(seaH + 3, midSea + 5, ty + 2);
-    if (want.y < floor) want.y = floor;
-  }
+  // v1.4.1: one free-orbit camera — no dive blend, no camera floor.
+  // The orbit position is used as computed, so the camera can go
+  // below the surface, underneath the carrier, or straight overhead
+  // at any zoom; the underwater switch below still follows the lens.
   const k = 1 - Math.exp(-dt * 6);
   G.camera.position.lerp(want, k);
   G.camera.lookAt(tx, ty, tz);
@@ -909,57 +878,7 @@ function updateCamera(dt) {
     G.camera.position.y += (Math.random() - 0.5) * G.vfx.shake * 0.12;
   }
 }
-// v1.4.0 (item 8): where the dive camera looks. Priority: the
-// spectated falling/sinking wreck (so dive + spectate compose — the
-// dive follows the wreck the player is already watching); else the
-// nearest falling/sinking carrier; else the newest wreckage field
-// (a wreck to look at after she is gone); else the flagship's hull.
-// lookY is at/below the surface so the lens looks slightly up at the
-// hull from underneath, never down at the seabed.
-function diveTargetPos() {
-  let c = null;
-  if (G.camSpectate && (G.camSpectate.state === 'falling' || G.camSpectate.state === 'sinking' ||
-      (G.camSpectate.state === 'gone' && G.camSpectate.pieces.length))) c = G.camSpectate;
-  else {
-    let bd = 1e18;
-    const ax = G.selected ? G.selected.x : 0, az = G.selected ? G.selected.z : 0;
-    for (const cc of G.allCarriers) {
-      if (cc.state !== 'falling' && cc.state !== 'sinking') continue;
-      const d = Math.hypot(cc.x - ax, cc.z - az);
-      if (d < bd) { bd = d; c = cc; }
-    }
-  }
-  if (c) return { x: c.x, y: c.y, z: c.z, lookY: Math.min(c.y, -2), kind: 'carrier', ref: c };
-  if (G.wreckage && G.wreckage.fields.length) {
-    const f = G.wreckage.fields[G.wreckage.fields.length - 1];
-    const cx = f.cx !== undefined ? f.cx : f.x, cz = f.cz !== undefined ? f.cz : f.z;
-    return { x: cx, y: -6, z: cz, lookY: -6, kind: 'wreck', ref: f };
-  }
-  const s = G.selected || G.camFollow;
-  if (s && s.x !== undefined) return { x: s.x, y: Math.min(s.y, -2), z: s.z, lookY: -2, kind: 'carrier', ref: s };
-  return null;
-}
-// v1.4.0 (item 8): toggle the dive camera (button or U). Diving ends
-// a tactical track (Hurricane v11.25: diving ends a follow track) so
-// the lens never dives after a jet. Spectate is NOT cleared — the
-// dive composes with it (diveTargetPos prefers the spectated wreck),
-// and surfacing returns to the normal spectate follow.
-function setDiveCam(on) {
-  if (!G.started || G.over) return;
-  if (on === G.diveCam) return;
-  if (on) {
-    G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null; G.tacJetsIdx = -1; G.tacOrdIdx = -1;
-    $('btnCam').textContent = 'Camera: fleet [C]';
-  }
-  G.diveCam = on;
-  const b = $('btnDive');
-  if (b) b.textContent = on ? '⬆️ Surface [U]' : '🌊 Dive cam [U]';
-  msg(on ? '🌊 Dive camera — inspecting below the surface. U or R to return.' : '⬆️ Surfaced — camera back to normal');
-}
 function cycleTactical() {
-  // v1.4.0 (item 8): cycling the tactical camera surfaces first —
-  // a jet/ordnance track and a dive are mutually exclusive.
-  if (G.diveCam) setDiveCam(false);
   // v1.3.0 (E) TacticalCameraSystem (Hurricane v11.35): C steps through
   // EVERY airborne jet in order, then EVERY ordnance in flight, then
   // off. Within each category the index advances (next jet, next
@@ -969,7 +888,7 @@ function cycleTactical() {
   for (const c of G.allCarriers) if (c.wing) for (const s of c.wing.squadrons) for (const j of s.jets)
     if (['climb', 'ingress', 'attack', 'egress', 'rtb', 'trap', 'spinout', 'crashed'].includes(j.state) && j.group.visible) jets.push(j);
   const ord = [...G.bombs, ...G.missiles, ...(G.airDefense ? G.airDefense.sams : [])].filter(o => o.alive);
-  const setBtn = (label) => { $('btnCam').textContent = 'Camera: ' + label + ' [C]'; };
+  const setBtn = (label) => { $('btnCam').textContent = '📷 ' + label[0].toUpperCase() + label.slice(1) + ' [C]'; };
   const clearTac = () => { G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.camTac = null; G.tacJetsIdx = -1; G.tacOrdIdx = -1; };
   if (G.tacMode === 'jet') {
     G.tacJetsIdx++;
@@ -1022,7 +941,7 @@ function noteDetonation(x, y, z, kind) {
   }
   G.tacHoldPos = { x, y, z };
   G.tacHoldUntil = G.time + 2.5;
-  $('btnCam').textContent = 'Camera: impact hold [C]';
+  $('btnCam').textContent = '📷 Impact hold [C]';
 }
 function tacTargetValid() {
   const t = G.tacTarget;
@@ -1033,17 +952,19 @@ function tacTargetValid() {
 
 // ---------- HUD ----------
 function zoneLine(c) {
+  // v1.4.1: zones as single-letter codes + numbers (R reactor, M
+  // magazine, B bridge, D deck, E engines) — same readouts, no words.
   const z = c.zones;
   const podLine = 'Pods ' + c.pods.map(p => p.alive ? '●' : '✕').join('');
   const f = (k, label) => `<b>${label}</b> ${Math.round(z[k].hp / z[k].max * 100)}%`;
   const fires = c.fires.map(f => `<span class="fire">🔥${f.zone.replace('pod:', 'pod ')}</span>`).join(' ');
-  return `${podLine}<br>${f('reactor', 'Rct')} · ${f('magazine', 'Mag')} · ${f('bridge', 'Brg')} · ${f('deck', 'Deck')} · ${f('engines', 'Eng')}${fires ? '<br>' + fires : ''}`;
+  return `${podLine}<br>${f('reactor', 'R')} · ${f('magazine', 'M')} · ${f('bridge', 'B')} · ${f('deck', 'D')} · ${f('engines', 'E')}${fires ? '<br>' + fires : ''}`;
 }
 function carrierRowHTML(c, selectable) {
   const cls = 'carrierRow' + (G.selected === c ? ' sel' : '') + (c.state === 'gone' || c.state === 'sinking' ? ' dead' : '') + (G.camSpectate === c ? ' watch' : '');
   const hpCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? ' hurt' : ' crit';
   const barCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? 'mid' : 'low';
-  const wing = c.wing ? ` · ✈ ${c.wing.remaining} jets (${c.wing.airborneCount()} up)` + (c.wing.squadrons.some(s => s.state === 'launchQueued') ? ' · LAUNCH QUEUED' : '') + (c.wing.squadrons.some(s => s.loadout === 'cap' && ['catapult', 'climb', 'patrol', 'intercept'].includes(s.state)) ? ' · 🛡 CAP UP' : c.wing.capOn ? ' · 🛡 CAP' : '') : '';
+  const wing = c.wing ? ` · ✈ ${c.wing.remaining} (${c.wing.airborneCount()} ↑)` + (c.wing.squadrons.some(s => s.state === 'launchQueued') ? ' · ⏳' : '') + (c.wing.squadrons.some(s => s.loadout === 'cap' && ['catapult', 'climb', 'patrol', 'intercept'].includes(s.state)) ? ' · 🛡' : c.wing.capOn ? ' · 🛡' : '') : '';
   // v1.1.0: Hurricane v11.30 visual row — icon + short code + health bar
   // on phones (CSS shows .fic/.fcode/.fbar and hides .nm/.hp/.zones/.bar);
   // desktop keeps the full row. fic flags fire / loss / camera-follow.
@@ -1056,7 +977,7 @@ function carrierRowHTML(c, selectable) {
     <h4><span class="fic">${fic}</span><span class="fcode">${code}</span><span class="nm">${c.name}</span><span class="hp">${hpText}</span></h4>
     <div class="fbar"><i class="${barCls}" style="width:${pct}%"></i></div>
     <div class="bar${hpCls}"><i style="width:${pct}%"></i></div>
-    <div class="zones">Lift ${Math.round(c.lift * 100)}% · Alt ${Math.round(c.y)} m · Spd ${Math.abs(c.forwardSpeed).toFixed(0)} m/s${wing}<br>${zoneLine(c)}</div>
+    <div class="zones">⇧ ${Math.round(c.lift * 100)}% · ⬍ ${Math.round(c.y)} · ➤ ${Math.abs(c.forwardSpeed).toFixed(0)}${wing}<br>${zoneLine(c)}</div>
   </div>`;
 }
 function renderFleetPanels() {
@@ -1089,7 +1010,7 @@ function renderFleetPanels() {
         return;
       }
       if (c.side === 'player') switchShip(c);
-      else { G.targetCarrier = c; G.targetMode = 'designated'; $('btnTarget').textContent = 'Target: ' + c.name; msg('Target designated: ' + c.name); }
+      else { G.targetCarrier = c; G.targetMode = 'designated'; $('btnTarget').textContent = '🎯 ' + c.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E'); msg('Target designated: ' + c.name); }
     });
   });
 }
@@ -1097,9 +1018,10 @@ function updateTeleBox() {
   const t = TELEGRAPH[G.telegraphIdx];
   $('teleNotch').textContent = t.name;
   const s = G.selected;
-  $('teleSub').textContent = (s ? Math.abs(s.forwardSpeed).toFixed(0) + ' m/s · rudder ' + Math.round(s.rudderDeg) + '°' : '—');
-  $('rudderReadout').textContent = 'RUDDER ' + (s ? Math.round(s.rudderDeg) + '°' : '0°');
-  $('modeBtn').textContent = G.mode;
+  // v1.4.1: icon readouts — speed ➤, rudder ⎋, mode as icon + code.
+  $('teleSub').textContent = (s ? `➤ ${Math.abs(s.forwardSpeed).toFixed(0)} · ⎋ ${Math.round(s.rudderDeg)}°` : '—');
+  $('rudderReadout').textContent = '↔ ' + (s ? Math.round(s.rudderDeg) + '°' : '0°');
+  $('modeBtn').textContent = G.mode === 'FLEET' ? '▦ FLEET' : G.mode === 'INDV' ? '◉ INDV' : '⚓ ANCHOR';
   document.querySelectorAll('#teleBtns .teleBtn').forEach(b => b.classList.toggle('on', +b.dataset.idx === G.telegraphIdx));
 }
 function updateStatus() {
@@ -1107,22 +1029,27 @@ function updateStatus() {
   if (!s) return;
   // v1.2.0: pitch readout follows the selected carrier's real pitch
   // angle whenever the pitch track / arrow keys are not actively held.
+  // v1.4.1: icon arrow + number, no word.
   if (Math.abs(G.pitchTrack) < 0.02 && !G.keys['ArrowUp'] && !G.keys['ArrowDown']) {
     const pd = Math.round(s.pitch * 57.2958);
-    $('pitchReadout').textContent = 'PITCH ' + (pd >= 0 ? '+' : '') + pd + '°';
+    $('pitchReadout').textContent = (pd >= 0 ? '▲ +' : '▼ ') + pd + '°';
   }
   // v1.1.0: the wide centred status strip is gone — its facts live in the
   // Hurricane-style top pill bar (ship / nav / air) and the minimap stats.
+  // v1.4.1: icons/bars/dots/numbers — ship icon + code + lift mini-bar
+  // + % + pod dots; alt/speed as icons + numbers; jets/bombs/sea as
+  // icons + numbers. No readout lost, no words left in the pills.
   const pods = s.pods.map(p => p.alive ? '●' : '✕').join('');
-  $('pillShip').innerHTML = `<b>${s.name}</b> · Lift ${Math.round(s.lift * 100)}% · Pods ${pods}`;
+  const liftPct = Math.round(s.lift * 100);
+  const code = s.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E');
+  $('pillShip').innerHTML = `<b>🚢 ${code}</b> <span class="minibar"><i style="width:${liftPct}%"></i></span> ${liftPct}% · ${pods}`;
   $('pillNav').textContent =
-    `ALT ${Math.round(s.y)} m (→${Math.round(s.targetAlt)}) · SPD ${Math.abs(s.forwardSpeed).toFixed(0)} m/s · ` +
-    `${TELEGRAPH[s.telegraphIdx].name} · ${G.mode}`;
+    `⬍ ${Math.round(s.y)} (→${Math.round(s.targetAlt)}) · ➤ ${Math.abs(s.forwardSpeed).toFixed(0)}`;
   $('pillAir').textContent =
-    `✈ ${G.playerFleet.reduce((a, c) => a + (c.wing ? c.wing.remaining : 0), 0)} jets · ` +
-    `💣 ${G.bombStats.drops}/${G.bombStats.hits} · ${STAGES[G.stage].name} Hs ${G.sea.HS.toFixed(1)} m`;
+    `✈ ${G.playerFleet.reduce((a, c) => a + (c.wing ? c.wing.remaining : 0), 0)} · ` +
+    `💣 ${G.bombStats.drops}/${G.bombStats.hits} · 🌊 ${STAGES[G.stage].name} ${G.sea.HS.toFixed(1)}`;
   $('miniStats').innerHTML =
-    `YOU <b>${G.playerFleet.filter(c => c.alive).length}/${G.playerFleet.length}</b> · FOE <b>${G.enemyFleet.filter(c => c.alive).length}/${G.enemyFleet.length}</b>`;
+    `<span class="dot you"></span> ${G.playerFleet.filter(c => c.alive).length}/${G.playerFleet.length} · <span class="dot foe"></span> ${G.enemyFleet.filter(c => c.alive).length}/${G.enemyFleet.length}`;
 }
 
 // ---------- Minimap / tactical radar (v1.3.0, F) ----------
@@ -1740,7 +1667,11 @@ function bindInput() {
         G.camPan.y = clamp(G.camPan.y - dy * 2, -400, 800);
       } else {
         G.camYaw -= dx * 0.005;
-        G.camPitch = clamp(G.camPitch - dy * 0.005, -0.1, 1.2);
+        // v1.4.1: full-orbit pitch — near-vertical both ways (±1.45,
+        // ~83°) so the camera can look straight down on the deck or
+        // straight up from below the hull at any zoom. (Was [-0.1,
+        // 1.2]: no below-surface orbit.)
+        G.camPitch = clamp(G.camPitch - dy * 0.005, -1.45, 1.45);
       }
     } else if (role === 'pinch') {
       const oid = rolePointer('orbit');
@@ -1829,14 +1760,14 @@ function bindInput() {
     }
     G.rudderInput = input;
     knob.style.transform = `translateX(${input * (JOY_R_MAX - 22)}px)`;
-    $('rudderReadout').textContent = 'RUDDER ' + Math.round(input * 35) + '°';
+    $('rudderReadout').textContent = '↔ ' + Math.round(input * 35) + '°';
   };
   const joyResetFloat = () => {
     const last = joyCentre;
     joyCentre = null;
     G.rudderInput = 0;
     knob.style.transform = '';
-    $('rudderReadout').textContent = 'RUDDER 0°';
+    $('rudderReadout').textContent = '↔ 0°';
     if (last) G.joyGhost = last; // ghost ring rests at the last centre
     if (joyGhostT) clearTimeout(joyGhostT);
     joyGhostT = setTimeout(() => {
@@ -1880,7 +1811,7 @@ function bindInput() {
     dx = clamp(dx, -1, 1);
     G.rudderInput = dx;
     knob.style.transform = `translateX(${dx * (r.width / 2 - 28)}px)`;
-    $('rudderReadout').textContent = 'RUDDER ' + Math.round(dx * 35) + '°';
+    $('rudderReadout').textContent = '↔ ' + Math.round(dx * 35) + '°';
   };
   joy.addEventListener('pointerdown', e => {
     if (G.joyMode === 'float') return;
@@ -1916,13 +1847,13 @@ function bindInput() {
       dy = clamp(Math.sign(offPx) * (Math.abs(offPx) - PITCH_DEAD) / (half - PITCH_DEAD), -1, 1);
     G.pitchTrack = dy;
     pk.style.transform = `translateY(${-dy * (r.height / 2 - 26)}px)`;
-    $('pitchReadout').textContent = 'PITCH ' + (dy >= 0 ? '+' : '') + Math.round(dy * 12) + '°';
+    $('pitchReadout').textContent = (dy >= 0 ? '▲ +' : '▼ ') + Math.round(dy * 12) + '°';
   };
   pt.addEventListener('pointerdown', e => { if (!claim(e, 'pitch')) return; try { pt.setPointerCapture(e.pointerId); } catch (_) {} ptMove(e); });
   pt.addEventListener('pointermove', e => { if (pointers.get(e.pointerId) === 'pitch') ptMove(e); });
   const ptEnd = e => {
     if (releasePointer(e) !== 'pitch') return;
-    G.pitchTrack = 0; pk.style.transform = ''; $('pitchReadout').textContent = 'PITCH 0°';
+    G.pitchTrack = 0; pk.style.transform = ''; $('pitchReadout').textContent = '▲ +0°';
   };
   pt.addEventListener('pointerup', ptEnd);
   pt.addEventListener('pointercancel', ptEnd);
@@ -1962,7 +1893,7 @@ function bindInput() {
     }
     if (best && bd < 60) { // v1.4.0 (item 7, touch spec §4.2/§6): designation radius 30 -> 60 canvas units ≈ 23 display px ≈ 6 mm — the old 3 mm radius was smaller than a fingertip, so taps on an enemy triangle missed and dropped a waypoint instead. Waypoint taps (open ocean) use the else-branch and are unaffected.
       G.targetCarrier = best; G.targetMode = 'designated';
-      $('btnTarget').textContent = 'Target: ' + best.name;
+      $('btnTarget').textContent = '🎯 ' + best.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E');
       msg('Target designated: ' + best.name);
       return;
     }
@@ -2015,8 +1946,6 @@ function bindInput() {
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') e.preventDefault();
     if (e.key === 'r' || e.key === 'R') resetCamera();
     if (e.key === 'c' || e.key === 'C') cycleTactical();
-    // v1.4.0 (item 8): U toggles the dive camera.
-    if (e.key === 'u' || e.key === 'U') setDiveCam(!G.diveCam);
   });
   addEventListener('keyup', e => { G.keys[e.key] = false; });
 
@@ -2042,17 +1971,16 @@ function bindInput() {
   $('btnTarget').addEventListener('click', () => {
     if (G.targetMode === 'nearest') {
       const alive = G.enemyFleet.filter(c => c.alive);
-      if (alive.length) { G.targetMode = 'designated'; G.targetCarrier = alive[0]; $('btnTarget').textContent = 'Target: ' + alive[0].name; }
+      if (alive.length) { G.targetMode = 'designated'; G.targetCarrier = alive[0]; $('btnTarget').textContent = '🎯 ' + alive[0].name.replace('SHIELD-', 'S').replace('ENEMY-', 'E'); }
     } else {
       const alive = G.enemyFleet.filter(c => c.alive);
       const i = alive.indexOf(G.targetCarrier);
       const next = alive[(i + 1) % alive.length];
-      if (next) { G.targetCarrier = next; $('btnTarget').textContent = 'Target: ' + next.name; }
-      else { G.targetMode = 'nearest'; $('btnTarget').textContent = 'Target: nearest'; }
+      if (next) { G.targetCarrier = next; $('btnTarget').textContent = '🎯 ' + next.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E'); }
+      else { G.targetMode = 'nearest'; $('btnTarget').textContent = '🎯 Nearest'; }
     }
   });
   $('btnCam').addEventListener('click', cycleTactical);
-  $('btnDive').addEventListener('click', () => setDiveCam(!G.diveCam)); // v1.4.0 (item 8)
   $('btnAltUp').addEventListener('click', () => adjustAlt(25));
   $('btnAltDn').addEventListener('click', () => adjustAlt(-25));
   $('teleUp').addEventListener('click', () => setTelegraph(G.telegraphIdx - 1));
@@ -2069,7 +1997,7 @@ function bindInput() {
   $('btnMenu').addEventListener('click', () => location.reload());
   $('btnPause').addEventListener('click', togglePause);
   const muteBtn = $('btnMute');
-  const syncMute = () => { muteBtn.textContent = G.audio && G.audio.muted ? '🔇 Muted' : '🔊 Sound'; };
+  const syncMute = () => { muteBtn.textContent = G.audio && G.audio.muted ? '🔇' : '🔊'; }; // v1.4.1: icon only
   muteBtn.addEventListener('click', () => {
     if (!G.audio) return;
     G.audio.ensure();
@@ -2102,7 +2030,7 @@ function adjustThrottle(d) {
 }
 function syncThrottleUI() {
   const el = $('thrReadout');
-  if (el) el.textContent = 'THR ' + Math.round(G.throttle * 100) + '%';
+  if (el) el.textContent = Math.round(G.throttle * 100) + '%'; // v1.4.1: number only, the bar sits beside it
   const knob = $('thrKnob'), track = $('thrTrack');
   if (knob && track) {
     const r = track.getBoundingClientRect();
@@ -2113,11 +2041,8 @@ function resetCamera() {
   G.camYaw = 0.6; G.camPitch = 0.32; G.camDist = 1100;
   G.camPan = { x: 0, y: 0 }; G.camTac = null; G.camTacIdx = 0; G.camFollow = G.selected;
   G.tacMode = null; G.tacKind = null; G.tacTarget = null; G.tacHoldPos = null; G.tacJetsIdx = -1; G.tacOrdIdx = -1;
-  // v1.4.0 (item 8): R also surfaces the dive camera.
-  G.diveCam = false; G.diveBlend = 0;
-  const b = $('btnDive'); if (b) b.textContent = '🌊 Dive cam [U]';
   G.camSpectate = null; // v1.2.0: R also ends a spectate follow (Hurricane v11.15)
-  $('btnCam').textContent = 'Camera: fleet [C]';
+  $('btnCam').textContent = '📷 Fleet [C]';
 }
 // v1.4.0 (item 7, touch spec §2/§8): apply the rudder stick mode.
 // 'float' shows the ghost ring at G.joyGhost (last used centre, or
@@ -2182,7 +2107,7 @@ function clickPick(cx, cy) {
       }
       G.camFollow = c;
       if (c.side === 'player') switchShip(c);
-      else { G.targetCarrier = c; G.targetMode = 'designated'; $('btnTarget').textContent = 'Target: ' + c.name; }
+      else { G.targetCarrier = c; G.targetMode = 'designated'; $('btnTarget').textContent = '🎯 ' + c.name.replace('SHIELD-', 'S').replace('ENEMY-', 'E'); }
       msg('Following ' + c.name + (c.state === 'sinking' || c.state === 'falling' ? ' — she is going down' : ''));
     }
   }
@@ -2369,7 +2294,7 @@ let lastT = performance.now();
 // unboundedly). Debug timeScale multiplies the cap, as before.
 function stepSim(dt) {
   G.time += dt;
-  if (G.msgT > 0) { G.msgT -= dt; if (G.msgT <= 0) $('msg').textContent = '—'; }
+  if (G.msgT > 0) { G.msgT -= dt; if (G.msgT <= 0) { const m = $('msg'); if (m) m.style.display = 'none'; } } // v1.4.1: hide on expiry, never show the idle '—' pill
   // Post-game freeze (Job B): once G.over is set, the world stops — no
   // steering, carrier/wing, ordnance or director updates — so the frozen
   // scene stays exactly the end state the overlay describes (a survivor
@@ -2425,7 +2350,7 @@ function stepSim(dt) {
   // (c) Keep a command-transfer announcement on screen for 8 s of game
   // time — it must survive the flurry of loss messages around a sinking.
   if (G.transferAnnounce) {
-    if (G.time < G.transferAnnounce.until && !G.over) { $('msg').textContent = G.transferAnnounce.text; G.msgT = 4; }
+    if (G.time < G.transferAnnounce.until && !G.over) { const m = $('msg'); if (m) { m.textContent = G.transferAnnounce.text; m.style.display = 'block'; } G.msgT = 4; }
     else G.transferAnnounce = null;
   }
 }

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>Helicarriers at Sea — v1.4.0</title>
+<title>Helicarriers at Sea — v1.4.1</title>
 <style>
   html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0b1c26;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#dfeef5;}
   #app{position:fixed;inset:0;}
@@ -25,13 +25,25 @@
      (reserving the minimap corner in BASE css, not a breakpoint, per
      Hurricane v11.20 — some in-app browsers report a wider viewport),
      fleet panel top-left under the bar, minimap top-right, Air Ops +
-     telegraph docked bottom-right, horizontal rudder track bottom-left.
-     Nothing is centred-bottom or free-floating any more, so no two
-     elements can pile up on a phone portrait screen. */
+     telegraph docked right, horizontal rudder track bottom-left.
+     v1.4.1: every info dashboard is icons/bars/dots/numbers (no words
+     in the pills, no wordy fleet rows, icon Air Ops buttons) so the
+     panels shrink and nothing overlaps at 390 px portrait. The dock
+     is a flex column anchored to the right edge from below the
+     minimap to the bottom, with its own scroll on short screens;
+     the bottom cluster (rudder + pitch + throttle) lives in the
+     strip left of the dock, readouts above their own tracks. */
   .hudTop{position:fixed;left:0;right:0;top:0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
     padding:calc(8px + env(safe-area-inset-top)) calc(168px + env(safe-area-inset-right)) 0 10px;pointer-events:none;z-index:5;}
   .pill{background:rgba(6,18,30,.72);border:1px solid rgba(140,190,230,.25);border-radius:999px;
     padding:6px 11px;font-size:12.5px;font-weight:650;backdrop-filter:blur(6px);white-space:nowrap;}
+  .pill b{color:#ffd166;}
+  /* v1.4.1 icon-dashboard bits: a lift mini-bar inside the ship pill,
+     and coloured dots in the minimap stats. */
+  .minibar{display:inline-block;width:28px;height:6px;background:rgba(255,255,255,.14);border-radius:3px;overflow:hidden;vertical-align:middle;}
+  .minibar i{display:block;height:100%;background:#7ed491;border-radius:3px;}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle;}
+  .dot.you{background:#58c98a;} .dot.foe{background:#ff5a5a;}
   .pill b{color:#ffd166;}
   .miniBtn{background:none;border:none;color:#9dc3d8;font-size:12px;cursor:pointer;padding:0 4px;pointer-events:auto;}
   .panelHead{display:flex;justify-content:space-between;align-items:center;font-size:10px;letter-spacing:.12em;
@@ -59,23 +71,27 @@
     overflow:hidden;background:rgba(6,18,30,.6);cursor:crosshair;}
   #miniStats{font-size:10px;color:#9db8cc;text-align:center;padding:3px 4px 4px;white-space:nowrap;}
   #miniStats b{color:#ffd166;}
-  #msg{position:fixed;left:50%;top:26%;transform:translateX(-50%);z-index:7;
+  #msg{position:fixed;left:50%;top:26%;transform:translateX(-50%);z-index:7;display:none;
     padding:6px 14px;font-size:13px;pointer-events:none;white-space:nowrap;max-width:92vw;overflow:hidden;text-overflow:ellipsis;}
   /* Right dock: Air Ops stacked above the telegraph, one flex column so
      their heights can never overlap (Hurricane v11.25 Air Ops + v11.19
-     compact telegraph, docked instead of absolutely positioned). */
-  #dockRight{position:fixed;right:10px;bottom:calc(10px + env(safe-area-inset-bottom));z-index:6;width:170px;
-    display:flex;flex-direction:column;gap:8px;align-items:stretch;}
-  #airOpsPanel{pointer-events:auto;padding:7px 8px 8px;}
+     compact telegraph, docked instead of absolutely positioned).
+     v1.4.1: the dock runs from below the minimap to the bottom edge
+     (top-anchored, not floating mid-screen) and scrolls internally
+     on short screens, so it can never crowd the top bar or the
+     bottom tracks. Air Ops buttons are a 2-column icon grid. */
+  #dockRight{position:fixed;right:10px;top:calc(176px + env(safe-area-inset-top));bottom:calc(10px + env(safe-area-inset-bottom));z-index:6;width:170px;
+    display:flex;flex-direction:column;gap:8px;align-items:stretch;overflow-y:auto;scrollbar-width:none;}
+  #dockRight::-webkit-scrollbar{display:none;}
+  #airOpsPanel{pointer-events:auto;padding:7px 8px 8px;flex:none;}
   #airOpsPanel .aoHead{display:flex;justify-content:space-between;align-items:center;font-size:9px;letter-spacing:.12em;
     text-transform:uppercase;color:#ffd166;font-weight:800;margin-bottom:5px;}
   #airOpsPanel.collapsed .aoBody{display:none;}
-  #airOpsPanel .aoBtn{display:block;width:100%;text-align:left;margin-bottom:4px;min-height:48px;padding:12px;}
+  #airOpsPanel .aoBody{display:grid;grid-template-columns:1fr 1fr;gap:4px;}
+  #airOpsPanel .aoBtn{display:flex;align-items:center;justify-content:center;gap:4px;width:100%;text-align:center;min-height:44px;padding:6px 4px;font-size:11px;}
   #airOpsPanel .aoBtn.on{border-color:#ffd166;color:#ffd166;}
-  #airOpsPanel .aoBtn:last-child{margin-bottom:0;}
-  #airOpsPanel .aoRow2{display:flex;gap:4px;margin-bottom:4px;}
-  #airOpsPanel .aoRow2 .aoBtn{flex:1;margin-bottom:0;text-align:center;}
-  #telePanel{pointer-events:auto;padding:7px 8px 8px;text-align:center;}
+  #airOpsPanel .aoRow2{display:contents;}
+  #telePanel{pointer-events:auto;padding:7px 8px 8px;text-align:center;flex:none;}
   #telePanel .teleHead{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#ffd166;font-weight:800;margin-bottom:4px;}
   #telePanel .teleHead span{color:#e8f1f8;font-size:11px;}
   .teleBtns{display:grid;grid-template-columns:1fr 1fr;gap:3px;}
@@ -102,6 +118,13 @@
      48 wide would swallow the panel heading text). Fleet rows grow
      visibly to 48 px tall on phones (desktop rows are already ~50). */
   .miniBtn{position:relative;}
+  /* v1.4.1: the panel toggles are 14 px glyphs whose ::before hit
+     area (inset -15 px) is CLIPPED by the panels' overflow, so the
+     effective target was only ~35 px — below the 44 px floor. The
+     buttons themselves are now 44x44 with the glyph centred (the
+     ::before is gone — it cannot extend past the panel edge). */
+  #fleetToggle,#aoToggle{min-width:44px;min-height:44px;padding:0;display:flex;align-items:center;justify-content:center;}
+  #fleetToggle::before,#aoToggle::before{content:none;}
   /* v1.4.0 (item 7, touch spec §4): the pause/mute pills are genuinely
      44 px tall (the 44 px floor) — NOT via ::before padding, because
      .hudTop is scrollable (overflow-x:auto), which forces vertical
@@ -110,9 +133,8 @@
      The ::before below only adds horizontal slop (±4 px; the pills sit
      6 px apart, so wider padding would swallow the neighbour) plus
      whatever vertical slop fits inside the bar. */
-  .miniBtn.pill{min-height:44px;padding:0 10px;}
+  .miniBtn.pill{min-height:44px;min-width:44px;padding:0 10px;}
   .miniBtn.pill::before{content:'';position:absolute;inset:-15px -4px;pointer-events:auto;}
-  #fleetToggle::before,#aoToggle::before{content:'';position:absolute;inset:-15px -13px;pointer-events:auto;}
   #teleSub{margin-top:4px;font-size:10px;color:#9db8cc;text-align:center;line-height:1.5;}
   #teleSub b{color:#ffd166;}
   button{pointer-events:auto;background:#16405a;color:#eaf6ff;border:1px solid #3d7ea6;border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer;}
@@ -143,7 +165,7 @@
   #joy.float.ghost{opacity:.18;}
   #joy{transition:opacity .3s;}
   /* v1.4.0 (item 8): underwater wash (Hurricane v11.5) — a fullscreen
-     tint that fades in when the dive camera goes under. */
+     tint that fades in when the camera goes under. */
   #waterTint{position:fixed;inset:0;z-index:8;pointer-events:none;opacity:0;transition:opacity .4s;
     background:radial-gradient(ellipse at 50% 40%, rgba(10,60,70,.28), rgba(4,25,35,.62));}
   #joy{position:fixed;left:14px;bottom:calc(14px + env(safe-area-inset-bottom));z-index:6;width:216px;height:62px;border-radius:32px;
@@ -205,14 +227,19 @@
   kbd{background:#22384a;border-radius:4px;padding:1px 6px;font-size:12px;}
   .hint{font-size:12px;color:#8fb4c8;line-height:1.6;}
   /* v11.30: MOBILE phone UI only (max-width:820px) — visual fleet rows,
-     short telegraph labels, tighter dock. Desktop untouched. */
+     short telegraph labels, tighter dock. Desktop untouched.
+     v1.4.1: two-row top bar on narrow phones (≤560px) with a 96 px
+     minimap reserve; dock top-anchored below the minimap; bottom
+     cluster (rudder + pitch + throttle) narrowed to fit left of the
+     dock with readouts above their own tracks. */
   @media (max-width:820px){
     .hudTop{padding-right:calc(128px + env(safe-area-inset-right));padding-left:8px;gap:5px;}
     .pill{padding:5px 8px;font-size:11px;}
-    /* Toast sits top-left under the bar on phones: centred it would run
-       under the minimap and over the fleet panel. Wraps to two lines. */
-    #msg{left:8px;transform:none;top:calc(50px + env(safe-area-inset-top));max-width:calc(100vw - 140px);white-space:normal;text-align:center;line-height:1.35;font-size:12px;}
-    #fleetPanel{width:104px;left:8px;top:calc(100px + env(safe-area-inset-top));padding:5px;max-height:calc(100dvh - 340px);}
+    /* Toast sits BELOW the fleet panel on phones (it used to sit on
+       top of it, covering the first rows while a message showed).
+       Transient (4 s) and pointer-events:none, over open scene. */
+    #msg{left:8px;transform:none;top:calc(360px + env(safe-area-inset-top));max-width:calc(100vw - 140px);white-space:normal;text-align:center;line-height:1.35;font-size:12px;}
+    #fleetPanel{width:104px;left:8px;top:calc(60px + env(safe-area-inset-top));padding:5px;max-height:calc(100dvh - 240px);}
     #fleetPanel .panelHead{font-size:9px;margin-bottom:3px;}
     .carrierRow{padding:3px 4px;margin:4px 0;display:flex;align-items:center;gap:4px;min-height:48px;}
     .carrierRow h4{margin:0;flex:1;display:flex;align-items:center;gap:4px;min-width:0;}
@@ -225,12 +252,16 @@
     .carrierRow .fbar i.low{background:#ff5a5a;}
     #miniWrap{right:8px;}
     #minimap{width:112px;height:112px;}
-    #dockRight{right:8px;width:138px;gap:6px;}
-    #airOpsPanel{padding:5px 6px 6px;}
-    #airOpsPanel .aoBtn{font-size:11px;padding:6px 8px;}
+    #dockRight{right:8px;width:138px;gap:6px;top:calc(150px + env(safe-area-inset-top));}
     .teleBtn[data-short]{font-size:0;padding:5px 1px;}
     .teleBtn[data-short]::after{content:attr(data-short);font-size:9.5px;font-weight:700;letter-spacing:.03em;}
-    .teleStep button{padding:5px 0;font-size:11px;}
+    /* v1.4.1: the teleStep row is 3-across in a 132 px dock, so its
+       buttons are only ~33 px wide — below the 44 px floor. On phones
+       it becomes two rows: −/+ side by side (each ~60 px), mode full
+       width below. Same handlers, same step behaviour. */
+    .teleStep{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+    .teleStep button{padding:5px 0;font-size:11px;min-height:44px;}
+    #modeBtn{grid-column:1 / 3;}
     #teleSub{font-size:9px;}
     #joy{left:12px;bottom:calc(12px + env(safe-area-inset-bottom));width:180px;height:56px;}
     #joyKnob{width:40px;height:40px;margin:-20px 0 0 -20px;}
@@ -244,19 +275,59 @@
     #hint{display:none;}
     #debugPanel{left:8px;right:auto;top:calc(262px + env(safe-area-inset-top));width:150px;max-height:calc(100dvh - 500px);overflow:auto;}
   }
-  @media (max-width:900px){
+  /* v1.4.1 narrow phones (Nicholas's 390 px portrait): the top bar
+     wraps to two rows (ship+nav, air+pause+mute) with a 96 px minimap
+     reserve, so no pill is ever clipped; the bottom cluster narrows
+     to 232 px (rudder 132 + pitch 44 + throttle 44) so it clears the
+     132 px dock with a gap. */
+  @media (max-width:560px){
+    .hudTop{padding-right:calc(112px + env(safe-area-inset-right));flex-wrap:wrap;overflow:visible;}
+    #minimap{width:96px;height:96px;}
+    #fleetPanel{top:calc(108px + env(safe-area-inset-top));max-height:calc(100dvh - 260px);}
+    #dockRight{width:132px;top:calc(130px + env(safe-area-inset-top));}
+    #airOpsPanel .aoBtn{font-size:10.5px;padding:6px 3px;}
+    .teleBtn{min-height:44px;}
+    #joy{width:132px;}
+    #pitchTrack{left:150px;width:44px;}
+    #pitchReadout{left:150px;}
+    #thrTrack{left:200px;width:44px;}
+    #thrReadout{left:200px;}
+  }
+  /* v1.4.1 very narrow phones (≤380 px): shrink the cluster and the
+     dock together so the throttle track still clears the dock. */
+  @media (max-width:380px){
+    #dockRight{width:120px;}
+    #joy{width:116px;}
+    #pitchTrack{left:134px;width:40px;}
+    #pitchReadout{left:134px;}
+    #thrTrack{left:180px;width:40px;}
+    #thrReadout{left:180px;}
+  }
+  /* Single-row scrollable top bar on mid-width screens (tablets) —
+     scoped above 560 px so it never forces the narrow-phone bar
+     into one clipped row. */
+  @media (max-width:900px) and (min-width:561px){
     .hudTop{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;}
     .hudTop::-webkit-scrollbar{display:none;}
-  }
-  @media (max-width:560px){
-    #dockRight{width:132px;}
-    #airOpsPanel .aoBtn{font-size:10.5px;padding:6px 7px;}
   }
   @media (max-height:500px){
     .hudTop{padding-right:calc(112px + env(safe-area-inset-right));}
     #minimap{width:96px;height:96px;}
     #fleetPanel{top:calc(52px + env(safe-area-inset-top));width:120px;}
-    #dockRight{width:132px;}
+    #dockRight{width:132px;top:calc(130px + env(safe-area-inset-top));}
+    /* v1.4.1 landscape: the 8-button notch grid is 308 px tall and
+       runs below the fold even with Air Ops collapsed (v1.4.0
+       behaviour). On short screens the telegraph is stepper-only —
+       the −/+ buttons step through all 8 notches (same handlers),
+       the notch name stays in the head — so the whole dock fits
+       without scrolling. No control is lost. The step row also goes
+       two-row here (same as phones): 3-across in a 132 px dock is
+       only ~31 px per button, below the 44 px floor. */
+    .teleBtns{display:none;}
+    .teleBtn{min-height:44px;}
+    .teleStep{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+    .teleStep button{min-height:44px;}
+    #modeBtn{grid-column:1 / 3;}
     #joy{width:190px;height:52px;}
     #rudderReadout{bottom:calc(72px + env(safe-area-inset-bottom));}
     #hint{display:none;}
@@ -268,32 +339,31 @@
 
 <div id="hud">
   <div class="hudTop">
-    <span class="pill" id="pillShip"><b>SHIELD-1</b></span>
-    <span class="pill" id="pillNav">ALT 350 m · SPD 0 m/s</span>
-    <span class="pill" id="pillAir">✈ 48 jets</span>
-    <button id="btnPause" class="miniBtn pill" title="Pause (P / Esc)" style="pointer-events:auto;">⏸ Pause</button>
-    <button id="btnMute" class="miniBtn pill" title="Mute / unmute sound" style="pointer-events:auto;">🔊 Sound</button>
+    <span class="pill" id="pillShip"><b>🚢 S1</b></span>
+    <span class="pill" id="pillNav">⬍ 350 · ➤ 0</span>
+    <span class="pill" id="pillAir">✈ 48 · 💣 0/0 · 🌊 Calm 1.4</span>
+    <button id="btnPause" class="miniBtn pill" title="Pause (P / Esc)" style="pointer-events:auto;">⏸</button>
+    <button id="btnMute" class="miniBtn pill" title="Mute / unmute sound" style="pointer-events:auto;">🔊</button>
   </div>
-  <div id="msg" class="panel">—</div>
+  <div id="msg" class="panel"></div>
   <div id="fleetPanel" class="panel">
     <div class="panelHead"><span>Your fleet</span><button id="fleetToggle" class="miniBtn" title="Collapse fleet list">▾</button></div>
     <div id="fleetRows"></div>
   </div>
   <div id="miniWrap">
     <canvas id="minimap" width="380" height="380"></canvas>
-    <div id="miniStats">YOU 4 · FOE 4</div>
+    <div id="miniStats"><span class="dot you"></span> 4/4 · <span class="dot foe"></span> 4/4</div>
   </div>
   <div id="dockRight">
     <div id="airOpsPanel" class="panel">
       <div class="aoHead"><span>Air Ops</span><button id="aoToggle" class="miniBtn" title="Collapse air ops">▾</button></div>
       <div class="aoBody">
-        <button id="btnLaunchBomb" class="aoBtn go">✈ Launch flight (bombs)</button>
-        <button id="btnLaunchAsm" class="aoBtn go">✈ Launch flight (ASM)</button>
-        <button id="btnCap" class="aoBtn">🛡 Launch CAP patrol</button>
-        <button id="btnRecall" class="aoBtn">Recall wings</button>
-        <button id="btnTarget" class="aoBtn">Target: nearest</button>
-        <button id="btnCam" class="aoBtn">Camera: fleet [C]</button>
-        <button id="btnDive" class="aoBtn">🌊 Dive cam [U]</button>
+        <button id="btnLaunchBomb" class="aoBtn go">💣 Bombs</button>
+        <button id="btnLaunchAsm" class="aoBtn go">🚀 ASM</button>
+        <button id="btnCap" class="aoBtn">🛡 CAP</button>
+        <button id="btnRecall" class="aoBtn">↩ Recall</button>
+        <button id="btnTarget" class="aoBtn">🎯 Nearest</button>
+        <button id="btnCam" class="aoBtn">📷 Fleet [C]</button>
         <div class="aoRow2">
           <button id="btnAltUp" class="aoBtn">▲ Alt</button>
           <button id="btnAltDn" class="aoBtn">▼ Alt</button>
@@ -301,7 +371,7 @@
       </div>
     </div>
     <div id="telePanel" class="panel">
-      <div class="teleHead">Telegraph · <span id="teleNotch">ALL STOP</span></div>
+      <div class="teleHead">≣ <span id="teleNotch">ALL STOP</span></div>
       <div class="teleBtns" id="teleBtns">
         <button class="teleBtn" data-idx="0">FLANK</button>
         <button class="teleBtn" data-idx="1">FULL</button>
@@ -317,12 +387,12 @@
         <button id="teleUp">+</button>
         <button id="modeBtn">FLEET</button>
       </div>
-      <div id="teleSub">0 m/s · rudder 0°</div>
+      <div id="teleSub">➤ 0 · ⎋ 0°</div>
     </div>
   </div>
-  <div id="rudderReadout">RUDDER 0°</div>
-  <div id="pitchReadout">PITCH 0°</div>
-  <div id="thrReadout">THR 69%</div>
+  <div id="rudderReadout">↔ 0°</div>
+  <div id="pitchReadout">▲ +0°</div>
+  <div id="thrReadout">69%</div>
   <div id="thrTrack">
     <span class="thrTick" style="top:25%"></span><span class="thrTick" style="top:50%"></span><span class="thrTick" style="top:75%"></span>
     <span class="thrLab" style="top:4px">MAX</span><span class="thrLab" style="bottom:4px">IDLE</span>
@@ -338,7 +408,7 @@
     <span class="joyLab" style="left:10px">PORT</span><span class="joyLab" style="right:10px">STBD</span>
     <div id="joyKnob"></div>
   </div>
-  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>Shift+W/S</kbd> or <kbd>+</kbd>/<kbd>−</kbd> throttle · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · <kbd>U</kbd> dive camera · <kbd>P</kbd>/<kbd>Esc</kbd> pause · click a carrier to follow it · click a falling carrier to watch her go down</div>
+  <div id="hint">Drag orbit · wheel/pinch zoom · Shift+drag pan · <kbd>Tab</kbd> switch ship · <kbd>1–8</kbd> telegraph · <kbd>W/S</kbd> telegraph · <kbd>Shift+W/S</kbd> or <kbd>+</kbd>/<kbd>−</kbd> throttle · <kbd>←/→</kbd> rudder · <kbd>↑/↓</kbd> pitch · <kbd>Q/E</kbd> altitude · <kbd>R</kbd> reset camera · <kbd>P</kbd>/<kbd>Esc</kbd> pause · click a carrier to follow it · click a falling carrier to watch her go down</div>
 </div>
 <div id="joyZone"></div>
 <div id="waterTint"></div>
@@ -347,7 +417,7 @@
 
 <div id="menu"><div id="menuCard" class="panel">
   <h1>HELICARRIERS <span>AT SEA</span></h1>
-  <p class="sub">v1.4.0 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: mass-grounded flight physics for the 120,000 t carriers (slow spool, banked lagged turns, mass-limited pitch, 6 s rotor spool), a pitch fix that makes pitch-up climb for real, and a collective-style throttle track that drives rotor strength, lift and climb (69% hovers). Also: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result. Sunk carriers leave drifting debris and oil slicks that stay on the sea for the rest of the round.</p>
+  <p class="sub">v1.4.1 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New: island fittings grounded on the real island surface (no more floating mast, antennas or nav lights, plus a coaming closing the island-to-deck gap), rotors housed inside their pod ducts, the stray toast pill gone, an icon-based HUD that fits a phone portrait screen without overlaps, a single free-orbit camera (no dive-camera mode — orbit below the surface instead), and breakups that vary with every kill — fracture paths, timing, cook-offs and fall behaviour all differ per carrier and per round. Zero throttle now means zero lift: cut the rotors and she falls under gravity to the sea (spool them back up in time and she recovers), and how she hits the water — speed, angle, fires, remaining lift — decides whether she stays intact, breaks apart or shatters. Also: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result. Sunk carriers leave drifting debris and oil slicks that stay on the sea for the rest of the round.</p>
   <p class="hint" id="bestLine">No rounds played yet — your best result will be remembered here.</p>
   <div class="pick"><label>Fleet size (you)</label><div class="seg" id="segPlayerFleet">
     <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4" class="on">4</button></div></div>
