@@ -73,11 +73,56 @@ export const PHYSICS = {
   PITCH_MAX: 0.21, // rad, +-12 deg — unchanged
   PITCH_RATE_MAX: 0.06, // rad/s (3.4 deg/s) — reached at PITCH_ACCEL
   CLIMB_MAX: 6, // m/s — climb is thrust-authority limited
+  // v1.4.2 throttle linearity: the throttle term alone spans
+  // (0-1)*8 = -8..+3.6 m/s, so the climb sum is clamped to -8 below
+  // (not -6) — clamping at -6 saturated the bottom ~17% of the slider
+  // (throttle 0.05-0.15 all gave -6.00 m/s, probed v142-throttle-climb).
+  // Equal 10% slider steps now give equal 1.16 m/s climb steps over
+  // the whole range; hover (0.69) and full-throttle climb (+3.6) are
+  // unchanged, and pitch-only descent is still capped at -6 by the
+  // pitch term's own clamp. Max descent via throttle is now -8 m/s.
+  CLIMB_MAX_DN: 8, // m/s — descent authority (throttle term's natural floor)
   TAU_VY: 5.0, // s — vertical speed chases the climb command
   ALT_HOLD_CAP_UP: 6, ALT_HOLD_CAP_DN: -5, // m/s (was +15/-10)
   LIFT_HOVER: 1 / 1.45, // 0.69 — hover threshold, re-anchored from 0.60
   THROTTLE_CLIMB: 8, // m/s climb per unit lift excess over hover (throttle)
+  // v1.4.2 freefall — real physics (Nicholas 2026-11-26; supersedes spec
+  // §8's "do not fix it from the mass", which capped the fall at a
+  // 40-70 m/s terminal with a tau=2.5 s chase and gave ~27 m/s^2
+  // initial acceleration — 2.75g, impossible in freefall).
+  FALL_RHO: 1.225, // kg/m^3, sea-level air
+  FALL_CD: 1.0, // flat plate
+  FALL_A_PLAN: 333 * 68, // m^2, planform flat
+  FALL_A_BOW: 68 * 35, // m^2, bow face (hull depth 35 m, estimate)
+  FALL_A_SIDE: 333 * 35, // m^2, side face
 };
+// v1.4.2 freefall model (see PHYSICS.FALL_*): gravity g = 9.81 m/s^2
+// exactly — a freefalling body starting from rest cannot accelerate
+// faster than g (drag only slows it). Drag is the drag equation,
+// F = 1/2*rho*Cd*A*v^2; terminal velocity vt = sqrt(2*m*g/(rho*Cd*A))
+// = 291 m/s flat, so from game altitudes (<=600 m) the ship is still
+// accelerating at impact: 350 m in 8.5 s at 81 m/s, 600 m in 11.2 s
+// at 105 m/s (probed before/after, v142-fall-before/after.json).
+// Attitude changes the projected area (flat vs nose-down). Rotors at
+// zero throttle are STOPPED, not windmilling: a windmilling rotor would
+// autorotate a helicopter down at ~10 m/s, but these are ducted fans
+// with the drive cut — the pods are dead weight in the fall, so hull
+// drag alone governs (no rotor-drag term). Lift thrust, when the fans
+// are spooled back up, offsets weight directly:
+// a = -g*(1 - liftThrust) + a_drag.
+// v1.4.2: projected area (m^2) of a 333 m hull at pitch/roll (radians).
+function fallProjectedArea(pitch, roll) {
+  return PHYSICS.FALL_A_PLAN * Math.abs(Math.cos(pitch)) * Math.abs(Math.cos(roll))
+    + PHYSICS.FALL_A_BOW * Math.abs(Math.sin(pitch))
+    + PHYSICS.FALL_A_SIDE * Math.abs(Math.sin(roll));
+}
+// v1.4.2: drag acceleration (m/s^2, signed — always opposes the motion)
+// for a body moving at vy (m/s) presenting area (m^2) with mass (kg):
+// a_drag = -(1/2*rho*Cd*A/m) * vy*|vy|.
+function fallDragAccel(vy, area, mass) {
+  const k = 0.5 * PHYSICS.FALL_RHO * PHYSICS.FALL_CD * area / mass;
+  return -k * vy * Math.abs(vy);
+}
 // v1.4.0: pitch limits now live in PHYSICS above (PITCH_MAX 0.21 rad,
 // PITCH_RATE_MAX 0.06 rad/s, accel from the measured pod levers). The
 // old 0.5 rad/s pitch rate (12 deg in 0.42 s) is gone — it was the
@@ -794,9 +839,14 @@ export class BreakupPiece {
     this.ventCount = 0; this.shedCount = 0; // probe counters (research §7 venting check)
     scene.add(group);
   }
-  // v1.4.0 mass (audit F4/F11 + research §4.3): terminal velocity
-  // breathes with attitude — flat-falling ≈36 m/s, nose-down ≈54 m/s.
-  pieceVt() { return 45 * (0.8 + 0.4 * Math.abs(Math.cos(this.pitch || 0))); }
+  // v1.4.2: same real freefall as the whole hull (see PHYSICS.FALL_*):
+  // a = -g + a_drag, with the piece's own projected area and mass
+  // (uniform linear density: both scale with segLen, so the drag
+  // coefficient k equals the whole-hull value and the flat terminal
+  // velocity is the same 291 m/s). The old pieceVt (36-54 m/s) with a
+  // tau=2.5 s chase gave ~18 m/s^2 initial acceleration — the same
+  // faster-than-g error as the hull. Pieces now fall at g and are
+  // still accelerating at the sea.
   // Cut-face world position (cap centroid), for venting/shedding.
   cutFaceWorld(i, out) {
     const f = this.cutFaces[i % this.cutFaces.length];
@@ -805,8 +855,10 @@ export class BreakupPiece {
   }
   update(dt, ctx) {
     if (this.state === 'falling') {
-      const vt = this.pieceVt();
-      this.vy += (-vt - this.vy) * Math.min(1, dt / 2.5);
+      const lenFrac = Math.max(20, this.segLen || 60) / 333;
+      const area = fallProjectedArea(this.pitch, this.roll) * lenFrac;
+      const mass = PHYSICS.MASS * lenFrac;
+      this.vy += (-9.81 + fallDragAccel(this.vy, area, mass)) * dt;
       this.y += this.vy * dt;
       // Ballistic drift: horizontal velocity decays with air drag,
       // τ = 0.13·L s (audit §1) — a 60 m section keeps its separation
@@ -1001,6 +1053,7 @@ export class Helicarrier {
     // 1/1.45 = 0.69). Player helm sets it on the selected carrier each
     // frame; escorts/AI keep the hover default.
     this.throttle = PHYSICS.THROTTLE_HOVER;
+    this.liftThrustNow = 0; // v1.4.2: lift actually produced (fraction of weight) — read by the downwash builder + probes; set every frame in the alive/falling branches
     // v1.4.0 lever arms measured from the GLB's own pod centres
     // (template.podLocals): mean |z| 65.1 m (pitch), mean |x| 58.2 m
     // (roll/yaw). Angular accel from the max 25%-of-W control
@@ -1038,6 +1091,7 @@ export class Helicarrier {
     this._breakList = 0; this._breakListTarget = 0; // v1.4.1: pre-breakup list (eases in during cracking/hinging)
     this._sinkDur = 30; // v1.4.1: intact-sinking duration, varied per kill (24–38 s)
     this._fallVentT = 0; // v1.4.1: falling-vent timer (smoke while falling hurt)
+    this._washAcc = 0; // v1.4.2: downwash spray/mist emission accumulator
     this._fallZeroThrottle = false; // v1.4.1: this fall is a zero-throttle fall (pods alive, recoverable)
     this._fallSpool = 0; // v1.4.1: spooled lift thrust (fraction of weight) during a zero-throttle fall
     this.sinkRollTarget = 0; // F10: final list from the damage state
@@ -1339,7 +1393,10 @@ export class Helicarrier {
     if (this.state !== 'alive') return;
     this.state = 'falling';
     this.fallT = 0;
-    this.vy = 0;
+    // v1.4.2: keep the vertical speed she had — cutting lift does not
+    // zero velocity (a ship climbing at +3 m/s keeps rising briefly,
+    // then falls; a ship already sinking keeps her sink rate).
+    this.liftThrustNow = 0;
     // v1.4.1: a zero-throttle fall is recoverable — the pods are alive
     // and the player can spool them back up (falling branch); a
     // damage/structural fall is not (lift is gone or the ship is torn).
@@ -2061,6 +2118,7 @@ export class Helicarrier {
       if (dy > 2) climb = Math.min(PHYSICS.ALT_HOLD_CAP_UP, dy * 0.2);
       else if (dy < -2) climb = Math.max(PHYSICS.ALT_HOLD_CAP_DN, dy * 0.2);
       const liftThrust = Math.min(this.throttle * PHYSICS.T_LIFT_MAX_RATIO, this.lift * PHYSICS.T_LIFT_MAX_RATIO);
+      this.liftThrustNow = liftThrust; // v1.4.2: lift actually produced (downwash + probes)
       const liftExcess = liftThrust - 1;
       const throttleClimb = liftExcess * PHYSICS.THROTTLE_CLIMB;
       const marginFrac = Math.max(0, Math.min(1, (this.lift * PHYSICS.T_LIFT_MAX_RATIO - 1) / (PHYSICS.T_LIFT_MAX_RATIO - 1)));
@@ -2075,7 +2133,11 @@ export class Helicarrier {
         const pitchClimb = Math.max(-PHYSICS.CLIMB_MAX, Math.min(PHYSICS.CLIMB_MAX,
           (Math.abs(this.forwardSpeed) * 0.8 + 6) * Math.sin(this.pitch)));
         const pitchClimbM = pitchClimb >= 0 ? pitchClimb * marginFrac : pitchClimb;
-        climb = Math.max(-PHYSICS.CLIMB_MAX, Math.min(PHYSICS.CLIMB_MAX, pitchClimbM + throttleClimb));
+        // v1.4.2: the descent clamp is CLIMB_MAX_DN (8), not CLIMB_MAX
+        // (6) — see the PHYSICS note. The throttle term's natural floor
+        // is -8 m/s, and clamping the sum at -6 saturated the bottom
+        // of the slider (see v142-throttle-climb.json).
+        climb = Math.max(-PHYSICS.CLIMB_MAX_DN, Math.min(PHYSICS.CLIMB_MAX, pitchClimbM + throttleClimb));
         this.targetAlt = this.y; // hold resumes here when pitch/throttle releases
       }
       // Pitch alone can never drive her into the sea or above the ceiling.
@@ -2102,35 +2164,80 @@ export class Helicarrier {
       this.y = Math.min(650, this.y);
       if (this.y <= ALT_FLOOR && this.vy < 0 && climb <= 0) { this.y = ALT_FLOOR; this.vy = 0; }
       if (this.y >= ALT_CEIL) { this.y = ALT_CEIL; if (this.vy > 0) this.vy = 0; }
+      // v1.4.2 rotor downwash — spray + mist at the sea under each live
+      // pod (the sea shader draws the flattened disc / spray ring /
+      // churn; this is the airborne spray thrown up where the jet hits
+      // the water and turns outward). Strength follows the same physics
+      // as the shader sources (game.js): per-pod lift share faded with
+      // height as (76/h)^2. Only below ~220 m and only while the fans
+      // are actually producing lift; at cruise altitude nothing is
+      // emitted. Throttled to one puff per pod every 0.25 s and guarded
+      // by the live-pool counts, so 8 low carriers cost at most ~32
+      // sprites + ~100 particles per second of pool churn — the pools
+      // (420 sprites / 1600 particles) keep headroom for damage FX.
+      // Spray velocities are visual, not the 325 m/s jet itself: the
+      // particles are the water thrown up by the blast (radial outward
+      // from each pod + up), capped so they read as spray, not tracers.
+      this._washAcc = (this._washAcc || 0) + dt;
+      if (liftThrust > 0.5 && this.y < 220 && this._washAcc > 0.25) {
+        this._washAcc = 0;
+        const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+        const h = Math.max(1, this.y - seaH);
+        const fall = Math.min(1, (76 / h) * (76 / h));
+        const nAlive = this.pods.filter(p => p.alive).length;
+        if (nAlive && ctx.vfx.liveSprites() < 300 && ctx.vfx.liveParticles() < 1200) {
+          for (const p of this.pods) {
+            if (!p.alive) continue;
+            const sPod = (liftThrust / nAlive) * fall;
+            if (sPod < 0.02) continue;
+            _bpV.set(p.local.x, p.local.y, p.local.z);
+            this.group.localToWorld(_bpV);
+            const R = Math.min(60, 19 * (1 + h / 76));
+            // Mist: a wide soft sprite hanging over the sea under the
+            // pod, growing slowly and fading — the spray cloud.
+            ctx.vfx.spawnSprite(_bpV.x, seaH + 3, _bpV.z, 1.2, R * 2, R * 1.2, 0.5, 0xd8ecf2, Math.min(0.4, 0.12 + sPod));
+            // Spray: water thrown radially outward from under the pod.
+            const sp = 6 + 14 * sPod; // m/s outward, visual scale
+            for (let k = 0; k < 3; k++) {
+              const a = Math.random() * Math.PI * 2;
+              ctx.vfx.spawnParticle(_bpV.x + (Math.random() - 0.5) * 10, seaH + 1, _bpV.z + (Math.random() - 0.5) * 10,
+                Math.cos(a) * sp * (0.6 + Math.random() * 0.8), 4 + Math.random() * 8, Math.sin(a) * sp * (0.6 + Math.random() * 0.8),
+                0.7 + Math.random() * 0.5, 0.85, 0.95, 1, -9.81);
+            }
+          }
+        }
+      }
       this.group.position.set(this.x, this.y, this.z);
       this.group.rotation.set(this.pitch + (this.breakFlex || 0), -this.heading, this.roll + (this.breakHinge || 0) + (this._breakList || 0));
     } else if (this.state === 'falling') {
-      // GENUINE FREEFALL: drag toward terminal velocity from mass and
-      // remaining lift, attitude from asymmetric lift loss.
-      // v1.4.0 mass (audit F14): the old code added gravity AND a drag
-      // term chasing −vt, so the true terminal was −(vt + a·τ) = −64.5
-      // m/s at lift 0, not the documented 40. vy now chases −vt with
-      // τ=2.5 s and the terminal velocity IS vt as documented (40–70
-      // m/s by lift) — consistent with breakup pieces (vt 36–54).
+      // v1.4.2 GENUINE FREEFALL (real physics — see PHYSICS.FALL_*):
+      // a = -g*(1 - liftThrust) + a_drag, integrated directly. The old
+      // code chased a 40-70 m/s terminal with tau=2.5 s, which gave
+      // ~27 m/s^2 initial acceleration (2.75g — impossible: a
+      // freefalling body cannot accelerate faster than g) and capped
+      // the fall at ~66 m/s. Now the initial acceleration is exactly
+      // g, drag is the 1/2*rho*Cd*A*v^2 equation, and the terminal
+      // velocity (291 m/s flat) is never reached from game altitudes
+      // — she is still accelerating at impact (350 m: 8.5 s, 81 m/s;
+      // 600 m: 11.2 s, 105 m/s). Attitude changes the projected area,
+      // so a tumbling fall drags differently from a flat one. The
+      // water-impact ladder below is unchanged in formula — it is now
+      // driven by the corrected impact speed.
       this.fallT += dt;
-      const vt = 40 + 30 * this.lift; // terminal velocity, m/s
-      // v1.4.1 zero-throttle fall: the pods are alive, so restored
-      // throttle spools the fans back up (ROTOR_SPOOL_TAU 6 s) and the
-      // residual thrust offsets weight — the terminal sink rate falls
-      // as the fans spool (vtEff = vt * (1 - liftThrust)). At full
-      // thrust the fall arrests and she returns to controlled flight
-      // (see the recovery check below), but only if there was altitude
-      // to spool up in. Damage falls never take this path: their lift
-      // can never produce liftThrust >= 1, and _fallZeroThrottle is
-      // false for them, so their freefall is byte-identical to v1.4.0.
-      let vyTarget = -vt;
+      // Lift thrust actually being produced (0 in a dead fall; spools
+      // back up with ROTOR_SPOOL_TAU when the player restores throttle
+      // in a zero-throttle fall, and offsets weight directly).
+      // Damage falls never take this path: _fallZeroThrottle is false.
+      let liftThrust = 0;
       if (this._fallZeroThrottle) {
         const liftTarget = Math.min(this.throttle * PHYSICS.T_LIFT_MAX_RATIO, this.lift * PHYSICS.T_LIFT_MAX_RATIO);
         this._fallSpool += (liftTarget - this._fallSpool) * (1 - Math.exp(-dt / PHYSICS.ROTOR_SPOOL_TAU));
-        const lt = this._fallSpool;
-        vyTarget = lt >= 1 ? Math.max(-PHYSICS.CLIMB_MAX, Math.min(PHYSICS.CLIMB_MAX, (lt - 1) * PHYSICS.THROTTLE_CLIMB)) : -vt * (1 - lt);
+        liftThrust = this._fallSpool;
       }
-      this.vy += (vyTarget - this.vy) * Math.min(1, dt / 2.5); // drag only
+      this.liftThrustNow = liftThrust;
+      const area = fallProjectedArea(this.pitch, this.roll);
+      const a = -9.81 * (1 - liftThrust) + fallDragAccel(this.vy, area, PHYSICS.MASS);
+      this.vy += a * dt;
       this.y += this.vy * dt;
       // Horizontal drift from the velocity at lift failure (see
       // startFall): decays slowly, like the pieces' ballistic drag.
@@ -2153,13 +2260,16 @@ export class Helicarrier {
       this.heading += this.fallYawRate * dt;
       this.group.position.set(this.x, this.y, this.z);
       this.group.rotation.set(this.pitch + (this.breakFlex || 0), -this.heading, this.roll + (this.breakHinge || 0) + (this._breakList || 0));
-      // v1.4.1 recovery: the fans can hold her (target sink rate ~0)
-      // and the descent is arrested — back to controlled flight at
-      // the recovery altitude, targetAlt reset there. Hover throttle
-      // alone can arrest her (liftThrust asymptotes to 1, vyTarget to
-      // 0); full throttle climbs her out. A late restore still hits
-      // the sea — the impact block below decides that, not this check.
-      if (this._fallZeroThrottle && this.breakState === 'none' && vyTarget >= -0.5 && this.vy >= -1) {
+      // v1.4.2 recovery: the fans are producing at least hover thrust
+      // (liftThrust >= 1) and the descent is arrested (vy >= -1 m/s)
+      // — back to controlled flight at the recovery altitude,
+      // targetAlt reset there. Note the physics consequence: hover
+      // thrust alone (liftThrust = 1) gives zero net acceleration, so
+      // it HOLDS a fall rate but cannot arrest one — arrest needs
+      // MORE than hover thrust (full throttle, 1.45xW, gives +0.45g).
+      // A late restore still hits the sea — the impact block below
+      // decides that, not this check.
+      if (this._fallZeroThrottle && this.breakState === 'none' && liftThrust >= 1 && this.vy >= -1) {
         this.state = 'alive';
         this._fallZeroThrottle = false;
         this.targetAlt = this.y;

@@ -1,10 +1,43 @@
-# Helicarriers at Sea — v1.4.1
+# Helicarriers at Sea — v1.4.2
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
 home. **Jets strike only in v1 — no dogfighting.** v1.4.0 adds defensive
 CAP gun passes against inbound strikes (see below) — interception,
 not dogfighting.
+
+v1.4.2: the in-game toast/event messages are removed entirely (the
+`#msg` element, its CSS and its show/hide logic are gone; `msg()` in
+`js/game.js` is a no-op so the call sites in game/carrier/jets/
+collisions keep working — nothing of that kind can appear). On phone
+portrait the speed telegraph is anchored to the bottom of the viewport,
+so collapsing or expanding Air Ops never moves it. Freefall is now real
+physics (see `../goals/helicarriers-at-sea-game/hidden_files/
+v14-physics-spec.md` §8, superseded 26 Nov 2026): initial acceleration
+exactly g = 9.81 m/s², drag F = ½·ρ·Cd·A·v² (ρ = 1.225, Cd = 1.0,
+planform 333×68 = 22,644 m², attitude-scaled), terminal velocity
+291 m/s flat — the old 40–70 m/s terminal with a τ=2.5 s chase gave
+~27 m/s² (2.75g) and capped the fall at ~66 m/s. From 350 m the fall now
+takes 8.5 s and hits at 81 m/s; from 600 m, 11.2 s at 105 m/s. Recovery
+is physics too: hover thrust alone holds a fall rate but cannot arrest
+one — immediate FULL-throttle restore recovers from 350 m by only ~24 m
+and from 600 m with ~274 m to spare, while a ~2 s delayed restore from
+350 m hits the sea at ~45 m/s. Rotor
+downwash is now visible on the sea: momentum theory with the game's own
+numbers (W = 1.1772e9 N, disc area 4,536 m² → v_i = 325 m/s at hover,
+392 m/s at full throttle), strength = lift actually produced per pod
+faded with height as (76/h)², drawn in the sea shader as a flattened
+disc + spray ring + churn + radial streaks under each live pod, plus
+spray/mist particles — player and enemy alike, strongest low and at high
+lift, absent at altitude. The throttle is linear now: the bottom ~17% of
+the slider used to pin at −6 m/s climb (the climb sum was clamped at −6
+while the throttle term spans −8…+3.6), so equal steps gave no change
+there — the descent clamp is now −8 m/s, the throttle term's natural
+floor, and equal 10% steps give equal 1.16 m/s climb steps across the
+whole range; hover stays at 69% and full-throttle climb at +3.6 m/s.
+The throttle knob also travels the full track now (it moved 29 px in a
+110 px track) and sits under the finger. No other feature, physics or
+damage amount changed.
 
 v1.4.0: mass-grounded flight physics for the 120,000 t carriers (spec in
 `../goals/helicarriers-at-sea-game/hidden_files/v14-physics-spec.md`):

@@ -135,7 +135,6 @@ const G = {
   // hits, strike aborts + ordnance denied, enemy jets spun out by CAP
   // gunfire. Read by the v14-cap probes; never shown in the HUD.
   capStats: { launches: 0, intercepts: 0, gunPasses: 0, gunHits: 0, aborts: 0, capKills: 0, ordnanceDenied: 0 },
-  msgT: 0,
   // v1.3.0
   paused: false, audio: null, airDefense: null,
   weatherProg: 'fixed', sailedDist: 0, lastFlagPos: null,
@@ -148,16 +147,23 @@ const G = {
   collCool: {}, grindCool: {}, scrapeCool: {}, // per-pair cooldowns (collisions.js)
   collidePair: null, // [a, b] carriers forced onto a collision course (?collide= / debug button)
   collideMode: null, // 'headon' | 'gentle' | 'drift'
-  transferAnnounce: null, // (c) sticky command-transfer banner {text, until}
   enemyFlag: null, // (c) current live enemy flagship (role moves when it dies)
   endResult: null, // (e) 'win' | 'lose' | 'draw' once the round ends
 };
 
-function msg(text) {
-  const el = $('msg');
-  if (el) { el.textContent = text; el.style.display = 'block'; } // v1.4.1: hidden by default — the idle '—' pill sat in open sea (39212)
-  G.msgT = 4;
-}
+// v1.4.2: the toast/event-message system is removed entirely — the
+// #msg element, its CSS and its show/hide timer are gone from
+// index.html and from stepSim() below. msg() stays as a no-op so the
+// ~40 call sites (game.js, carrier.js, jets.js, collisions.js via
+// ctx.msg) keep working untouched; nothing can appear on screen.
+// Every message it used to carry is duplicated in the HUD already
+// (selected ship in the top pill + fleet panel, telegraph notch in
+// the telegraph head, target on the target button, round outcome on
+// the end overlay). The one message the old code called must-not-miss
+// — command transfer on flagship loss — is likewise visible in the
+// top pill and the fleet panel's selected row, so no replacement UI
+// was added.
+function msg(text) {}
 
 // v1.4.0 (item 7, touch spec §5): haptics — navigator.vibrate only,
 // five rare events only (H1 kill, H2 own loss, H3 round end, H4 freak
@@ -355,15 +361,9 @@ function ensureLiveCommand(dead) {
   for (let k = 1; k <= fleet.length; k++) {
     const c = fleet[(start + k) % fleet.length];
     if (c && c.alive) {
-      const prevName = lost ? lost.name : 'Flagship';
       switchShip(c);
-      const text = `${prevName} lost — command transferred to ${c.name}`;
-      msg(text);
-      // Sticky: the transfer is the one message the player must not
-      // miss, and carrier/jet loss messages in the same frames would
-      // otherwise overwrite it within a frame. Re-asserted at the end
-      // of the loop for 8 s of game time (see loop()).
-      G.transferAnnounce = { text, until: G.time + 8 };
+      // v1.4.2: the old command-transfer toast is gone (see msg());
+      // the new command ship shows in the top pill + fleet panel.
       return true;
     }
   }
@@ -1865,10 +1865,17 @@ function bindInput() {
   // moved onto the shared pointer Map (own 'throttle' role,
   // lostpointercapture handled) like rudder/pitch — the old single
   // thId var had the same overwrite hole.
+  // v1.4.2 linearity: the pointer maps over the KNOB-CENTRE travel
+  // (track height minus knob height), not the full track height — so
+  // the knob sits under the finger at every position (before, the
+  // pointer spanned 110 px while the knob travelled 29 px, so the
+  // knob barely moved and never matched the finger). syncThrottleUI
+  // below uses the same travel, so finger, knob and value agree.
   const th = $('thrTrack'), tk = $('thrKnob');
   const thMove = e => {
     const r = th.getBoundingClientRect();
-    let v = 0.5 + ((r.top + r.height / 2) - e.clientY) / (r.height / 2) * 0.5;
+    const travel = Math.max(1, r.height - tk.getBoundingClientRect().height);
+    let v = 0.5 + ((r.top + r.height / 2) - e.clientY) / (travel / 2) * 0.5;
     G.throttle = clamp(v, 0, 1);
     syncThrottleUI();
   };
@@ -2034,7 +2041,12 @@ function syncThrottleUI() {
   const knob = $('thrKnob'), track = $('thrTrack');
   if (knob && track) {
     const r = track.getBoundingClientRect();
-    knob.style.transform = `translateY(${((0.5 - G.throttle) * (r.height / 2 - 26)).toFixed(1)}px)`;
+    // v1.4.2: the knob centre travels the full knob-centre range
+    // (track height minus knob height). The old formula used
+    // (r.height/2 - 26) as the half-travel, giving 29 px of travel in
+    // a 110 px track — the knob sat near the centre at every setting.
+    const travel = Math.max(1, r.height - knob.getBoundingClientRect().height);
+    knob.style.transform = `translateY(${((0.5 - G.throttle) * travel).toFixed(1)}px)`;
   }
 }
 function resetCamera() {
@@ -2252,15 +2264,9 @@ async function startGame() {
   bindInput();
   bindDebug();
   applyJoyMode(G.joyMode);
-  // v1.4.0 (item 7, touch spec §8): first-run note, in #msg (the
-  // #hint line is display:none on phones, so it cannot carry this).
-  // Shown once, after the fleet-launched message has had its 4 s.
-  try {
-    if (G.joyMode === 'float' && !localStorage.getItem('helicarriers_joy_hint_seen')) {
-      localStorage.setItem('helicarriers_joy_hint_seen', '1');
-      setTimeout(() => { if (G.started && !G.over) msg('Rudder is now floating — touch down anywhere bottom-left to steer. Fixed stick available in the menu.'); }, 4500);
-    }
-  } catch (_) {}
+  // v1.4.2: the old first-run floating-rudder toast is gone with the
+  // toast system; the menu text already explains the floating stick
+  // ("touch down anywhere bottom-left to steer").
   renderFleetPanels();
   updateTeleBox();
   msg(`Fleet launched — ${G.playerN}v${G.enemyN}, ${SKILLS[G.skill].label} enemy, ${STAGES[G.stage].name} sea. Launch a flight to strike.`);
@@ -2294,7 +2300,6 @@ let lastT = performance.now();
 // unboundedly). Debug timeScale multiplies the cap, as before.
 function stepSim(dt) {
   G.time += dt;
-  if (G.msgT > 0) { G.msgT -= dt; if (G.msgT <= 0) { const m = $('msg'); if (m) m.style.display = 'none'; } } // v1.4.1: hide on expiry, never show the idle '—' pill
   // Post-game freeze (Job B): once G.over is set, the world stops — no
   // steering, carrier/wing, ordnance or director updates — so the frozen
   // scene stays exactly the end state the overlay describes (a survivor
@@ -2347,12 +2352,6 @@ function stepSim(dt) {
   // has had its say (see flushHaptics — a round that just ended
   // drops the queue so only H3 fires).
   flushHaptics();
-  // (c) Keep a command-transfer announcement on screen for 8 s of game
-  // time — it must survive the flurry of loss messages around a sinking.
-  if (G.transferAnnounce) {
-    if (G.time < G.transferAnnounce.until && !G.over) { const m = $('msg'); if (m) { m.textContent = G.transferAnnounce.text; m.style.display = 'block'; } G.msgT = 4; }
-    else G.transferAnnounce = null;
-  }
 }
 function loop(now) {
   requestAnimationFrame(loop);
@@ -2365,7 +2364,7 @@ function loop(now) {
     const alive = G.allCarriers.filter(c => c.state !== 'gone');
     const fx = alive.reduce((a, c) => a + c.x, 0) / Math.max(1, alive.length);
     const fz = alive.reduce((a, c) => a + c.z, 0) / Math.max(1, alive.length);
-    G.sea.update(G.time, rawDt, fx, fz, []);
+    G.sea.update(G.time, rawDt, fx, fz, [], []);
     G.vfx.update(rawDt);
     updateCamera(rawDt);
     G.renderer.render(G.scene, G.camera);
@@ -2386,7 +2385,53 @@ function loop(now) {
   const fx = alive.reduce((a, c) => a + c.x, 0) / Math.max(1, alive.length);
   const fz = alive.reduce((a, c) => a + c.z, 0) / Math.max(1, alive.length);
   const wakeShips = G.allCarriers.filter(c => c.y < 60).map(c => ({ x: c.x, z: c.z, heading: c.heading, forwardSpeed: c.forwardSpeed, len: CARRIER_LEN, beam: 70 }));
-  G.sea.update(G.time, rawDt, fx, fz, wakeShips);
+  // v1.4.2 rotor downwash — momentum theory with the game's own numbers
+  // (documented here so the values are checkable, not tuned to look nice):
+  //   weight W = 120,000,000 kg * 9.81 = 1.1772e9 N; fan radius r = 19 m
+  //   (measured from the STL rotorSpin meshes; fallback 19 in carrier.js);
+  //   rotor disc area A = 4 * pi * 19^2 = 4,536 m^2.
+  //   downwash velocity at the disc v_i = sqrt(T / (2*rho*A)),
+  //   rho = 1.225 kg/m^3: at hover (T = W) v_i = 325 m/s; at full
+  //   throttle (T = 1.45W) v_i = 392 m/s. (The lift system itself is
+  //   specified, not derived — see carrier.js PHYSICS — but the air
+  //   velocity its thrust implies is what momentum theory says it is.)
+  //   The jet spreads as it descends, so the velocity at the surface
+  //   falls as ~1/h beyond the near field (h0 = 2 rotor diameters =
+  //   76 m) and the dynamic pressure — what blasts the water — as
+  //   1/h^2: strength = (lift actually produced / W) * min(1, (76/h)^2),
+  //   per live pod (dead pods blast nothing; survivors share the load).
+  //   That gives, at hover: ~0.064 per pod at the 150 m floor, ~0.012
+  //   at cruise 350 m (effectively absent), ~0.004 at 600 m; at full
+  //   throttle the same heights give ~0.093 / 0.017 / 0.006. The disc
+  //   radius grows as the jet spreads: R = r * (1 + h/76), capped at
+  //   60 m. Sources sit under the actual pods (group.localToWorld, so
+  //   pitch/roll shift the pattern with the ship's attitude) and are
+  //   rebuilt every frame for player and enemy carriers alike. A
+  //   falling carrier spooling her fans back up washes too
+  //   (liftThrustNow > 0 in the falling branch); a dead fall (throttle
+  //   0, lift 0) washes nothing. G.washDebug exposes the sources for
+  //   the probes (v142-wash.mjs) — it is not HUD state.
+  const washSources = [];
+  const _washV = new THREE.Vector3();
+  for (const c of G.allCarriers) {
+    if ((c.state !== 'alive' && c.state !== 'falling') || !c.liftThrustNow || c.liftThrustNow <= 0.01) continue;
+    const seaH = G.sea.waveHeight(c.x, c.z, G.time);
+    const h = Math.max(1, c.y - seaH);
+    const fall = Math.min(1, (76 / h) * (76 / h));
+    const nAlive = c.pods.filter(p => p.alive).length;
+    if (!nAlive) continue;
+    const R = Math.min(60, 19 * (1 + h / 76));
+    for (const p of c.pods) {
+      if (!p.alive) continue;
+      _washV.set(p.local.x, p.local.y, p.local.z);
+      c.group.localToWorld(_washV);
+      washSources.push({ x: _washV.x, z: _washV.z, strength: (c.liftThrustNow / nAlive) * fall, radius: R });
+      if (washSources.length >= 32) break;
+    }
+    if (washSources.length >= 32) break;
+  }
+  G.washDebug = { vDiscHover: 325.5, vDiscFull: 392, h0: 76, sources: washSources.map(s => ({ x: +s.x.toFixed(1), z: +s.z.toFixed(1), strength: +s.strength.toFixed(4), radius: +s.radius.toFixed(1) })) };
+  G.sea.update(G.time, rawDt, fx, fz, wakeShips, washSources);
   // v1.3.0 (D) freak-wave crest wall follows the crest.
   if (G.freakMesh) {
     const fw = G.sea.freak;

@@ -174,6 +174,16 @@ export class Sea {
     const shipVecs = [], shipSizes = [];
     for (let i = 0; i < MAXS; i++) { shipVecs.push(new THREE.Vector4()); shipSizes.push(new THREE.Vector2()); }
     this.MAXS = MAXS;
+    // v1.4.2 rotor downwash: uWash[32] — one source per live lift pod
+    // (8 carriers x 4 pods). vec4(x, z, strength, radius). strength is
+    // the physics strength (see the note in game.js): lift actually
+    // produced per pod, faded with height; the shader turns it into a
+    // flattened disc + spray ring + churn + radial streaks. Zero
+    // strength = no source. Filled by Sea.update's `wash` argument.
+    const WASH_MAX = 32;
+    const washVecs = [];
+    for (let i = 0; i < WASH_MAX; i++) washVecs.push(new THREE.Vector4());
+    this.WASH_MAX = WASH_MAX;
     this.uniforms = {
       uDeep: { value: new THREE.Color(0x0d2839) },
       uBase: { value: new THREE.Color(0x1a5a78) },
@@ -185,6 +195,7 @@ export class Sea {
       uFoam: { value: new THREE.Color(0xa9c2cf) },
       uShips: { value: shipVecs },
       uShipSize: { value: shipSizes },
+      uWash: { value: washVecs },
       uWind: { value: new THREE.Vector2(0, 1) },
       uWindStr: { value: 0 },
     };
@@ -208,6 +219,7 @@ export class Sea {
         uniform vec3 uDeep; uniform vec3 uBase; uniform vec3 uCrest; uniform vec3 uSky;
         uniform vec3 uSunDir; uniform float uSunI; uniform float uTime; uniform vec3 uFoam;
         uniform vec4 uShips[${MAXS}]; uniform vec2 uShipSize[${MAXS}];
+        uniform vec4 uWash[${WASH_MAX}];
         uniform vec2 uWind; uniform float uWindStr;
         varying vec3 vNormal; varying vec3 vWorldPos; varying float vSteep; varying float vH;
         #include <fog_pars_fragment>
@@ -231,6 +243,37 @@ export class Sea {
           float dist = length(cameraPosition - vWorldPos);
           vec2 wp = vWorldPos.xz;
           float detailFade = exp(-dist / 170.0);
+          // v1.4.2 rotor downwash (physics: see game.js wash builder —
+          // strength = lift actually produced per pod, faded with height
+          // as the jet spreads; the jet presses the water flat under
+          // each pod, throws a spray ring where it turns outward, and
+          // churns the disc white with radial streaks). Flattening is
+          // applied to the ripple normals below; the foam is mixed in
+          // with the wave/wake foam at the end. Per-fragment cost is
+          // one cheap bounds check per source; noise runs only inside
+          // a disc. washFlat/washFoam are 0 where no source reaches.
+          float washFoam = 0.0;
+          float washFlat = 0.0;
+          for(int i = 0; i < ${WASH_MAX}; i++){
+            vec4 w = uWash[i];
+            if(w.z > 0.003){
+              vec2 d = wp - w.xy;
+              float R = w.w;
+              if(abs(d.x) < R && abs(d.y) < R){
+                float r = length(d) / R;
+                if(r < 1.0){
+                  float ang = atan(d.y, d.x);
+                  float ring = smoothstep(0.45, 0.62, r) * (1.0 - smoothstep(0.78, 1.0, r));
+                  float churnN = vnoise(wp * 1.5 + vec2(uTime * 1.5, -uTime * 1.0));
+                  float churn = (1.0 - smoothstep(0.55, 0.95, r)) * (0.4 + 0.6 * churnN);
+                  float streak = vnoise(vec2(r * 6.0, ang * 2.5 + uTime * 0.7));
+                  float streakF = smoothstep(0.55, 0.85, streak) * smoothstep(0.15, 0.6, r) * (1.0 - smoothstep(0.8, 1.0, r));
+                  washFoam += w.z * (ring * 0.9 + churn * 0.55 + streakF * 0.45);
+                  washFlat = max(washFlat, w.z * (1.0 - smoothstep(0.7, 1.0, r)));
+                }
+              }
+            }
+          }
           vec3 N = normalize(vNormal);
           vec2 g1 = vec2(0.0);
           { vec2 rp = wp * 0.6 + vec2(uTime * 0.4, -uTime * 0.25); float e = 0.6;
@@ -244,7 +287,10 @@ export class Sea {
           vec2 g4 = vec2(0.0);
           { vec2 rp = wp * 9.0 + vec2(-uTime * 0.8, uTime * 0.7); float e = 0.12;
             g4 = vec2(vnoise(rp) - vnoise(rp + vec2(e, 0.0)), vnoise(rp) - vnoise(rp + vec2(0.0, e))); }
-          N.xz += detailFade * (0.28 * g1 + 0.16 * g2 + 0.14 * g3 + 0.08 * g4);
+          // v1.4.2: inside a downwash disc the blast presses the water
+          // flat — the ripple normals are suppressed there, so the disc
+          // reads as flattened water, not ordinary chop.
+          N.xz += detailFade * (1.0 - clamp(washFlat, 0.0, 0.9)) * (0.28 * g1 + 0.16 * g2 + 0.14 * g3 + 0.08 * g4);
           N = normalize(N);
           float ndv = max(dot(N, V), 0.0);
           vec3 water = mix(uDeep, uBase, smoothstep(-0.15, 0.45, vH));
@@ -298,7 +344,10 @@ export class Sea {
           vec2 streakUV = vec2(dot(wp, wPerp), dot(wp, uWind) * 0.15);
           float streak = vnoise(streakUV * 0.55 + vec2(0.0, uTime * 0.25));
           float streakF = smoothstep(0.6, 0.9, streak) * smoothstep(0.4, 0.8, uWindStr) * 0.35 * smoothstep(0.4, 0.7, vH) * exp(-dist / 260.0);
-          col = mix(col, uFoam, clamp(foam + shipFoam + streakF, 0.0, 1.0) * 0.35);
+          col = mix(col, uFoam, clamp(foam + shipFoam + streakF + washFoam, 0.0, 1.0) * 0.35);
+          // v1.4.2: the downwash foam gets its own stronger pass — a
+          // full-strength blast reads whiter than ordinary wave foam.
+          col = mix(col, uFoam, clamp(washFoam, 0.0, 1.0) * 0.45);
           gl_FragColor = vec4(col, 1.0);
           #include <fog_fragment>
         }`,
@@ -320,7 +369,10 @@ export class Sea {
   }
   // ships: [{x,z,heading,forwardSpeed,len,beam, onWater}] — only hulls at/near
   // the water feed the wake uniforms; flying carriers skip (no wake in the sky).
-  update(t, dt, focusX, focusZ, ships) {
+  // wash: [{x,z,strength,radius}] — v1.4.2 rotor-downwash sources, one per
+  // live lift pod (see game.js); strength 0 = no source. Pass [] or null
+  // for none (e.g. the attract scene behind the menu).
+  update(t, dt, focusX, focusZ, ships, wash) {
     this.ampCur += (this.ampTarget - this.ampCur) * Math.min(1, dt * 0.5);
     this.uniforms.uTime.value = t;
     const OCEAN_STEP = 8;
@@ -354,6 +406,11 @@ export class Sea {
         this.uniforms.uShips.value[i].set(0, 0, 0, 0);
         this.uniforms.uShipSize.value[i].set(0, 0);
       }
+    }
+    for (let i = 0; i < this.WASH_MAX; i++) {
+      const w = wash && wash[i];
+      if (w) this.uniforms.uWash.value[i].set(w.x, w.z, w.strength || 0, w.radius || 0);
+      else this.uniforms.uWash.value[i].set(0, 0, 0, 0);
     }
   }
 }
