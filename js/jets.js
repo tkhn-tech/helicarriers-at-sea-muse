@@ -29,6 +29,19 @@
 //     the debug panel before trusting the dive.
 import * as THREE from 'three';
 
+// v1.5.0 R6/R8: one shared soft radial texture for the nav-light and
+// blob-shadow sprites (own sprites, not the VFX pool — see _ensureNavLights).
+const NAV_TEX = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.4, 'rgba(255,255,255,0.5)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+})();
+
 export const JET_CRUISE_SPEED = 140;
 export const JET_ATTACK_SPEED = 170;
 export const JET_CATAPULT_SPEED = 75;
@@ -91,9 +104,13 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
   if (!jet.stalled && jet.speed < JET_STALL_SPEED) { jet.stalled = true; jet.stallSide = Math.random() < 0.5 ? 1 : -1; }
   if (jet.stalled && jet.speed > JET_RECOVER_SPEED) jet.stalled = false;
   let tx = ux, ty = uy, tz = uz;
+  // v1.5.0 M1: induced-drag deceleration (m/s^2), computed in the
+  // non-stalled branch below and applied after the accel steps.
+  let _indDecel = 0;
   // v1.3.0 SAM evasion (Hurricane v11.45 F5): while the defensive timer
   // runs the jet breaks 90 deg to its evasion side — the aim vector is
-  // rotated, so the jet actually turns away from the SAM, not just banks.
+  // rotated, so the jet actually turns into the SAM (v1.5.0 M5, Hurricane
+  // L6225: break INTO the threat), not just banks.
   if (jet.defensiveT > 0 && !jet.stalled) {
     const s = jet.defSide || 1;
     const rx = Math.cos(jet.heading), rz = Math.sin(jet.heading);
@@ -114,13 +131,37 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
       const rx = Math.cos(jet.heading), rz = Math.sin(jet.heading);
       tx = rx * side; ty = 0; tz = rz * side;
     }
-    // Bank bleed
-    if (Math.abs(jet.roll) > 0.5) sp -= Math.min(30, 20 * (1 / Math.cos(jet.roll) - 1));
+    // v1.5.0 M1 — energy honesty (Pandora §0: F/A-18 k = 1/(pi*e*AR)
+    // ~= 0.10, AR 3.99, e ~0.8). The old bank bleed was a small
+    // target-speed trim; the induced-drag bleed is a real deceleration:
+    // n = 1/cos(roll) (4 g in pullout), CL = n*W/(q*S) capped at the
+    // Hornet CLmax 1.6, D_ind = q*S*k*CL^2, decel = D/m. At 140 m/s a
+    // 60-deg bank (n=2) bleeds ~1.4 m/s^2 and a 75-deg bank ~5 m/s^2;
+    // level flight (n=1) bleeds ~0.4 m/s^2, inside the thrust margin,
+    // so cruise speed is unaffected. Sustained-turn check at 140 m/s:
+    // CLmax caps n at ~4.5 g, omega ~17.6 deg/s (Pandora §0: 19.2 deg/s
+    // at 400 kt SL). Applied as a velocity decay after the accel steps
+    // so it is dt-correct and cannot fight the 80 m/s floor (below).
+    // The dive accelerates under gravity: diveGain accumulates
+    // g*(-ty) while diving (capped +25 m/s) and raises the commanded
+    // dive speed, so a 30-deg dive ends ~207 m/s, not pinned at 190.
+    const _V = Math.max(1, jet.speed);
+    const _q = 0.5 * 1.225 * _V * _V;
+    const _n = opts.pullout ? 4 : Math.min(3.9, 1 / Math.max(0.25, Math.cos(jet.roll)));
+    const _CL = Math.min(1.6, _n * 198574 / (_q * 46.5));
+    _indDecel = _q * 46.5 * 0.10 * _CL * _CL / 20242;
+    if (opts.dive && !jet.stalled) {
+      jet._diveGain = Math.min(25, (jet._diveGain || 0) + 9.81 * Math.max(0, -ty) * dt);
+    } else jet._diveGain = 0;
+    if (opts.dive && !jet.stalled) sp = Math.max(sp, JET_DIVE_SPEED + (jet._diveGain || 0));
     sp = Math.max(80, sp); // commanded floor (not stalled)
   }
-  // Longitudinal accel toward desired speed along aim
+  // Longitudinal accel toward desired speed along aim — v1.5.0 M1:
+  // 50 -> 18 m/s^2 (Hurricane's measured real-Hornet value, 10-15 in
+  // its units; 18 m/s^2 here). Near-instant before; now a jet takes
+  // ~3.3 s to add 60 m/s, so climbs and turn exits cost real time.
   const curAlong = jet.vx * tx + jet.vy * ty + jet.vz * tz;
-  const accel = jet.stalled ? 0 : 50;
+  const accel = jet.stalled ? 0 : 18;
   let dAlong = clamp(sp - curAlong, -accel * dt, accel * dt);
   jet.vx += tx * dAlong; jet.vy += ty * dAlong; jet.vz += tz * dAlong;
   // Lateral (turn) accel — cap order: longitudinal first, then lateral.
@@ -139,6 +180,17 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
   const vAcc = jet.stalled ? 15 : opts.pullout ? 39 : opts.dive ? 60 : 35;
   const wantVy = ty * sp;
   jet.vy += clamp(wantVy - jet.vy, -vAcc * dt, vAcc * dt);
+  // v1.5.0 M1: induced-drag velocity decay (from the roll/pullout load
+  // factor above). Scales the velocity vector down by decel*dt — a
+  // true energy loss, not a target trim. The 80 m/s floor below still
+  // applies, so a jet can bleed to the floor but never through it.
+  if (!jet.stalled) {
+    const s0 = Math.hypot(jet.vx, jet.vy, jet.vz);
+    if (s0 > 1) {
+      const k = Math.max(0, 1 - _indDecel * dt / s0);
+      jet.vx *= k; jet.vy *= k; jet.vz *= k;
+    }
+  }
   // Actual-speed floor in flight states (v11.46/50 fix: 259 stall-sea
   // deaths -> 1). Never applied while stalled (stall recovers by falling).
   if (!jet.stalled && opts.flight) {
@@ -157,6 +209,20 @@ export function steerJetTo(jet, aim, slowingR, maxSpeed, dt, opts = {}) {
   let dh = vHeading - jet.heading;
   dh = ((dh + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
   jet.heading += clamp(dh, -3 * dt, 3 * dt);
+  // v1.5.0 M6: engine-out yaw moment (Pandora §5.6: thrust station at
+  // y = +/-0.55 m gives T*y/I ~= 3.4 deg/s^2 = 0.059 rad/s^2).
+  // jet.engineYaw is -1 (port engine dead) / +1 (starboard) / 0, set in
+  // _syncZoneEffects. The drift rate grows at 0.059 rad/s^2 to a
+  // +/-0.15 rad/s cap and rotates the velocity vector, so the jet
+  // genuinely crabs toward the dead engine. Both engines dead is a
+  // spin-out, so the drift only ever applies to a single-engine loss.
+  if (!jet.stalled && jet.engineYaw) {
+    jet.yawDrift = clamp((jet.yawDrift || 0) + jet.engineYaw * 0.059 * dt, -0.15, 0.15);
+    const yd = jet.yawDrift * dt, c = Math.cos(yd), s = Math.sin(yd);
+    const nvx = jet.vx * c - jet.vz * s, nvz = jet.vx * s + jet.vz * c;
+    jet.vx = nvx; jet.vz = nvz;
+    jet.heading += yd;
+  } else if (jet.yawDrift) jet.yawDrift = 0;
   const omega = dh / Math.max(dt, 1e-3);
   jet.omegaSm = (jet.omegaSm || 0) + (clamp(omega, -1.5, 1.5) - (jet.omegaSm || 0)) * Math.min(1, dt * 6);
   let pitchT;
@@ -308,6 +374,15 @@ export class FighterJet {
     // and the bounce cooldown — a jet that just jinked off a closing
     // CAP fighter does not jink again for 8 s.
     this.capAmmo = 0; this.capGunT = 0; this.capBounceT = 0;
+    // v1.5.0 jets (Tier A): stall-buffet / vapour cadence timers,
+    // engine-out yaw drift (M6, rad/s — grows at 3.4 deg/s^2 per dead
+    // engine, capped), sinking-wreck timers (R4), slide-off state (R5),
+    // nav-light / blob-shadow handles (R6/R8 — own sprites, NOT the
+    // shared VFX pool: 0 pool sprites/particles each).
+    this.buffT = 0; this.vapT = 0; this.yawDrift = 0;
+    this.sinkT = 0; this.bubT = 0; this.slideT = 0; this.slideCarrier = null;
+    this.carrierCrashT = 0; this.carrierCrashLocal = null; this.carrierCrashCarrier = null;
+    this._navLights = null; this._shadow = null; this._abortedCrippled = false;
     this.rollBias = 0; this.speedMul = 1; this.turnMul = 1;
     this.deckLocal = null; // {lx,lz} — deck coupling (J): jets parked /
     // taxiing / rearming ride the carrier's deck when she climbs/descends
@@ -340,7 +415,7 @@ export class FighterJet {
   // v1.3.0 (B): apply damage to one jet zone. Returns 'lost' (zone just
   // destroyed), 'spinout' (dying rule met), 'fire' (fuel ignited) or null.
   damageZone(amount, zoneKey, source, ctx) {
-    if (this.state === 'crashed' || this.state === 'sinking' || this.state === 'spinout') return null;
+    if (['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(this.state)) return null;
     const z = this.zones[zoneKey] || this.zones.fuselage;
     const key = this.zones[zoneKey] ? zoneKey : 'fuselage';
     const mult = this.zoneMult[key] || 1;
@@ -369,6 +444,11 @@ export class FighterJet {
     const wingL = this.zones.wingL.hp <= 0, wingR = this.zones.wingR.hp <= 0;
     this.rollBias = (wingL ? 0.35 : 0) + (wingR ? -0.35 : 0);
     const engLost = (this.zones.engineL.hp <= 0 ? 1 : 0) + (this.zones.engineR.hp <= 0 ? 1 : 0);
+    // v1.5.0 M6: single-engine-out yaw direction — dead port engine
+    // yaws the nose to port (-1), dead starboard to starboard (+1).
+    // Both dead is a spin-out (no yaw needed — the jet is already dead).
+    this.engineYaw = (this.zones.engineL.hp <= 0 && this.zones.engineR.hp > 0) ? -1
+      : (this.zones.engineR.hp <= 0 && this.zones.engineL.hp > 0) ? 1 : 0;
     const wingDmg = (1 - this.zones.wingL.hp / 80) + (1 - this.zones.wingR.hp / 80);
     this.speedMul = Math.max(0.55, 1 - 0.22 * engLost - 0.08 * wingDmg);
     this.turnMul = Math.max(0.6, 1 - 0.18 * engLost);
@@ -385,7 +465,7 @@ export class FighterJet {
   // nose-down bias, lift scale ~0.15 — the jet tumbles down and only
   // becomes a crash when it reaches the sea (update()).
   startSpinOut(ctx, reason) {
-    if (this.state === 'crashed' || this.state === 'sinking' || this.state === 'spinout') return;
+    if (['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(this.state)) return;
     this.state = 'spinout';
     this.spinOut = true;
     this.spinT = 0;
@@ -408,8 +488,135 @@ export class FighterJet {
     this.group.position.set(this.x, this.y, this.z);
     this.group.rotation.set(this.pitch, -this.heading, this.roll);
   }
+  // v1.5.0 jets (Tier A, R3/R6/R8): zone-local offsets (metres, nose -Z,
+  // +x starboard) so damage smoke/fire emit from the hit zone, not the
+  // jet centre. Wingtips at +/-6.8 m (13.62 m span); engines at +/-1.6 m
+  // fuselage side; fuel centre-aft.
+  static ZONE_OFFSET = {
+    wingL: { x: -6.8, y: 0, z: 0.5 }, wingR: { x: 6.8, y: 0, z: 0.5 },
+    engineL: { x: -1.6, y: -0.3, z: 2.0 }, engineR: { x: 1.6, y: -0.3, z: 2.0 },
+    fuselage: { x: 0, y: 0.3, z: 0 }, fuel: { x: 0, y: 0, z: 6.5 },
+  };
+  _zoneWorld(zoneKey) {
+    const o = FighterJet.ZONE_OFFSET[zoneKey] || FighterJet.ZONE_OFFSET.fuselage;
+    const fx = Math.sin(this.heading), fz = -Math.cos(this.heading);
+    const rx = Math.cos(this.heading), rz = Math.sin(this.heading);
+    return { x: this.x + rx * o.x + fx * o.z, y: this.y + o.y, z: this.z + rz * o.x + fz * o.z };
+  }
+  _wingtipWorld(side) { // side -1 port / +1 starboard
+    const rx = Math.cos(this.heading), rz = Math.sin(this.heading);
+    return { x: this.x + rx * side * 6.8, y: this.y, z: this.z + rz * side * 6.8 };
+  }
+  // v1.5.0 R6: nav / formation lights — red port, green starboard,
+  // white tail strobe on a 1 s cycle. Own sprites parented to the jet
+  // group (shared materials), NOT the VFX pool: cost 0 pool sprites,
+  // 0 pool particles, 3 draw calls per jet. Chosen over pool sprites
+  // because liveS already hits 415/420 in kills.
+  _ensureNavLights() {
+    if (this._navLights) return;
+    const mk = (color, x, y, z, s) => {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: NAV_TEX, color, transparent: true, opacity: 0.9, depthWrite: false }));
+      sp.position.set(x, y, z); sp.scale.set(s, s, 1);
+      this.group.add(sp);
+      return sp;
+    };
+    this._navLights = {
+      port: mk(0xff2a22, -6.8, 0, 0.5, 2.5),
+      stbd: mk(0x2aff66, 6.8, 0, 0.5, 2.5),
+      strobe: mk(0xffffff, 0, 0.5, 8.5, 3.5),
+    };
+  }
+  // v1.5.0 R8: blob shadow — one dark transparent sprite per jet,
+  // projected onto the sea/deck height below, scale growing and opacity
+  // fading with altitude, gone above ~150 m. Own sprite in the scene
+  // (not the VFX pool): cost 0 pool sprites/particles, 1 draw call.
+  _ensureShadow(ctx) {
+    if (this._shadow || !ctx || !ctx.scene) return;
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: NAV_TEX, color: 0x000000, transparent: true, opacity: 0, depthWrite: false }));
+    sp.scale.set(14, 7, 1);
+    ctx.scene.add(sp);
+    this._shadow = sp;
+  }
+  _updateShadow(ctx) {
+    if (!this._shadow) return;
+    const airborne = this.group.visible && !['deck', 'taxi', 'rearm', 'catapult', 'crashed', 'sinking', 'spinout'].includes(this.state);
+    if (!airborne) { this._shadow.visible = false; return; }
+    const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+    let ground = seaH;
+    for (const c of ctx.carriers || []) {
+      if (!c.alive) continue;
+      const dh = c.deckHeightAt ? c.deckHeightAt(this.x, this.z) : -Infinity;
+      if (dh > ground) ground = dh;
+    }
+    const alt = this.y - ground;
+    if (alt > 150 || alt < 0) { this._shadow.visible = false; return; }
+    const k = 1 - alt / 150;
+    this._shadow.visible = true;
+    this._shadow.position.set(this.x, ground + 0.5, this.z);
+    this._shadow.scale.set(14 + alt * 0.15, 7 + alt * 0.08, 1);
+    this._shadow.material.opacity = 0.32 * k;
+  }
+  // v1.5.0 R4: wreck-on-deck detonation (Hurricane L6036) — a wreck
+  // falling onto a LIVE carrier deck detonates on it instead of
+  // falling through. Returns true when it detonated. alreadyCounted:
+  // the loss was already recorded (crashed jets) vs not yet (spin-out
+  // jets, counted at sea impact — here instead). The wreck is gone
+  // after the blast: state 'sinking' + _despawned, group hidden, so
+  // the squadron's lost/stand-down logic (which waits for 'sinking')
+  // still resolves and the jet is refilled from the pool at the next
+  // launch. Cost: 50 particles + 1 sprite, both pool-guarded.
+  _wreckOnDeck(ctx, alreadyCounted) {
+    if (!ctx.carriers || !ctx.vfx) return false;
+    for (const c of ctx.carriers) {
+      if (!c.alive) continue;
+      if (this.y > c.deckTopY() + 3) continue;
+      const l = c.localFromWorld(this.x, this.z);
+      if (Math.abs(l.lx) > 34 || Math.abs(l.lz) > 166) continue;
+      if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 30, [1, 0.6, 0.2], 8, 5);
+      if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 20, [0.3, 0.3, 0.3], 5, 5);
+      if (ctx.vfx.liveSprites() < 300) { const fb = ctx.vfx.spawnSprite(this.x, this.y + 2, this.z, 0.9, 14, 14, 2.5, 0xff8822, 0.95); fb.vy = 4; }
+      if (this._shadow) this._shadow.visible = false;
+      this.group.visible = false;
+      this.state = 'sinking'; this.sinkT = 0; this._despawned = true;
+      this.crashReason = 'wreck hit the deck';
+      if (!alreadyCounted && this.wing) this.wing.onJetLost(this);
+      if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet wreck detonated on ${c.name}'s deck (${this.wing.remaining} jets left in wing)`);
+      return true;
+    }
+    return false;
+  }
+  // v1.5.0 R5: slide off a sinking deck (Hurricane startSlideOff
+  // L6110). The loss is counted ONCE here, at release from the deck —
+  // the slide, the fall and the sinking that follow are the visible
+  // loss, not further losses.
+  startSlideOff(carrier, ctx) {
+    if (['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(this.state)) return;
+    this.state = 'slideoff'; this.slideT = 0; this.slideCarrier = carrier;
+    this.vx = 0; this.vy = 0; this.vz = 0;
+    if (this.wing) this.wing.onJetLost(this);
+    if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet sliding off ${carrier.name}'s deck (${this.wing.remaining} jets left in wing)`);
+  }
+  // v1.5.0 R5: crash into a sinking deck on final (Hurricane
+  // crashIntoCarrier L6134). The wreck anchors to the deck at the
+  // impact point and rides the wreck down. Loss counted once here.
+  // Cost: 50 particles + 1 sprite, both pool-guarded.
+  crashIntoCarrier(carrier, ctx) {
+    if (['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(this.state)) return;
+    this.state = 'carrierCrash'; this.carrierCrashT = 0;
+    this.carrierCrashCarrier = carrier;
+    const l = carrier.localFromWorld(this.x, this.z);
+    this.carrierCrashLocal = { lx: l.lx, lz: l.lz };
+    const p = carrier.deckPoint(l.lx, l.lz);
+    this.x = p.x; this.y = p.y + 2.4; this.z = p.z;
+    if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 30, [1, 0.6, 0.2], 8, 5);
+    if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 20, [0.3, 0.3, 0.3], 5, 5);
+    if (ctx.vfx.liveSprites() < 300) { const fb = ctx.vfx.spawnSprite(this.x, this.y + 2, this.z, 0.9, 14, 14, 2.5, 0xff8822, 0.95); fb.vy = 4; }
+    if (this._shadow) this._shadow.visible = false;
+    if (this.wing) this.wing.onJetLost(this);
+    if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet crashed into ${carrier.name}'s sinking deck (${this.wing.remaining} jets left in wing)`);
+  }
   crash(reason, ctx) {
-    if (this.state === 'crashed' || this.state === 'sinking') return;
+    if (['crashed', 'sinking', 'slideoff', 'carrierCrash'].includes(this.state)) return;
     this.state = 'crashed';
     this.crashT = 0;
     this.crashReason = reason;
@@ -446,8 +653,17 @@ export class FighterJet {
           const bothEngines = this.zones.engineL.hp <= 0 && this.zones.engineR.hp <= 0;
           if (wingLost || bothEngines) this.startSpinOut(ctx, 'fire burned through ' + f.zone);
         }
-        if (Math.random() < dt * 12) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 0.8, 1, 0.5, 0.1, -0.5);
-        if (Math.random() < dt * 8) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 1.2, 0.15, 0.15, 0.15, 0.5);
+        // v1.5.0 R3: fire/smoke emit from the burning ZONE (not the jet
+        // centre) and stream AFT with the airflow: initial velocity =
+        // -jet velocity (aft) plus a small up component. Guarded at
+        // liveParticles < 1200 (pool is near saturation in kills).
+        // Particle count unchanged from the pre-v1.5.0 centre emission.
+        if (ctx.vfx.liveParticles() < 1200) {
+          const zp = this._zoneWorld(f.zone);
+          const avx = -this.vx * 0.7, avz = -this.vz * 0.7;
+          if (Math.random() < dt * 12) ctx.vfx.spawnParticle(zp.x, zp.y, zp.z, avx, 1, avz, 0.8, 1, 0.5, 0.1, -0.5);
+          if (Math.random() < dt * 8) ctx.vfx.spawnParticle(zp.x, zp.y, zp.z, avx, 1.5, avz, 1.2, 0.15, 0.15, 0.15, 0.5);
+        }
         if (f.spreadT > 8) {
           f.spreadT = 0;
           const adj = { fuel: 'fuselage', fuselage: 'engineL', engineL: 'wingL', engineR: 'wingR', wingL: 'fuselage', wingR: 'fuselage' };
@@ -471,15 +687,24 @@ export class FighterJet {
       this.x += this.vx * dt; this.y += this.vy * dt; this.z += this.vz * dt;
       if (Math.random() < dt * 10) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 0, 0, 0.7, 1, 0.5, 0.1, 0);
       const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+      // v1.5.0 R4: wreck-on-deck detonation (Hurricane L6036) — a
+      // spinning-out jet falling onto a LIVE carrier deck detonates on
+      // it instead of falling through. Deck footprint |lx| <= 34,
+      // |lz| <= 166 in carrier-local coords.
+      if (this._wreckOnDeck(ctx)) { this.syncModel(); return; }
       if (this.y <= seaH) {
-        this.state = 'crashed'; this.crashT = 0;
+        // v1.5.0 R4: the wreck does NOT vanish at sea impact — it stays
+        // visible and sinks (updateSinking below: ~2-3 m/s, gentle
+        // tumble, bubble stream, debris + oil slick at -15 m).
+        this.state = 'sinking'; this.sinkT = 0; this.bubT = 0;
         this.crashReason = this.spinReason || 'spun out';
+        this.y = seaH; this.vy = -2; this.vx *= 0.3; this.vz *= 0.3;
         ctx.vfx.burst(this.x, this.y, this.z, 30, [1, 0.6, 0.2], 8, 4);
         ctx.vfx.splash(this.x, seaH, this.z, Math.abs(this.vy));
-        this.group.visible = false;
         if (this.wing) this.wing.onJetLost(this);
         if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet lost — ${this.crashReason} (${this.wing.remaining} jets left in wing)`);
       }
+      this._ensureShadow(ctx); this._updateShadow(ctx);
       this.syncModel();
       return;
     }
@@ -488,12 +713,59 @@ export class FighterJet {
       this.vy -= 9.81 * dt * 0.5;
       this.x += this.vx * dt; this.y += this.vy * dt; this.z += this.vz * dt;
       this.roll += dt * 2;
+      if (this._shadow) this._shadow.visible = false; // v1.5.0 R8: no shadow for a dead tumbling wreck
       if (Math.random() < dt * 8) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 0, 0, 0.7, 1, 0.5, 0.1, 0);
       const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+      // v1.5.0 R4: wreck-on-deck detonation (loss already counted by crash()).
+      if (this._wreckOnDeck(ctx, true)) { this.syncModel(); return; }
       if (this.y <= seaH) {
-        this.state = 'sinking';
+        // v1.5.0 R4: keep the model visible and sink (see updateSinking
+        // below) instead of hiding at the waterline.
+        this.state = 'sinking'; this.sinkT = 0; this.bubT = 0;
+        this.y = seaH; this.vy = -2; this.vx *= 0.3; this.vz *= 0.3;
         ctx.vfx.splash(this.x, seaH, this.z, Math.abs(this.vy));
+      }
+      this.syncModel();
+      return;
+    }
+    // v1.5.0 R4: sinking wreck (Hurricane updateSinking L6068 + Pandora
+    // CrashVFXManager presentation). The model stays visible, sinks
+    // ~2-3 m/s with a gentle tumble, streams bubbles, and despawns at
+    // -15 m leaving a debris field + oil slick (wreckage.js, consistent
+    // with carrier wreckage). Q6 lifetime: the debris/oil field
+    // persists for the REST OF THE ROUND, like carrier wreckage — not
+    // Pandora's 90 s — because the sea already carries carrier fields
+    // that way and a 90 s jet field would vanish mid-round.
+    // Cost: ~25 particles/s bubbles (guarded < 1200); the debris field
+    // uses the preallocated wreckage pools (4 chunks + 1 slick), 0 VFX
+    // pool sprites/particles (falls back to 4 VFX debris sprites + 1
+    // slick sprite, guarded < 300, only if wreckage is unavailable).
+    if (this.state === 'sinking') {
+      if (this._despawned) { this.syncModel(); return; }
+      if (this._shadow) this._shadow.visible = false;
+      this.sinkT += dt;
+      this.vy = Math.max(this.vy - 8 * dt, -3);
+      this.y += this.vy * dt;
+      this.x += this.vx * dt; this.z += this.vz * dt;
+      this.heading += dt * 0.5; this.roll += dt * 0.4;
+      this.bubT -= dt;
+      if (this.bubT <= 0 && ctx.vfx.liveParticles() < 1200) {
+        this.bubT = 0.12;
+        ctx.vfx.bubbles(this.x, this.y + 1, this.z, 3, 2);
+      }
+      const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+      if (this.y <= seaH - 15 || this.sinkT > 12) {
+        this._despawned = true;
         this.group.visible = false;
+        if (ctx.wreckage) {
+          ctx.wreckage.spawn(this.x, this.z, { chunks: 4, slickR0: 12, along: 8, across: 6, heading: this.heading, name: 'jet-wreck' });
+        } else if (ctx.vfx.liveSprites() < 300) {
+          for (let i = 0; i < 4; i++) {
+            const d = ctx.vfx.spawnSprite(this.x + (Math.random() - 0.5) * 6, seaH + 0.3, this.z + (Math.random() - 0.5) * 6, 90, 3, 2, 0.1, 0x1a1a1a, 0.7);
+            d.vx = (Math.random() - 0.5) * 0.3; d.vz = (Math.random() - 0.5) * 0.3;
+          }
+          ctx.vfx.spawnSprite(this.x, seaH + 0.2, this.z, 90, 10, 10, 0.05, 0x0a0a12, 0.5);
+        }
       }
       this.syncModel();
       return;
@@ -503,14 +775,134 @@ export class FighterJet {
       if (this.state !== 'sinking') this.rideDeck();
       this.syncModel(); return;
     }
+    // v1.5.0 R5: slide down the tilting deck (Hurricane updateSlideOff
+    // L6125) — gravity projected onto the live deck plane via the
+    // carrier's live quaternion, so the slide follows the deck's real
+    // tilt as she lists and goes down. The jet stays on the deck
+    // surface while sliding; past the edge she falls (crashed branch
+    // -> sinking wreck, R4); if the deck is already under, straight
+    // into the sinking. g = 9.81 (metric; Hurricane used 25 in its
+    // ~5.74 m units). Always-solid: the jet never leaves the deck
+    // plane until it is past the edge or the deck is under.
+    if (this.state === 'slideoff') {
+      this.slideT += dt;
+      const carrier = this.slideCarrier;
+      if (!carrier || carrier.state === 'gone' || !carrier.group) {
+        this.state = 'crashed'; this.crashT = 0; this.crashReason = 'slid off — no deck left';
+        this.syncModel(); return;
+      }
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(carrier.group.quaternion);
+      const deckC = carrier.deckPoint(0, 0);
+      const gx = up.y * up.x, gy = -1 + up.y * up.y, gz = up.y * up.z;
+      this.vx += gx * 9.81 * dt; this.vy += gy * 9.81 * dt; this.vz += gz * 9.81 * dt;
+      this.x += this.vx * dt; this.y += this.vy * dt; this.z += this.vz * dt;
+      const dx = this.x - deckC.x, dy = this.y - deckC.y, dz = this.z - deckC.z;
+      const dn = dx * up.x + dy * up.y + dz * up.z;
+      this.x -= up.x * dn; this.y -= up.y * dn; this.z -= up.z * dn;
+      const vn = this.vx * up.x + this.vy * up.y + this.vz * up.z;
+      this.vx -= up.x * vn; this.vy -= up.y * vn; this.vz -= up.z * vn;
+      this.heading = carrier.heading; this.pitch = carrier.pitch || 0; this.roll = carrier.roll || 0;
+      const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+      if (this.y <= seaH) {
+        this.state = 'sinking'; this.sinkT = 0; this.bubT = 0;
+        this.y = seaH; this.vy = -2; this.vx *= 0.3; this.vz *= 0.3;
+        ctx.vfx.splash(this.x, seaH, this.z, 2);
+        this.syncModel(); return;
+      }
+      const l = carrier.localFromWorld(this.x, this.z);
+      if (Math.abs(l.lx) > 34 || Math.abs(l.lz) > 166) {
+        this.state = 'crashed'; this.crashT = 0; this.crashReason = 'slid off the deck';
+        this.vy = Math.min(this.vy, -2);
+      }
+      this.syncModel(); return;
+    }
+    // v1.5.0 R5: the wreck rides the carrier down (Hurricane
+    // updateCarrierCrash L6160), anchored to the deck at the impact
+    // point — burning while above the sea, bubbling once under. Gone
+    // with the carrier (despawned as a sinking wreck) once 2 m under
+    // or after 60 s.
+    if (this.state === 'carrierCrash') {
+      const carrier = this.carrierCrashCarrier;
+      if (!carrier || !this.carrierCrashLocal || carrier.state === 'gone') {
+        this.group.visible = false; this.state = 'sinking'; this._despawned = true; this.sinkT = 0;
+        this.syncModel(); return;
+      }
+      const p = carrier.deckPoint(this.carrierCrashLocal.lx, this.carrierCrashLocal.lz);
+      this.x = p.x; this.y = p.y + 2.4; this.z = p.z;
+      this.heading = carrier.heading; this.pitch = carrier.pitch || 0; this.roll = carrier.roll || 0;
+      this.carrierCrashT += dt;
+      const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+      if (this.y >= seaH) {
+        if (Math.random() < dt * 8 && ctx.vfx.liveParticles() < 1200) ctx.vfx.spawnParticle(this.x, this.y + 1, this.z, 0, 2, 0, 1.2, 0.15, 0.15, 0.15, 0);
+        if (Math.random() < dt * 6 && ctx.vfx.liveParticles() < 1200) ctx.vfx.spawnParticle(this.x, this.y + 1, this.z, 0, 0, 0, 0.4, 1, 0.5, 0.1, 0);
+      } else if (Math.random() < dt * 10 && ctx.vfx.liveParticles() < 1200) {
+        ctx.vfx.bubbles(this.x, this.y + 1, this.z, 2, 2);
+      }
+      if (this.y < seaH - 2 || this.carrierCrashT > 60) {
+        this.group.visible = false; this.state = 'sinking'; this._despawned = true; this.sinkT = 0;
+      }
+      this.syncModel(); return;
+    }
     // v1.3.0 (J): taxiing jets ride the deck too.
     if (this.state === 'taxi') this.rideDeck();
-    // Damaged-jet FX
-    if (this.hp < 50 && Math.random() < dt * 10) {
-      ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 1.2, 0.15, 0.15, 0.15, 0.5);
+    // v1.5.0 Tier A — stall buffet (M2), wingtip vapour (R2), damage
+    // wobble + zone smoke/fire (R3), nav strobe + blob shadow (R6/R8).
+    // Airborne here = flying states; jet.state stays 'climb' through
+    // ingress/attack/egress/rtb/trap (the squadron owns those states),
+    // so 'climb' is the in-flight marker. Spin-out/crash/deck branches
+    // above already returned.
+    const airborne = this.state === 'climb';
+    if (airborne && !this.stalled) {
+      const spd = Math.hypot(this.vx, this.vy, this.vz);
+      // M2: 65-78 m/s buffet band — roll shake + white wingtip puffs
+      // every 0.2 s (Hurricane L6260-6276). Pure telegraphing.
+      if (spd >= JET_STALL_SPEED && spd < JET_RECOVER_SPEED) {
+        this.roll += Math.sin(ctx.time * 13 + this.id) * 0.25 * dt;
+        this.buffT -= dt;
+        if (this.buffT <= 0 && ctx.vfx.liveParticles() < 1200) {
+          this.buffT = 0.2;
+          for (const s of [-1, 1]) {
+            const w = this._wingtipWorld(s);
+            ctx.vfx.spawnParticle(w.x, w.y, w.z, -this.vx * 0.3, 0, -this.vz * 0.3, 0.4, 0.95, 0.95, 0.95, 0);
+          }
+        }
+      }
+      // R2: faint white wingtip vapour in high-G turns (|roll| > ~0.8)
+      // and in the dive (vy < -50). Short life, additive, low alpha —
+      // the physical effect at 15-1200 m (no contrails, R10).
+      // Cost: 2 particles / 0.2 s per jet, only while turning/diving.
+      if (Math.abs(this.roll) > 0.8 || this.vy < -50) {
+        this.vapT -= dt;
+        if (this.vapT <= 0 && ctx.vfx.liveParticles() < 1200) {
+          this.vapT = 0.2;
+          for (const s of [-1, 1]) {
+            const w = this._wingtipWorld(s);
+            ctx.vfx.spawnParticle(w.x, w.y, w.z, -this.vx * 0.5, 0.5, -this.vz * 0.5, 0.5, 0.9, 0.93, 0.95, 0);
+          }
+        }
+      }
+      // Damaged-jet wobble (Hurricane L6254-6263): instability roll.
+      if (this.hp < 50) this.roll += Math.sin(ctx.time * 7 + this.id * 2) * 0.15 * dt;
     }
-    if (this.hp < 25 && Math.random() < dt * 10) {
-      ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 1, 0, 0.6, 1, 0.5, 0.1, -0.5);
+    // R6: white tail strobe blinks on a 1 s cycle (visible 0.15 s);
+    // red/green stay steady. R8: blob shadow follows the ground below.
+    this._ensureNavLights();
+    if (this._navLights) this._navLights.strobe.visible = (ctx.time % 1) < 0.15;
+    this._ensureShadow(ctx);
+    this._updateShadow(ctx);
+    // v1.5.0 R3: damage smoke/fire from the WORST-HIT ZONE, streaming
+    // aft (dark smoke wing/fuselage, orange fire engine/fuel). Same
+    // emission rates as the pre-v1.5.0 centre emission — repositioned,
+    // not added. Guarded at liveParticles < 1200.
+    if (this.hp < 50 && Math.random() < dt * 10 && ctx.vfx.liveParticles() < 1200) {
+      let worst = 'fuselage', worstFrac = 1;
+      for (const k in this.zones) { const f = this.zones[k].hp / this.zones[k].max; if (f < worstFrac) { worstFrac = f; worst = k; } }
+      const zp = this._zoneWorld(worst);
+      ctx.vfx.spawnParticle(zp.x, zp.y, zp.z, -this.vx * 0.7, 1, -this.vz * 0.7, 1.2, 0.15, 0.15, 0.15, 0.5);
+    }
+    if (this.hp < 25 && Math.random() < dt * 10 && ctx.vfx.liveParticles() < 1200) {
+      const zp = this._zoneWorld(this.fire ? this.fire.zone : 'fuselage');
+      ctx.vfx.spawnParticle(zp.x, zp.y, zp.z, -this.vx * 0.7, 1, -this.vz * 0.7, 0.6, 1, 0.5, 0.1, -0.5);
     }
     this.syncModel();
   }
@@ -545,7 +937,7 @@ export class AirSquadron {
   get leader() { return this.jets[0]; }
   get wingman() { return this.jets[1]; }
   get homeCarrier() { return this.wing.carrier; }
-  get aliveJets() { return this.jets.filter(j => j.state !== 'crashed' && j.state !== 'sinking' && j.state !== 'spinout'); }
+  get aliveJets() { return this.jets.filter(j => !['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(j.state)); }
 
   launch(loadout, target, ctx) {
     if (this.state !== 'deckReady' && this.state !== 'launchQueued') return false;
@@ -561,7 +953,7 @@ export class AirSquadron {
     this.loadout = loadout; this.target = target;
     this.queuedLoadout = null; this.queuedTarget = null;
     this.state = 'catapult'; this.t = 0; this.diveT = 0; this.attackPhase = 'popup';
-    this.patT = 0; this.capHits = 0; this.interceptTarget = null;
+    this.patT = 0; this.capHits = 0; this.interceptTarget = null; this._m6Abort = false;
     if (loadout === 'cap' && ctx.cap) ctx.cap.launches++;
     // Reserve the catapult / climb-out for CATAPULT_CLEAR_S: no other
     // squadron of this wing launches until this flight is clear
@@ -589,6 +981,8 @@ export class AirSquadron {
       j.ordnance = loadout === 'cap' ? 0 : 2; // CAP jets carry no bombs — gun passes only
       j.capAmmo = loadout === 'cap' ? CAP_GUN_AMMO : 0; j.capGunT = 0; j.capBounceT = 0;
       j.hp = 100; j.fired = false; j.stalled = false;
+      j.yawDrift = 0; j._diveGain = 0; j._despawned = false;
+      j.slideCarrier = null; j.carrierCrashCarrier = null; j.carrierCrashLocal = null;
       // v1.3.0 (B): a fresh sortie starts with fresh zones — a jet that
       // trapped with damage is repaired on rearm; a refilled slot is a
       // new jet object with fresh zones already.
@@ -702,7 +1096,13 @@ export class AirSquadron {
       if (nd < CAP_BOUNCE_RANGE && (nearest.j.capBounceT || 0) <= 0) {
         nearest.j.capBounceT = 8;
         nearest.j.defensiveT = 1.5;
-        nearest.j.defSide = Math.random() < 0.5 ? 1 : -1;
+        // v1.5.0 M5: the bounce breaks INTO the closing CAP jet —
+        // bearing of the CAP jet from the attacker, same rule as the SAM
+        // break (Hurricane L6225), not a coin flip.
+        const cbx = cj.x - nearest.j.x, cbz = cj.z - nearest.j.z;
+        let cb = Math.atan2(cbx, -cbz) - nearest.j.heading;
+        cb = ((cb + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+        nearest.j.defSide = cb >= 0 ? 1 : -1; // CAP jet on the right -> break right, INTO it
       }
       if (cj.capGunT > 0 || (cj.capAmmo || 0) <= 0 || nd > CAP_GUN_RANGE) continue;
       cj.capGunT = CAP_GUN_REFRACTORY_S;
@@ -745,7 +1145,7 @@ export class AirSquadron {
     // v1.3.0 (B): a spinning-out jet is as dead as a crashed one for
     // sortie purposes — the wingman takes the lead, and a squadron with
     // no live jets aborts. Spin-out jets are never steered.
-    const _down = j => j.state === 'crashed' || j.state === 'sinking' || j.state === 'spinout';
+    const _down = j => ['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(j.state);
     if (_down(this.leader) &&
         ! _down(this.wingman)) {
       this.jets.reverse();
@@ -758,6 +1158,24 @@ export class AirSquadron {
     if (this.state !== 'deckReady' && this.state !== 'launchQueued' && this.state !== 'lost' && this.aliveJets.length === 0) {
       this.state = 'lost'; this.t = 0; this.target = null;
       if (ctx.msg) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} flight lost — all jets down (${this.wing.carrier.name})`);
+    }
+    // v1.5.0 M6: abort-when-crippled — a jet that loses ONE engine, or
+    // a fire it cannot put out (burning > 8 s, or intensity >= 0.7),
+    // leaves the attack and RTBs with ordnance un-delivered instead of
+    // flying the dive on a dead engine. (A lost wing or both engines is
+    // already a spin-out, so it never reaches this check.) Counted in
+    // cap.ordnanceDenied like the CAP aborts. Once per sortie.
+    if (!this._m6Abort && this.loadout !== 'cap' && (this.state === 'ingress' || this.state === 'attack')) {
+      const crippled = this.aliveJets.some(j =>
+        (j.zones.engineL.hp <= 0) !== (j.zones.engineR.hp <= 0) ||
+        (j.fire && (j.fire.t > 8 || j.fire.intensity >= 0.7)));
+      if (crippled) {
+        this._m6Abort = true;
+        const denied = this.aliveJets.reduce((a, j) => a + j.ordnance, 0);
+        this.state = 'egress'; this.t = 0;
+        if (ctx.cap) ctx.cap.ordnanceDenied += denied;
+        if (ctx.msg) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} flight aborted its strike — crippled jet RTBing (${denied} ordnance un-delivered)`);
+      }
     }
     const carrier = this.homeCarrier;
     const L = this.leader, W = this.wingman;
@@ -1048,17 +1466,28 @@ export class AirSquadron {
         const rtbIdx = this.wing.squadrons.indexOf(this);
         const latOff = (rtbIdx % 2 === 0 ? -1 : 1) * Math.ceil(rtbIdx / 2) * 220;
         const altOff = rtbIdx * 45;
+        // v1.5.0 M4: real carrier landing pattern (Hurricane L6856-6881),
+        // not four rectangular legs — downwind (port, opposite course,
+        // bow-side entry) -> base turn -> final on the angled deck.
+        // Legs are carrier-local (lx across, lz along, bow -lz — the
+        // same mapping as Hurricane's patPt): leg 0 downwind entry
+        // abeam the bow, leg 1 downwind abeam the stern, leg 2 base,
+        // leg 3 final. Altitudes are above the deck (Hurricane's are
+        // above the sea — helicarrier decks fly at ~350 m, so sea
+        // altitudes would put the pattern under the ship). Per-squadron
+        // latOff is halved here: the full +/-220 m would flip odd
+        // squadrons to the starboard side of the pattern.
         const legs = [
-          { lx: -500, lz: -150, alt: 120 }, { lx: -500, lz: 500, alt: 120 },
-          { lx: 150, lz: 600, alt: 100 }, { lx: -8, lz: 350, alt: 60 },
+          { lx: -190, lz: -60, alt: 45 }, { lx: -190, lz: 300, alt: 45 },
+          { lx: 30, lz: 360, alt: 40 }, { lx: -8, lz: 210, alt: 30 },
         ];
         const leg = legs[Math.min(this.patLeg, 3)];
-        const pt = carrier.deckPoint(leg.lx + latOff, leg.lz);
+        const pt = carrier.deckPoint(leg.lx + latOff * 0.5, leg.lz);
         pt.y = carrier.deckTopY() + leg.alt + altOff;
         steerJetTo(L, pt, 90, JET_CRUISE_SPEED, dt, { flight: true, seaH });
         this._formFly(W, L, dt, ctx, JET_CRUISE_SPEED, seaH);
         const dP = Math.hypot(pt.x - L.x, pt.y - L.y, pt.z - L.z);
-        if (dP < (this.patLeg === 2 ? 120 : 90)) this.patLeg++;
+        if (dP < (this.patLeg === 2 ? 90 : 70)) this.patLeg++;
         if (this.patLeg >= 3) {
           const dC = Math.hypot(carrier.x - L.x, carrier.z - L.z);
           if (dC < 700 && !this._trapBusy()) { this.state = 'trap'; this.t = 0; }
@@ -1068,7 +1497,20 @@ export class AirSquadron {
       }
       case 'trap': {
         this.t += dt;
-        if (!carrier || !carrier.alive) { this.state = 'divert'; this.t = 0; break; }
+        // v1.5.0 R5: no landing clearance on a sinking carrier — a
+        // flight on final crashes INTO the deck (Hurricane
+        // crashIntoCarrier) when the deck is still there, and diverts
+        // only when the carrier is fully gone. (handleCarrierFalling
+        // normally catches this first, from the carrier's own update;
+        // this is the belt-and-braces path for a carrier that dies
+        // without it.)
+        if (!carrier || !carrier.alive) {
+          if (carrier && carrier.state !== 'gone') {
+            this.aliveJets.forEach(j => j.crashIntoCarrier(carrier, ctx));
+            this.state = 'lost'; this.t = 0; this.target = null;
+          } else { this.state = 'divert'; this.t = 0; }
+          break;
+        }
         // 5.7 deg glide slope, 300 m behind the carrier.
         const back = carrier.deckPoint(0, 300);
         back.y = carrier.deckTopY() + 30;
@@ -1162,10 +1604,17 @@ export class AirSquadron {
     const fx = Math.sin(leader.heading), fz = -Math.cos(leader.heading);
     const rx = Math.cos(leader.heading), rz = Math.sin(leader.heading);
     const o = wingman.formOffset;
+    // v1.5.0 M3 (Hurricane setFormationAim L7019-7050): echelon
+    // step-down — wingman 3 m below the leader, out of the wake — and
+    // trail-in-turn: when the leader rolls hard (|roll| > 0.5) the
+    // wingman falls to trail (0 right, -30 behind) instead of cutting
+    // the corner across the leader's nose. Formation states only.
+    const trail = Math.abs(leader.roll || 0) > 0.5;
+    const ox = trail ? 0 : o.x, oz = trail ? -30 : o.z;
     const aim = {
-      x: leader.x + rx * o.x + fx * o.z,
-      y: leader.y,
-      z: leader.z + rz * o.x + fz * o.z,
+      x: leader.x + rx * ox + fx * oz,
+      y: leader.y - 3,
+      z: leader.z + rz * ox + fz * oz,
     };
     // Formation separation: the slot swings around the leader whenever
     // the leader turns, and a wingman chasing it can cut the corner
@@ -1185,7 +1634,23 @@ export class AirSquadron {
       aim.z = wingman.z + uz * push;
     }
     wingman.turnSide = leader.turnSide;
-    steerJetTo(wingman, aim, 60, speed, dt, { flight: true, seaH });
+    // v1.5.0 M3: wingman formation speed cap (Hurricane L5737/L7045):
+    // leader speed + a closure margin that shrinks to zero as the
+    // wingman reaches its slot, so it can close a launch gap but never
+    // outruns the leader into a mid-air. Formation states only
+    // (climb/ingress/egress/rtb/patrol/intercept); cleared in dive/trap
+    // where the wingman flies its own aim / the glide slope. The 60 m
+    // push-away above stays as the last-resort guard.
+    let flySpeed = speed;
+    const _form = ['climb', 'ingress', 'egress', 'rtb', 'patrol', 'intercept'].includes(this.state);
+    if (_form) {
+      const dSlot = Math.hypot(aim.x - wingman.x, aim.y - wingman.y, aim.z - wingman.z);
+      wingman.formCap = leader.speed + Math.min(10, Math.max(0, (dSlot - 15) * 0.25));
+      flySpeed = Math.min(speed, wingman.formCap);
+    } else {
+      wingman.formCap = undefined;
+    }
+    steerJetTo(wingman, aim, 60, flySpeed, dt, { flight: true, seaH });
     wingman.state = leader.state;
   }
 }
@@ -1276,13 +1741,27 @@ export class AirWing {
   handleCarrierFalling(ctx) {
     for (const s of this.squadrons) {
       if (['deckReady', 'rearm', 'taxi', 'catapult', 'launchQueued'].includes(s.state)) {
-        // Jets on the deck go down with the ship — through crash(), so
-        // the loss is counted in remaining and announced like any other
-        // jet loss, not silently dropped.
-        s.jets.forEach(j => { if (j.state !== 'crashed' && j.state !== 'sinking') { j.crash('lost with ' + this.carrier.name, ctx); j.vy = -5; j.vx = 0; j.vz = 0; } });
+        // v1.5.0 R5 (Part 1 handoff): jets on the deck go down with the
+        // ship — but they SLIDE off the tilting deck (Hurricane
+        // startSlideOff) instead of crash()ing in place, when they
+        // actually have a deck position (deckLocal). Parked jets that
+        // were never placed (fresh deckReady at round start) have no
+        // deck position to slide from; they still crash() in place,
+        // counted and announced as before.
+        s.jets.forEach(j => {
+          if (['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(j.state)) return;
+          if (j.deckLocal) j.startSlideOff(this.carrier, ctx);
+          else { j.crash('lost with ' + this.carrier.name, ctx); j.vy = -5; j.vx = 0; j.vz = 0; }
+        });
         s.state = 'deckReady';
         s.queuedLoadout = null; s.queuedTarget = null;
-      } else if (['rtb', 'trap'].includes(s.state)) {
+      } else if (s.state === 'trap') {
+        // v1.5.0 R5: a flight on final to a sinking deck does NOT trap
+        // — it crashes INTO the deck and rides the wreck down
+        // (Hurricane crashIntoCarrier).
+        s.jets.forEach(j => { if (!['crashed', 'sinking', 'spinout', 'slideoff', 'carrierCrash'].includes(j.state)) j.crashIntoCarrier(this.carrier, ctx); });
+        s.state = 'lost'; s.t = 0; s.target = null;
+      } else if (s.state === 'rtb') {
         s.state = 'divert'; s.t = 0;
       }
     }

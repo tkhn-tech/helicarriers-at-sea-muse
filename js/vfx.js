@@ -7,6 +7,40 @@
 //   P_MAX = 1600 particles, S_MAX = 420 sprites.
 // Both pools still round-robin and can steal the oldest live entry when
 // full — callers must never assume a spawn survives.
+//
+// v1.5.0 worst-case budget (live counts = emission rate x life; all new
+// emitters are pool-guarded — see the guards in carrier.js and below):
+//   detonation magazineSecondary + hitFX (pre-existing peak) ~900-1100 P / ~30 S
+//   D7 pulverisation burst (1 segment, capped)                ~100 P / 8 S
+//   D10 slam sheet (1 impact)                                  ~60 P / 3 S
+//   D11 cook-offs (8 max, staggered, ~25 P + 2 S each, life ~1 s) ~50 P / 6 S live
+//   cut-face venting (6 pieces x 2 faces, 0.5 s cadence)        ~60 P / 12 S
+//   shedding sparks (~10/s/piece)                               ~60 P
+//   travelling deck fire (4 fires, 0.15 s cadence)             ~100 P / 8 S
+//   burning slick (1 field, 6/s)                                ~12 P
+//   downwash spray (pre-existing, guarded)                     ~100 P / 32 S
+//   TOTAL worst live (build-time estimate)                 ~1450 P / ~100 S
+// MEASURED v1.5.0 probes (2026-11-26): the particle estimate
+// holds — liveP sits at the 1600 cap during multi-breakup action
+// — but the sprite estimate was ~4x too low. liveS reached 415/420
+// (longitudinal + crippled pages) and 399-412 on slam/crippled
+// snapshots. The big sprite consumers are the long-lived smoke
+// sprites (2.5-4 s life): cut-face venting on every piece, piece
+// smoke trails, fire/hurt smoke, sinking smoke, downwash. The new
+// v1.5.0 emitters are all guarded at liveSprites() < 300 /
+// liveParticles() < 1200, but several pre-existing emitters
+// (detonation/hit smoke, fire smoke, sinking smoke, splash rings)
+// spawn unguarded, so the pool still saturates when several kills
+// overlap. That is graceful, not a crash: spawnSprite() is a ring
+// cursor that recycles the oldest sprite, and no probe run showed
+// an error or a failed request. During saturation, the newest
+// effects (slam sheet, cook-off) can be throttled or steal an old
+// smoke sprite — accepted for v1.5.0; raising S_MAX or guarding the
+// pre-existing smoke emitters is a follow-up, not a blocker.
+// The slam sheet (D10) and pulverisation burst (D7) are budgeted FIRST
+// as the largest new consumers; every new emitter checks liveParticles()
+// < 1200 / liveSprites() < 300 before emitting and halves or skips under
+// pressure, so the pools can never be blown out by one kill.
 import * as THREE from 'three';
 
 export const P_MAX = 1600;
@@ -149,6 +183,68 @@ export class VFX {
     this.spawnSprite(x, y + 4 * k, z, 1.6, 30 * k, 30 * k, 2.5, 0xffffff, 0.8);
     this.spawnSprite(x, y + 2, z, 3.0, 45 * k, 12 * k, 1.2, 0xbfe3f0, 0.5);
     this.shake = Math.min(18, this.shake + 4 * k);
+  }
+  // v1.5.0 D10 slamming shatter: the impact is a hammer blow, then a
+  // vibration. A white slam ring races outward from the contact point
+  // and a spray SHEET is thrown up along the hull side (not just a
+  // splash — a sheet). Budgeted first with the D7 burst: ~60 particles
+  // + 3 sprites, pool-guarded (skipped entirely under pool pressure).
+  // (x, z) = impact point, heading = hull heading, len = hull length
+  // in the water, side = +1/-1 (which side the sheet climbs) or 0 for both.
+  slamSheet(x, y, z, heading, len, side = 0) {
+    if (this.liveParticles() > 1200 || this.liveSprites() > 300) return;
+    const fx = Math.sin(heading), fz = -Math.cos(heading);
+    const rx = Math.cos(heading), rz = Math.sin(heading);
+    // Slam ring: a wide flat white sprite racing outward (grow 6/s).
+    const ring = this.spawnSprite(x, y + 1, z, 2.2, 30, 30, 6, 0xffffff, 0.7);
+    ring.vx = 0; ring.vz = 0;
+    const ring2 = this.spawnSprite(x, y + 0.5, z, 3.0, 60, 60, 2, 0xbfe3f0, 0.4);
+    ring2.vx = 0; ring2.vz = 0;
+    // Spray sheet: particles thrown up along BOTH hull sides (or one
+    // side when the entry is a side entry), densest near the impact
+    // point, falling off along the hull — a wall of water climbing the
+    // steel, not a radial plume.
+    const sides = side === 0 ? [1, -1] : [side];
+    for (let i = 0; i < 60; i++) {
+      const s = sides[i % sides.length];
+      const along = (Math.random() * 2 - 1) * len * 0.5;
+      const px = x + fx * along + rx * s * 34;
+      const pz = z + fz * along + rz * s * 34;
+      const w = 1 - Math.abs(along) / (len * 0.5); // densest at impact
+      this.spawnParticle(px, y + Math.random() * 2, pz,
+        rx * s * (4 + Math.random() * 6), (10 + Math.random() * 16) * (0.4 + 0.6 * w),
+        rz * s * (4 + Math.random() * 6),
+        0.9 + Math.random() * 0.7, 0.85, 0.95, 1, -9.81);
+    }
+    this.spawnSprite(x, y + 6, z, 1.8, 50, 18, 2, 0xd8ecf2, 0.55);
+    this.shake = Math.min(18, this.shake + 6);
+  }
+  // v1.5.0 D11 cook-off: one round cooking off — a small sharp burst
+  // with its own fireball sprite, visual/audio only, no damage.
+  // Pool-guarded like everything else in v1.5.0.
+  cookoffBurst(x, y, z, size = 1) {
+    if (this.liveParticles() > 1200) return;
+    this.burst(x, y, z, Math.round(18 * size), [1, 0.55, 0.15], 9, 5);
+    this.spawnSprite(x, y, z, 0.4, 12 * size, 12 * size, 3, 0xff8c2e, 0.9);
+    this.boomLight.position.set(x, y, z);
+    this.boomLight.intensity = 4 + 4 * size;
+  }
+  // v1.5.0 D12/D14: a few orange flame particles at the water surface
+  // (burning slick) or a bubble/debris burst at depth (implosion).
+  // Both are small, pool-guarded, and short-lived.
+  slickFlame(x, y, z, n = 6) {
+    if (this.liveParticles() > 1200) return;
+    for (let i = 0; i < n; i++) {
+      this.spawnParticle(x + (Math.random() - 0.5) * 20, y + 1 + Math.random() * 2, z + (Math.random() - 0.5) * 20,
+        (Math.random() - 0.5) * 2, 2 + Math.random() * 3, (Math.random() - 0.5) * 2,
+        0.7 + Math.random() * 0.6, 1, 0.55, 0.15, 1.5);
+    }
+  }
+  implosionBurst(x, y, z) {
+    if (this.liveParticles() > 1200) return;
+    this.bubbles(x, y, z, 60, 30);
+    this.burst(x, y, z, 20, [0.5, 0.55, 0.6], 4, 2);
+    this.spawnSprite(x, y + 2, z, 2.0, 40, 40, 1.5, 0xd8ecf2, 0.5);
   }
   bubbles(x, y, z, n, spread) {
     for (let i = 0; i < n; i++) {

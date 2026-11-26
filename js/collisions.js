@@ -116,7 +116,7 @@ function effVel(c) {
 }
 
 function isSolid(c) {
-  return c.state === 'alive' || c.state === 'falling' || (c.state === 'sinking' && c.sinkT < 1);
+  return c.state === 'alive' || c.state === 'falling' || c.state === 'capsizing' || (c.state === 'sinking' && c.sinkT < 1);
 }
 
 function logCollision(G, entry) {
@@ -171,9 +171,15 @@ const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3();
 function pieceBody(p) {
   const g = p.group;
   g.updateWorldMatrix(true, false);
-  _v1.set(0, 0, -p.segCentre).applyMatrix4(g.matrixWorld);
+  // v1.5.0: assembly pieces (D4/D5 island/pod, D3 strips, D7 remnants)
+  // and longitudinal halves (D2) carry their own centre offset in
+  // group-local space — an island's centre is its own origin, a
+  // half-hull's centre is at ±21 m local x. Transverse pieces keep the
+  // segment-centre convention (0, 0, -segCentre).
+  const cl = p.centreLocal || { x: 0, y: 0, z: 0 };
+  _v1.set(cl.x, cl.y, -p.segCentre + (cl.z || 0)).applyMatrix4(g.matrixWorld);
   const cx = _v1.x, cy = _v1.y, cz = _v1.z;
-  _v2.set(0, 0, -p.segCentre - 10).applyMatrix4(g.matrixWorld);
+  _v2.set(cl.x, cl.y, -p.segCentre - 10 + (cl.z || 0)).applyMatrix4(g.matrixWorld);
   let fx = _v2.x - cx, fz = _v2.z - cz;
   const fl = Math.hypot(fx, fz);
   if (fl < 0.01) { // near-vertical piece: no horizontal forward — use heading
@@ -191,6 +197,12 @@ function pieceBody(p) {
   // rises ~14 m above the deck line, so a piece containing it is that
   // much taller. Without it an island piece could clip a deck above it.
   if (p.segLo !== undefined && p.segLo <= -47 && p.segHi >= -98) halfH += 14;
+  // v1.5.0: assembly pieces carry small proxies (~30 m sphere/capsule
+  // scale) instead of the 42 m half-beam of a hull section, and
+  // longitudinal halves are 21 m half-beam — the always-solid rule
+  // must hold for the new piece shapes, so the proxy matches the piece.
+  const halfBeam = p.halfBeamOverride || PIECE_HALF_BEAM;
+  if (p.halfHOverride) halfH = p.halfHOverride;
   // Sinking pieces sink at a fixed rate from sinkT (carrier.js derives y
   // from sinkT, it does not integrate a vy) — recover it analytically.
   // v1.4.0: sinkDur is size-scaled (audit F11), so the analytic vy uses
@@ -198,11 +210,15 @@ function pieceBody(p) {
   const vy = p.state === 'sinking'
     ? -2 * Math.min(1, p.sinkT || 0) * 55 / (p.sinkDur || 30)
     : p.vy;
-  const mass = Math.max(1.5, Math.min(CARRIER_MASS, CARRIER_MASS * (p.segLen || 60) / CARRIER_LEN));
+  // v1.5.0: piece mass from massFrac when set (assemblies and halves),
+  // else ∝ segLen as before.
+  const mass = p.massFrac !== null && p.massFrac !== undefined
+    ? Math.max(1.5, CARRIER_MASS * p.massFrac)
+    : Math.max(1.5, Math.min(CARRIER_MASS, CARRIER_MASS * (p.segLen || 60) / CARRIER_LEN));
   return {
     kind: 'piece', ref: p, id: 'p' + p.id, name: (p.carrierName || 'carrier') + ' piece',
     x: cx, z: cz, y: cy, fx, fz, rx: -fz, rz: fx,
-    halfLen, halfBeam: PIECE_HALF_BEAM, halfH,
+    halfLen, halfBeam, halfH,
     vel: { x: p.vx || 0, z: p.vz || 0, y: vy || 0 },
     invMass: 1 / mass, alive: false, state: p.state,
     segLen: p.segLen || 60, mass,

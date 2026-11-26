@@ -131,6 +131,21 @@ export class WreckageField {
       this.group.add(m);
       this.slickPool.push(m);
     }
+    // v1.5.0 D12: burning slicks get an orange emissive-edge ring —
+    // one preallocated ring per slick slot, so a burning field costs
+    // no new GPU resources either.
+    this.ringGeo = new THREE.RingGeometry(0.86, 1, 40);
+    this.ringPool = [];
+    for (let i = 0; i < WRECK_MAX_SLICKS; i++) {
+      const mat = new THREE.MeshBasicMaterial({ color: 0xff6a1e, transparent: true, opacity: 0.8, depthWrite: false, side: THREE.DoubleSide });
+      const m = new THREE.Mesh(this.ringGeo, mat);
+      m.rotation.x = -Math.PI / 2;
+      m.renderOrder = 2;
+      m.visible = false;
+      m.userData.wreck = null;
+      this.group.add(m);
+      this.ringPool.push(m);
+    }
     this.fields = []; // {name, born, chunks:[rec], slick, x, z, heading, r0}
     this.spawned = 0; // lifetime count (probes / dbgInfo)
   }
@@ -155,6 +170,7 @@ export class WreckageField {
     if (!f) return false;
     for (const rec of f.chunks) { rec.mesh.visible = false; rec.mesh.userData.wreck = null; }
     if (f.slick) { f.slick.visible = false; f.slick.userData.wreck = null; }
+    if (f.ring) { f.ring.visible = false; f.ring.userData.wreck = null; }
     return true;
   }
   // Spawn one wreck field. opts: {name, heading, along (field half-length
@@ -179,7 +195,10 @@ export class WreckageField {
     const rx = Math.cos(heading), rz = Math.sin(heading);
     const field = {
       name: opts.name || 'wreck', born: opts.born !== undefined ? opts.born : 0,
-      chunks: [], slick: null, x, z, heading, r0: opts.slickR0 || 45,
+      chunks: [], slick: null, ring: null, x, z, heading, r0: opts.slickR0 || 45,
+      burning: !!opts.burning, // v1.5.0 D12: burning slick — orange
+      // emissive edge + flames on the water for the first minute, then
+      // the fuel burns out and the slick stays as oil.
     };
     for (let i = 0; i < n; i++) {
       const mesh = this._allocChunk();
@@ -223,11 +242,23 @@ export class WreckageField {
       slick.userData.wreck = field;
       field.slick = slick;
     }
+    // v1.5.0 D12: a burning slick gets its orange edge ring, sized to
+    // the slick, riding just above it.
+    if (field.burning) {
+      const ring = this.ringPool.find(m => !m.visible);
+      if (ring) {
+        ring.position.set(x, 0.35, z);
+        ring.scale.set(field.r0, field.r0, 1);
+        ring.visible = true;
+        ring.userData.wreck = field;
+        field.ring = ring;
+      }
+    }
     this.fields.push(field);
     this.spawned++;
     return field;
   }
-  update(dt, time) {
+  update(dt, time, vfx) {
     if (!this.fields.length || dt <= 0) return;
     // Throttle: stepSim substeps (up to 16/frame at timescale 8) must
     // not each pay the wave-field cost — update at most every 0.1 s
@@ -253,6 +284,23 @@ export class WreckageField {
         f.slick.position.x += cur.x * 0.6 * dt;
         f.slick.position.z += cur.z * 0.6 * dt;
         f.x = f.slick.position.x; f.z = f.slick.position.z;
+      }
+      // v1.5.0 D12: the burning ring rides the slick's edge and fades
+      // as the fuel burns out (gone after ~60 s); while it burns, the
+      // slick throws orange flame particles — pool-guarded, ~6/s.
+      if (f.ring && f.ring.visible) {
+        const r = f.slick ? f.slick.scale.x : f.r0;
+        f.ring.position.set(f.x, (f.slick ? f.slick.position.y : 0.3) + 0.05, f.z);
+        f.ring.scale.set(r, r, 1);
+        f.ring.material.opacity = Math.max(0, 0.8 - age / 75);
+        if (age > 60) { f.ring.visible = false; f.ring.userData.wreck = null; f.ring = null; f.burning = false; }
+        else if (vfx) {
+          f._flameAcc = (f._flameAcc || 0) + dt;
+          if (f._flameAcc >= 0.5) {
+            f._flameAcc = 0;
+            vfx.slickFlame(f.x, f.slick ? f.slick.position.y : 0.3, f.z, 6);
+          }
+        }
       }
       let sx = 0, sz = 0;
       for (const rec of f.chunks) {
@@ -297,6 +345,7 @@ export class WreckageField {
     for (const f of this.fields) {
       for (const rec of f.chunks) { rec.mesh.visible = false; rec.mesh.userData.wreck = null; }
       if (f.slick) { f.slick.visible = false; f.slick.userData.wreck = null; }
+      if (f.ring) { f.ring.visible = false; f.ring.userData.wreck = null; }
     }
     this.fields.length = 0;
   }
@@ -309,7 +358,7 @@ export class WreckageField {
       caps: { chunks: WRECK_MAX_CHUNKS, slicks: WRECK_MAX_SLICKS, fields: WRECK_MAX_FIELDS },
       list: this.fields.map(f => ({
         name: f.name, age: time !== undefined ? +(time - f.born).toFixed(1) : null,
-        chunks: f.chunks.length, slick: !!f.slick,
+        chunks: f.chunks.length, slick: !!f.slick, burning: !!f.burning,
         slickR: f.slick ? +f.slick.scale.x.toFixed(1) : 0,
         cx: f.cx !== undefined ? +f.cx.toFixed(1) : +f.x.toFixed(1),
         cz: f.cz !== undefined ? +f.cz.toFixed(1) : +f.z.toFixed(1),

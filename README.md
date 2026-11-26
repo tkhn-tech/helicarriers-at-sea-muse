@@ -1,10 +1,105 @@
-# Helicarriers at Sea — v1.4.2
+# Helicarriers at Sea — v1.5.0
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
 home. **Jets strike only in v1 — no dogfighting.** v1.4.0 adds defensive
 CAP gun passes against inbound strikes (see below) — interception,
 not dogfighting.
+
+v1.5.0: destruction detail and realism (research in
+`../goals/helicarriers-at-sea-game/hidden_files/v15-destruction-research.md`).
+Ships no longer break only in clean slices across the width — each kill picks
+one destruction mode (seeded per carrier per round; damage amounts and gates
+unchanged):
+- **D1 diagonal tear** — one rotated clip plane (20–40°); wedge pieces
+  sliding past each other, with a parallelogram-section cap matching the
+  diagonal cut (never a rotated transverse cap).
+- **D6 asymmetric breakup** — cuts cluster on the hit side: one clean end
+  (a long piece that falls level and sinks nearly whole) and a shredded end
+  (3–4 ragged pieces + debris cloud).
+- **D2 longitudinal deck split** — the deck unzips along the centreline
+  trench; the hull parts into side-by-side halves (port full-length,
+  starboard split transversely at the hit), each with a side-profile cap
+  (new geometry, not a transverse cap); the capsule push-apart handles
+  lateral separation.
+- **D9 crippled-flight shedding** — she keeps flying crippled after the
+  kill (lift decaying over ~14 s), shedding pieces in order along her flight
+  path (pod segments first, then island, then hull), sorted by ballistic
+  coefficient; the largest segment is the core and falls afterwards,
+  clipped to its own range.
+- **D7 mid-section pulverisation** — rule (predictable from the kill, never
+  random): a segment pulverises iff the kill is a detonation, the segment
+  contains the detonation point, and energy ≥ 3.0 — or energy ≥ 4.5 and it
+  is the centre segment. The segment becomes a debris burst + 2–4 large
+  remnants; bow and stern are left with a debris-filled gap.
+- **D8 progressive flooding capsize** — a structural/fire kill on a badly
+  flooded hull (hpFrac ≤ 0.35) may die WITHOUT breaking up: list grows in
+  steps 10° → 20° → 32° tied to flooding events, then she rolls to 90° and
+  sinks on her side, intact.
+- **D10 slamming shatter on water entry** — entry-angle branches on the
+  impact frag ladder: nose-down → bow crumple (extra bow cut); flat →
+  whole-bottom slam + whipping flex (bigger hinge oscillation ~1 s) +
+  midship secondary fracture; side → roll trip + diagonal tear. White slam
+  ring racing outward + spray sheet up the hull side.
+- **D4 island shear-off + D5 pod tear-off** — detachable assemblies as
+  their own tumbling rigid bodies with small collision proxies (island
+  ~12 m half-beam, pod ~19 m); the pod's rotor keeps spinning while
+  attached to the piece, decaying over ~6 s; the list jumps toward the
+  dead side at the tear moment.
+- **D3 deck buckling + peel strips** — the deck ripples/creases over a
+  30–60 m length before separation, then long strips peel back and curl,
+  exposing fire below, and become light draggy debris at the first tear.
+- **D11 cook-off chain with real clocks** — one blast at a time along the
+  magazine; real clocks are 94 s (thin-cased, Forrestal) to 8–10 min
+  (thick-cased Mk 83), COMPRESSED to 0.5–30 s for playability (say so in
+  code comments and here). Cook-offs past the breakup transfer onto the
+  pieces and fire there, including post-splashdown from a burning wreck.
+  Visual/audio only, as always.
+- **D12 fuel fire on water + travelling deck fire** — deck fires travel
+  as a front at 5–10 m/s leaving scorch behind; a burning wreck leaves a
+  burning slick (orange emissive edge, flames for the first minute) on
+  the sea.
+- **D13 true hull flex** — prototype on ONE kill path, the structural
+  kill: the hull mesh is split into 2 rigid segments joined at the hinge
+  before separation (segments rotate ±hinge/2 relative to each other),
+  chosen over a vertex-shader bend, which fights the clip-plane system.
+- **D14 implosion at depth** — a sinking piece/carrier below 25 m shows
+  a late underwater bubble/debris burst as an air pocket collapses
+  (Derbyshire voids collapsed at 25–100 m).
+- **Pre-breakup damage detail (§6)** — fires travel along the deck as a
+  front; smoke trails behind the ship's motion and vents from the low
+  side when listing (dark oily for fuel/ordnance, white steam for the
+  reactor); list/trim grow in steps tied to events (pod lost +3°,
+  magazine/engines flood +5°, hatch fails +8°); dead bridge kills the
+  island lights; attached-but-unpowered pods windmill in freefall.
+- **Freefall breakup (§3)** — aerodynamic load (growing with v²) finishes
+  weakened damage: a dead pod or the island can tear off in the fall;
+  long flat pieces rock with growing amplitude before shedding debris.
+- **Sinking (§4.2–4.3)** — list grows in flood steps, trim is bow-first,
+  bubbles/boil increase as trapped air is forced out then stop when full.
+- **Piece-fall physics re-derived** against the corrected v1.4.2 fall
+  model (a = −9.81·(1−liftThrust) − k·vy·|vy|, Cd=1.0, planform 333×68,
+  vt=291 m/s) — NOT the old v1.4.1 τ=2.5 s chase and NOT the v14 §4.3
+  piece vt formula (36/54 m/s) as written. A uniform-density hull section
+  keeps vt 291 m/s; light draggy pieces fall slower by 1/√dragK (pod 206,
+  island 168, deck strip 119, pulverised debris 75–92 m/s).
+- **VFX pool budget** still binds (1600 particles / 420 sprites): the
+  slam sheet (D10) and pulverisation burst (D7) are budgeted first and
+  every new emitter is pool-guarded. MEASURED (26 Nov 2026 probes): the
+  particle estimate held (liveP hits the 1600 cap during multi-breakup
+  action) but the sprite estimate was ~4× too low — liveS reached
+  415/420 (long-lived smoke sprites: cut-face venting, piece trails,
+  fire/hurt smoke, sinking smoke). The pools saturate gracefully
+  (spawnSprite recycles the oldest entry; no errors), but during
+  saturation new effects can be throttled — raising S_MAX or guarding
+  the pre-existing smoke emitters is a follow-up, not a blocker.
+- **Probe-found fixes (26 Nov 2026, verified by re-probe)** — a tear-off
+  scheduled past the last release never fired (clamped into the breakup
+  window); the D9 crippled core's breakup record was wiped by startFall
+  (no longer cleared); a water-impact breakup sea-released on the first
+  frame so the D10 whipping flex never showed (hingeMaxDeg measured 0 —
+  the sea release now holds ~1 s on water kills; re-measured hingeMax
+  3.3°, duration 1.0 s on a flat shatter).
 
 v1.4.2: the in-game toast/event messages are removed entirely (the
 `#msg` element, its CSS and its show/hide logic are gone; `msg()` in

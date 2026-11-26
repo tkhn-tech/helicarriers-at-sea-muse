@@ -2345,7 +2345,8 @@ function stepSim(dt) {
       G.audio.rotor(meanSpin);
     }
     // v1.4.0 (item 6): wreckage drifts/spreads/bobs with game time.
-    if (G.wreckage) G.wreckage.update(dt, G.time);
+    // v1.5.0 D12: pass the VFX pool so burning slicks can throw flames.
+    if (G.wreckage) G.wreckage.update(dt, G.time, G.vfx);
     checkEnd(); // every frame: a breakup's pieces take ~40 s of game time to sink
   }
   // v1.4.0 (item 7): flush queued kill/loss buzzes after checkEnd()

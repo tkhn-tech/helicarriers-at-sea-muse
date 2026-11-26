@@ -251,9 +251,16 @@ export class AirDefenseSystem {
     // SAM-evasion trigger: the targeted jet breaks 90 deg for ~2.5 s at
     // steep bank and dumps flares (Hurricane v11.45 F5). The SAM itself
     // checks the flare decoy in flight.
+    // v1.5.0 M5: the break side comes from the SAM's ACTUAL bearing
+    // (Hurricane L6225) — break INTO the incoming missile — not a
+    // coin flip. The SAM spawns at the firing carrier, so its bearing
+    // at trigger time is the carrier's bearing from the jet.
     if (tgt.damageZone && tgt.defensiveT <= 0) {
       tgt.defensiveT = 2.5;
-      tgt.defSide = Math.random() < 0.5 ? 1 : -1;
+      const sbx = sam.x - tgt.x, sbz = sam.z - tgt.z;
+      let db = Math.atan2(sbx, -sbz) - tgt.heading;
+      db = ((db + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+      tgt.defSide = db >= 0 ? 1 : -1; // threat on the right -> break right, INTO it (Hurricane L6225)
       tgt.dumpFlares(ctx);
     }
   }
