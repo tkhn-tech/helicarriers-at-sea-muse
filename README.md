@@ -1,10 +1,18 @@
-# Helicarriers at Sea — v1.5.0
+# Helicarriers at Sea — v1.6.0
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
 home. **Jets strike only in v1 — no dogfighting.** v1.4.0 adds defensive
 CAP gun passes against inbound strikes (see below) — interception,
 not dogfighting.
+
+v1.6.0: performance, fragment solidity/buoyancy/persistence, INDV/ANCHOR steering, camera no-hop, seabed wrecks, damage-shake retune, duplicates fix.
+- **Performance** — program pre-warm (shader compiles front-loaded at boot), VFX sprites batched to a single Points draw, sea on a wave table with analytic normals, cheap JS wins, breakup spread over frames. Whole-run work −44% vs v1.5.0 in the headless harness (phone calm ~12–14 ms, kill phases improved).
+- **Fragments stay solid** — carriers and fragments never phase through each other; pieces settle, float and sink per buoyancy physics and rest on the seabed (`rested`) instead of despawning; no part of a ship ever just disappears. The one vanish-probe flag on the final tree was a same-frame core held-piece swap to the clipped intact group, proven seamless per-frame.
+- **INDV/ANCHOR steering** — in INDV non-selected ships continue in their previous state; in ANCHOR the command ship holds while control inputs steer the rest of the fleet; the waypoint now clears off the nearest driven ship.
+- **Camera no-hop** — destroying the selected ship no longer moves the camera; it stays on the wreck as it falls and sinks until Tab/tap switches manually.
+- **Damage shake retune** — a bomb hit now heels the 120,000 t carrier ~0.46 deg (was 5.7 deg) with matching smaller yaw, shove and camera shake; damage amounts unchanged.
+- **Duplicates fix** — fragmentation no longer shows duplicate copies of the ship (all 8 kill types verified: invariants A1–A5 = 0, A6 = 1).
 
 v1.5.0: destruction detail and realism (research in
 `../goals/helicarriers-at-sea-game/hidden_files/v15-destruction-research.md`).

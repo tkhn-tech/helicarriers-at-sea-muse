@@ -29,18 +29,10 @@
 //     the debug panel before trusting the dive.
 import * as THREE from 'three';
 
-// v1.5.0 R6/R8: one shared soft radial texture for the nav-light and
-// blob-shadow sprites (own sprites, not the VFX pool — see _ensureNavLights).
-const NAV_TEX = (() => {
-  const c = document.createElement('canvas'); c.width = c.height = 64;
-  const g = c.getContext('2d');
-  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
-  grad.addColorStop(0, 'rgba(255,255,255,1)');
-  grad.addColorStop(0.4, 'rgba(255,255,255,0.5)');
-  grad.addColorStop(1, 'rgba(255,255,255,0)');
-  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
-  return new THREE.CanvasTexture(c);
-})();
+// v1.6.0 perf: nav lights / blob shadows moved into the VFX external
+// sprite batch (see _ensureNavLights) — NAV_TEX (pixel-identical to
+// the VFX softTex) is gone with the per-jet sprites.
+const _navV = new THREE.Vector3(); // nav-light local->world scratch
 
 export const JET_CRUISE_SPEED = 140;
 export const JET_ATTACK_SPEED = 170;
@@ -255,7 +247,7 @@ export class AirBomb {
     this.vy -= 9.81 * dt; // AirBomb ballistics: g = 9.81 (Hurricane used 15 in game units)
     this.x += this.vx * dt; this.y += this.vy * dt; this.z += this.vz * dt;
     const tgt = this.target;
-    if (!tgt || tgt.state === 'gone') { this.alive = false; return; }
+    if (!tgt || tgt.state === 'gone' || tgt.state === 'rested') { this.alive = false; return; } // v1.6.0 Item 2: a floor wreck is dead too
     const deckY = tgt.deckTopY();
     const l0 = tgt.localFromWorld(this.x, this.z);
     // Only resolve a deck hit while the bomb is over/near the deck
@@ -301,7 +293,7 @@ export class AntiShipMissile {
     if (!this.alive) return;
     this.t += dt;
     const tgt = this.target;
-    if (!tgt || tgt.state === 'gone') { this.alive = false; return; }
+    if (!tgt || tgt.state === 'gone' || tgt.state === 'rested') { this.alive = false; return; } // v1.6.0 Item 2: a floor wreck is dead too
     // Lead 0.5 s, aim point recomputed every frame on the target's
     // CURRENT heading (the ASM aim logic was sound in Hurricane — keep it).
     const fx = Math.sin(tgt.heading), fz = -Math.cos(tgt.heading);
@@ -512,13 +504,17 @@ export class FighterJet {
   // group (shared materials), NOT the VFX pool: cost 0 pool sprites,
   // 0 pool particles, 3 draw calls per jet. Chosen over pool sprites
   // because liveS already hits 415/420 in kills.
-  _ensureNavLights() {
-    if (this._navLights) return;
+  // v1.6.0 perf: the lights are now slots in the VFX external sprite
+  // batch (ONE Points draw call for all jets' lights + shadows, same
+  // soft texture — NAV_TEX was pixel-identical to the VFX softTex).
+  // Positions/sizes/colours are unchanged; the per-frame write runs
+  // after syncModel so localToWorld uses the fresh group transform.
+  _ensureNavLights(ctx) {
+    if (this._navLights || !ctx || !ctx.vfx || !ctx.vfx.allocExt) return;
+    const v = ctx.vfx;
     const mk = (color, x, y, z, s) => {
-      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: NAV_TEX, color, transparent: true, opacity: 0.9, depthWrite: false }));
-      sp.position.set(x, y, z); sp.scale.set(s, s, 1);
-      this.group.add(sp);
-      return sp;
+      const slot = v.allocExt();
+      return { slot, lx: x, ly: y, lz: z, s, color };
     };
     this._navLights = {
       port: mk(0xff2a22, -6.8, 0, 0.5, 2.5),
@@ -526,21 +522,32 @@ export class FighterJet {
       strobe: mk(0xffffff, 0, 0.5, 8.5, 3.5),
     };
   }
+  _writeNavLights(ctx) {
+    if (!this._navLights || !ctx.vfx) return;
+    const blink = (ctx.time % 1) < 0.15;
+    for (const [key, vis] of [['port', true], ['stbd', true], ['strobe', blink]]) {
+      const L = this._navLights[key];
+      if (!L || L.slot < 0) continue;
+      _navV.set(L.lx, L.ly, L.lz);
+      this.group.localToWorld(_navV);
+      ctx.vfx.setExt(L.slot, _navV.x, _navV.y, _navV.z, L.s, L.s, L.color, 0.9, vis);
+    }
+  }
   // v1.5.0 R8: blob shadow — one dark transparent sprite per jet,
   // projected onto the sea/deck height below, scale growing and opacity
   // fading with altitude, gone above ~150 m. Own sprite in the scene
   // (not the VFX pool): cost 0 pool sprites/particles, 1 draw call.
+  // v1.6.0 perf: now a slot in the VFX external sprite batch (see
+  // _ensureNavLights). this._shadow is the slot index (null = not
+  // allocated yet, -1 = batch exhausted).
   _ensureShadow(ctx) {
-    if (this._shadow || !ctx || !ctx.scene) return;
-    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: NAV_TEX, color: 0x000000, transparent: true, opacity: 0, depthWrite: false }));
-    sp.scale.set(14, 7, 1);
-    ctx.scene.add(sp);
-    this._shadow = sp;
+    if (this._shadow !== null || !ctx || !ctx.vfx || !ctx.vfx.allocExt) return;
+    this._shadow = ctx.vfx.allocExt();
   }
   _updateShadow(ctx) {
-    if (!this._shadow) return;
+    if (this._shadow === null || this._shadow < 0 || !ctx.vfx) return;
     const airborne = this.group.visible && !['deck', 'taxi', 'rearm', 'catapult', 'crashed', 'sinking', 'spinout'].includes(this.state);
-    if (!airborne) { this._shadow.visible = false; return; }
+    if (!airborne) { ctx.vfx.setExt(this._shadow, 0, -999, 0, 14, 7, 0x000000, 0, false); return; }
     const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
     let ground = seaH;
     for (const c of ctx.carriers || []) {
@@ -549,12 +556,16 @@ export class FighterJet {
       if (dh > ground) ground = dh;
     }
     const alt = this.y - ground;
-    if (alt > 150 || alt < 0) { this._shadow.visible = false; return; }
+    if (alt > 150 || alt < 0) { ctx.vfx.setExt(this._shadow, 0, -999, 0, 14, 7, 0x000000, 0, false); return; }
     const k = 1 - alt / 150;
-    this._shadow.visible = true;
-    this._shadow.position.set(this.x, ground + 0.5, this.z);
-    this._shadow.scale.set(14 + alt * 0.15, 7 + alt * 0.08, 1);
-    this._shadow.material.opacity = 0.32 * k;
+    ctx.vfx.setExt(this._shadow, this.x, ground + 0.5, this.z, 14 + alt * 0.15, 7 + alt * 0.08, 0x000000, 0.32 * k, true);
+  }
+  // v1.6.0 perf: hide the batched shadow slot. The old code set
+  // sprite.visible = false on the THREE.Sprite; the slot is a number
+  // now, so that assignment would throw in strict mode. The slot
+  // stays allocated — the jet is pooled and reuses it on its next life.
+  _hideShadow(ctx) {
+    if (this._shadow !== null && this._shadow >= 0 && ctx && ctx.vfx) ctx.vfx.setExt(this._shadow, 0, -999, 0, 14, 7, 0x000000, 0, false);
   }
   // v1.5.0 R4: wreck-on-deck detonation (Hurricane L6036) — a wreck
   // falling onto a LIVE carrier deck detonates on it instead of
@@ -575,7 +586,7 @@ export class FighterJet {
       if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 30, [1, 0.6, 0.2], 8, 5);
       if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 20, [0.3, 0.3, 0.3], 5, 5);
       if (ctx.vfx.liveSprites() < 300) { const fb = ctx.vfx.spawnSprite(this.x, this.y + 2, this.z, 0.9, 14, 14, 2.5, 0xff8822, 0.95); fb.vy = 4; }
-      if (this._shadow) this._shadow.visible = false;
+      this._hideShadow(ctx);
       this.group.visible = false;
       this.state = 'sinking'; this.sinkT = 0; this._despawned = true;
       this.crashReason = 'wreck hit the deck';
@@ -611,7 +622,7 @@ export class FighterJet {
     if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 30, [1, 0.6, 0.2], 8, 5);
     if (ctx.vfx.liveParticles() < 1200) ctx.vfx.burst(this.x, this.y + 2, this.z, 20, [0.3, 0.3, 0.3], 5, 5);
     if (ctx.vfx.liveSprites() < 300) { const fb = ctx.vfx.spawnSprite(this.x, this.y + 2, this.z, 0.9, 14, 14, 2.5, 0xff8822, 0.95); fb.vy = 4; }
-    if (this._shadow) this._shadow.visible = false;
+    this._hideShadow(ctx);
     if (this.wing) this.wing.onJetLost(this);
     if (ctx.msg && this.wing) ctx.msg(`✈ ${this.wing.side === 'player' ? 'Your' : 'Enemy'} jet crashed into ${carrier.name}'s sinking deck (${this.wing.remaining} jets left in wing)`);
   }
@@ -713,7 +724,7 @@ export class FighterJet {
       this.vy -= 9.81 * dt * 0.5;
       this.x += this.vx * dt; this.y += this.vy * dt; this.z += this.vz * dt;
       this.roll += dt * 2;
-      if (this._shadow) this._shadow.visible = false; // v1.5.0 R8: no shadow for a dead tumbling wreck
+      this._hideShadow(ctx); // v1.5.0 R8: no shadow for a dead tumbling wreck
       if (Math.random() < dt * 8) ctx.vfx.spawnParticle(this.x, this.y, this.z, 0, 0, 0, 0.7, 1, 0.5, 0.1, 0);
       const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
       // v1.5.0 R4: wreck-on-deck detonation (loss already counted by crash()).
@@ -742,7 +753,7 @@ export class FighterJet {
     // slick sprite, guarded < 300, only if wreckage is unavailable).
     if (this.state === 'sinking') {
       if (this._despawned) { this.syncModel(); return; }
-      if (this._shadow) this._shadow.visible = false;
+      this._hideShadow(ctx);
       this.sinkT += dt;
       this.vy = Math.max(this.vy - 8 * dt, -3);
       this.y += this.vy * dt;
@@ -787,7 +798,7 @@ export class FighterJet {
     if (this.state === 'slideoff') {
       this.slideT += dt;
       const carrier = this.slideCarrier;
-      if (!carrier || carrier.state === 'gone' || !carrier.group) {
+      if (!carrier || carrier.state === 'gone' || carrier.state === 'rested' || !carrier.group) {
         this.state = 'crashed'; this.crashT = 0; this.crashReason = 'slid off — no deck left';
         this.syncModel(); return;
       }
@@ -823,8 +834,14 @@ export class FighterJet {
     // or after 60 s.
     if (this.state === 'carrierCrash') {
       const carrier = this.carrierCrashCarrier;
-      if (!carrier || !this.carrierCrashLocal || carrier.state === 'gone') {
-        this.group.visible = false; this.state = 'sinking'; this._despawned = true; this.sinkT = 0;
+      if (!carrier || !this.carrierCrashLocal || carrier.state === 'gone' || carrier.state === 'rested') {
+        // v1.6.0 D6: the jet does not vanish with the parent — it falls
+        // from where it was riding (same pattern as slideoff losing
+        // its deck) and sinks as jet wreckage through the crashed
+        // branch. Position/velocity are its last riding values.
+        this.state = 'crashed'; this.crashT = 0; this.crashReason = 'carrier gone';
+        this.vy = Math.min(this.vy || 0, -2);
+        this.carrierCrashCarrier = null;
         this.syncModel(); return;
       }
       const p = carrier.deckPoint(this.carrierCrashLocal.lx, this.carrierCrashLocal.lz);
@@ -839,7 +856,11 @@ export class FighterJet {
         ctx.vfx.bubbles(this.x, this.y + 1, this.z, 2, 2);
       }
       if (this.y < seaH - 2 || this.carrierCrashT > 60) {
-        this.group.visible = false; this.state = 'sinking'; this._despawned = true; this.sinkT = 0;
+        // v1.6.0 D6: once under, the jet sinks VISIBLY (state
+        // 'sinking', not despawned) so it leaves jet wreckage through
+        // the sinking branch instead of vanishing 2 m under.
+        this.state = 'sinking'; this.sinkT = 0; this.vy = Math.min(this.vy || 0, -2);
+        this.carrierCrashCarrier = null;
       }
       this.syncModel(); return;
     }
@@ -884,12 +905,6 @@ export class FighterJet {
       // Damaged-jet wobble (Hurricane L6254-6263): instability roll.
       if (this.hp < 50) this.roll += Math.sin(ctx.time * 7 + this.id * 2) * 0.15 * dt;
     }
-    // R6: white tail strobe blinks on a 1 s cycle (visible 0.15 s);
-    // red/green stay steady. R8: blob shadow follows the ground below.
-    this._ensureNavLights();
-    if (this._navLights) this._navLights.strobe.visible = (ctx.time % 1) < 0.15;
-    this._ensureShadow(ctx);
-    this._updateShadow(ctx);
     // v1.5.0 R3: damage smoke/fire from the WORST-HIT ZONE, streaming
     // aft (dark smoke wing/fuselage, orange fire engine/fuel). Same
     // emission rates as the pre-v1.5.0 centre emission — repositioned,
@@ -905,6 +920,14 @@ export class FighterJet {
       ctx.vfx.spawnParticle(zp.x, zp.y, zp.z, -this.vx * 0.7, 1, -this.vz * 0.7, 0.6, 1, 0.5, 0.1, -0.5);
     }
     this.syncModel();
+    // R6: white tail strobe blinks on a 1 s cycle (visible 0.15 s);
+    // red/green stay steady. R8: blob shadow follows the ground below.
+    // v1.6.0 perf: written AFTER syncModel so the batched lights use
+    // the fresh group transform (see _writeNavLights).
+    this._ensureNavLights(ctx);
+    this._writeNavLights(ctx);
+    this._ensureShadow(ctx);
+    this._updateShadow(ctx);
   }
 }
 
@@ -946,7 +969,7 @@ export class AirSquadron {
     // v1.4.0 (item 5) CAP: a patrol flight has no target carrier — it
     // defends a station over the fleet, so a null target is legal for
     // loadout 'cap' only. Strike loadouts still need a live target.
-    if (loadout !== 'cap' && (!target || target.state === 'gone')) return false;
+    if (loadout !== 'cap' && (!target || target.state === 'gone' || target.state === 'rested')) return false;
     const avail = this.wing.availableToLaunch();
     if (avail <= 0) return false;
     const n = Math.min(2, avail);
@@ -1182,7 +1205,7 @@ export class AirSquadron {
     const seaH = ctx.sea.waveHeight(L.x, L.z, ctx.time);
     const deckY = carrier && carrier.alive ? carrier.deckTopY() : seaH;
     const tgt = this.target;
-    const tgtAlive = tgt && tgt.state !== 'gone' && tgt.state !== 'sinking';
+    const tgtAlive = tgt && tgt.state !== 'gone' && tgt.state !== 'rested' && tgt.state !== 'sinking';
     switch (this.state) {
       case 'launchQueued': {
         this.t += dt;
@@ -1505,7 +1528,7 @@ export class AirSquadron {
         // this is the belt-and-braces path for a carrier that dies
         // without it.)
         if (!carrier || !carrier.alive) {
-          if (carrier && carrier.state !== 'gone') {
+          if (carrier && carrier.state !== 'gone' && carrier.state !== 'rested') {
             this.aliveJets.forEach(j => j.crashIntoCarrier(carrier, ctx));
             this.state = 'lost'; this.t = 0; this.target = null;
           } else { this.state = 'divert'; this.t = 0; }
@@ -1833,7 +1856,7 @@ export class AirWing {
 // change — this only draws where the bomb would land if dropped now.
 // Returns valid:false when the jet is climbing or too low to drop.
 export function predictBombImpact(jet, target) {
-  if (!jet || !target || target.state === 'gone') return { valid: false, x: 0, y: 0, z: 0, tFall: 0 };
+  if (!jet || !target || target.state === 'gone' || target.state === 'rested') return { valid: false, x: 0, y: 0, z: 0, tFall: 0 };
   const deckY = target.deckTopY();
   const dy = jet.y - deckY;
   if (dy <= 5 || jet.vy >= -5) return { valid: false, x: jet.x, y: deckY, z: jet.z, tFall: 0 };

@@ -6,6 +6,13 @@
 // equal-variance quantiles, m0 fetch law) are verbatim.
 import * as THREE from 'three';
 
+// v1.6.0 Item 2: the seabed. SEA_FLOOR_Y = -90 m — the intact hull's keel
+// (-30 m) at the old -55 m sink-curve end is -85 m, so a wreck comes to rest
+// just below where it used to vanish: the sink curves need clamping, not
+// retiming. Deep enough to read as sunk (a 55 m hull + island stays well
+// under), shallow enough for the camera to reach underwater (murk FogExp2
+// 0.005 keeps a wreck visible at ~200 m inspection range).
+export const SEA_FLOOR_Y = -90;
 export const STAGES = [
   { name: 'Calm',   speed: 20, amp: 0.35, wind: 5,  sky: 0x9fc3d8, sea: 0x1a5a78, sunI: 1.15 },
   { name: 'Rough',  speed: 25, amp: 0.70, wind: 10, sky: 0x7e9db4, sea: 0x174a64, sunI: 1.0 },
@@ -43,6 +50,17 @@ export class Sea {
     // here: 14 m amp (still ~3x the Storm swell), 120 m radius, 30 m/s.
     // Carriers fly at >=150 m, so they are safe; low jets are not.
     this.freak = null; // {x,z,dirX,dirZ,amp,radius,speed,age,life}
+    // v1.6.0 perf: per-frame wave table. gerstner()/getOceanDataAt()
+    // are called ~1000x/frame (897 ocean verts + every carrier/jet/
+    // wreck query) with the same time t and ampCur, so the per-wave
+    // terms that depend only on (t, ampCur) are precomputed once per
+    // distinct pair instead of per call: kdx = k*dx, kdz = k*dz,
+    // wt = w*t, A = amp*ampCur, Q = min(q, 1/(k*A)). The per-call
+    // math is identical, only reassociated (fp differences ~1e-9).
+    this._wt = [];
+    for (let i = 0; i < 18; i++) this._wt.push({ kdx: 0, kdz: 0, wt: 0, ph: 0, A: 0, Q: 0, dx: 0, dz: 0, k: 0, w: 0 });
+    this._wtT = NaN; this._wtAmp = NaN;
+    this._gTmp = { x: 0, y: 0, z: 0 };
   }
   // Gaussian crest height of the freak wave at (x,z), 0 when none/absent.
   freakHeightAt(x, z) {
@@ -90,37 +108,56 @@ export class Sea {
     this.WAVE_AMP_SUM = comps.reduce((a, w) => a + w.amp, 0);
     this.HS = HsM;
   }
-  gerstner(x, z, t) {
-    let y = 0, ox = 0, oz = 0;
-    const W = this.WAVES;
+  _prepWaves(t) {
+    if (t === this._wtT && this.ampCur === this._wtAmp) return;
+    this._wtT = t; this._wtAmp = this.ampCur;
+    const W = this.WAVES, T = this._wt;
     for (let i = 0; i < W.length; i++) {
-      const w = W[i];
-      const th = w.k * (w.dx * x + w.dz * z) - w.w * t + w.ph;
+      const w = W[i], e = T[i];
       const A = w.amp * this.ampCur;
-      const Q = Math.min(w.q, 1 / Math.max(0.001, w.k * A));
-      ox += Q * A * w.dx * Math.cos(th);
-      oz += Q * A * w.dz * Math.cos(th);
-      y += A * Math.sin(th);
+      e.kdx = w.k * w.dx; e.kdz = w.k * w.dz; e.wt = w.w * t; e.ph = w.ph;
+      e.A = A; e.Q = Math.min(w.q, 1 / Math.max(0.001, w.k * A));
+      e.dx = w.dx; e.dz = w.dz; e.k = w.k; e.w = w.w;
+    }
+  }
+  gerstner(x, z, t) {
+    this._prepWaves(t);
+    let y = 0, ox = 0, oz = 0, dydx = 0, dydz = 0;
+    const T = this._wt, n = this.WAVES.length;
+    for (let i = 0; i < n; i++) {
+      const e = T[i];
+      const th = e.kdx * x + e.kdz * z - e.wt + e.ph;
+      const sn = Math.sin(th), cs = Math.cos(th);
+      ox += e.Q * e.A * e.dx * cs;
+      oz += e.Q * e.A * e.dz * cs;
+      y += e.A * sn;
+      // v1.6.0 perf: analytic slopes in the same pass (no extra trig)
+      // — feeds the ocean normal + steepness in update() without
+      // computeVertexNormals. The freak slope is not included here,
+      // exactly as before (only getOceanDataAt carries it).
+      dydx += e.A * e.kdx * cs;
+      dydz += e.A * e.kdz * cs;
     }
     y += this.freakHeightAt(x, z);
-    return { x: x + ox, y, z: z + oz };
+    const g = this._gTmp; g.x = x + ox; g.y = y; g.z = z + oz; g.dydx = dydx; g.dydz = dydz;
+    return g;
   }
   waveHeight(x, z, t) { return this.gerstner(x, z, t).y; }
   // The shared ocean query — verbatim structure from Hurricane L907-957.
   getOceanDataAt(x, z, t) {
+    this._prepWaves(t);
     let y = 0, dydx = 0, dydz = 0, doxdx = 0, doxdz = 0, dozdx = 0, dozdz = 0, ovx = 0, ovy = 0, ovz = 0;
-    const W = this.WAVES;
-    for (let i = 0; i < W.length; i++) {
-      const w = W[i];
-      const th = w.k * (w.dx * x + w.dz * z) - w.w * t + w.ph;
-      const A = w.amp * this.ampCur;
-      const Q = Math.min(w.q, 1 / Math.max(0.001, w.k * A));
+    const T = this._wt, n = this.WAVES.length;
+    for (let i = 0; i < n; i++) {
+      const e = T[i];
+      const th = e.kdx * x + e.kdz * z - e.wt + e.ph;
+      const A = e.A, Q = e.Q, kdx = e.kdx, kdz = e.kdz;
       const sn = Math.sin(th), cs = Math.cos(th);
       y += A * sn;
-      dydx += A * w.k * w.dx * cs; dydz += A * w.k * w.dz * cs;
-      doxdx += -Q * A * w.k * w.dx * w.dx * sn; doxdz += -Q * A * w.k * w.dx * w.dz * sn;
-      dozdx += -Q * A * w.k * w.dz * w.dx * sn; dozdz += -Q * A * w.k * w.dz * w.dz * sn;
-      ovx += Q * A * w.dx * w.w * sn; ovy += -A * w.w * cs; ovz += Q * A * w.dz * w.w * sn;
+      dydx += A * kdx * cs; dydz += A * kdz * cs;
+      doxdx += -Q * A * kdx * e.dx * sn; doxdz += -Q * A * kdx * e.dz * sn;
+      dozdx += -Q * A * kdz * e.dx * sn; dozdz += -Q * A * kdz * e.dz * sn;
+      ovx += Q * A * e.dx * e.w * sn; ovy += -A * e.w * cs; ovz += Q * A * e.dz * e.w * sn;
     }
     // v1.3.0 freak wave in the shared ocean query too (Hurricane v11.8):
     // height and slope, so wave push / swamping see the same crest.
@@ -170,6 +207,12 @@ export class Sea {
     this.oceanH = new Float32Array(this.oceanPos.count);
     g.setAttribute('aSteep', new THREE.BufferAttribute(this.oceanSteep, 1));
     g.setAttribute('aH', new THREE.BufferAttribute(this.oceanH, 1));
+    // v1.6.0 perf: the normal attribute is filled analytically in
+    // update() (same field computeVertexNormals derived it from, see
+    // below) — pre-allocate it here so the vertex shader always has
+    // valid normals from frame 0.
+    this.oceanNrm = new Float32Array(this.oceanPos.count * 3);
+    g.setAttribute('normal', new THREE.BufferAttribute(this.oceanNrm, 3));
     const MAXS = 12; // uShips[12]: up to 8 carriers + 4 wreck slots (was 8 in Hurricane)
     const shipVecs = [], shipSizes = [];
     for (let i = 0; i < MAXS; i++) { shipVecs.push(new THREE.Vector4()); shipSizes.push(new THREE.Vector2()); }
@@ -355,6 +398,15 @@ export class Sea {
     this.ocean = new THREE.Mesh(g, mat);
     this.ocean.frustumCulled = false;
     scene.add(this.ocean);
+    // v1.6.0 Item 2: the visual seabed — a dark sandy disc at SEA_FLOOR_Y,
+    // wide enough to cover the ocean (radius 3000 m). MeshBasicMaterial so
+    // it reads through the underwater murk fog; it follows the ocean focus
+    // in update() like the surface does, so the floor never ends mid-map.
+    const floorGeo = new THREE.CircleGeometry(3200, 64);
+    this.floor = new THREE.Mesh(floorGeo, new THREE.MeshBasicMaterial({ color: 0x4a4238 }));
+    this.floor.rotation.x = -Math.PI / 2;
+    this.floor.position.y = SEA_FLOOR_Y;
+    scene.add(this.floor);
     this._frame = 0;
   }
   setStage(i) {
@@ -379,7 +431,9 @@ export class Sea {
     const mx = Math.round(focusX / OCEAN_STEP) * OCEAN_STEP;
     const mz = Math.round(focusZ / OCEAN_STEP) * OCEAN_STEP;
     this.ocean.position.set(mx, 0, mz);
+    if (this.floor) this.floor.position.set(mx, SEA_FLOOR_Y, mz); // v1.6.0 Item 2: seabed follows the focus
     const pos = this.oceanPos.array, base = this.oceanBase;
+    const nrm = this.oceanNrm;
     const range = this.WAVE_AMP_SUM * this.ampCur + 0.1;
     for (let i = 0; i < this.oceanPos.count; i++) {
       const bx = base[i * 3], bz = base[i * 3 + 2];
@@ -388,15 +442,19 @@ export class Sea {
       pos[i * 3 + 1] = g.y;
       pos[i * 3 + 2] = bz + (g.z - (mz + bz));
       this.oceanH[i] = (g.y / range) * 0.5 + 0.5;
+      // v1.6.0 perf: analytic normal + steepness from the same pass.
+      // Replaces computeVertexNormals() (every other frame) + the
+      // normal scan: the Gerstner field is smooth, so the analytic
+      // normal (-dydx, 1, -dydz) matches the discretised one to ~1e-3
+      // and is fresh every frame instead of every other one.
+      const inv = 1 / Math.sqrt(g.dydx * g.dydx + 1 + g.dydz * g.dydz);
+      nrm[i * 3] = -g.dydx * inv; nrm[i * 3 + 1] = inv; nrm[i * 3 + 2] = -g.dydz * inv;
+      this.oceanSteep[i] = Math.min(1, Math.max(0, (1 - inv) * 3));
     }
     this.oceanPos.needsUpdate = true;
-    if ((this._frame++ & 1) === 0) {
-      this.oceanGeo.computeVertexNormals();
-      const nrm = this.oceanGeo.attributes.normal.array;
-      for (let i = 0; i < this.oceanPos.count; i++) this.oceanSteep[i] = Math.min(1, Math.max(0, (1 - nrm[i * 3 + 1]) * 3));
-      this.oceanGeo.attributes.aSteep.needsUpdate = true;
-      this.oceanGeo.attributes.aH.needsUpdate = true;
-    }
+    this.oceanGeo.attributes.normal.needsUpdate = true;
+    this.oceanGeo.attributes.aSteep.needsUpdate = true;
+    this.oceanGeo.attributes.aH.needsUpdate = true;
     for (let i = 0; i < this.MAXS; i++) {
       const s = ships && ships[i];
       if (s) {

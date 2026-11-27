@@ -47,12 +47,12 @@
 // untouched, exactly as it sailed through the old debris sprites.
 import * as THREE from 'three';
 
-export const WRECK_MAX_CHUNKS = 96;
-export const WRECK_MAX_SLICKS = 12;
-export const WRECK_MAX_FIELDS = 12; // one per slick in the pool —
+export const WRECK_MAX_CHUNKS = 144;
+export const WRECK_MAX_SLICKS = 24;
+export const WRECK_MAX_FIELDS = 24; // one per slick in the pool —
 // a full 8-carrier breakup round spawns far more fields than this,
-// so the oldest are still reclaimed, but a normal round (one field
-// per sunk carrier, intact or in pieces) keeps every wreck.
+// so the oldest are still reclaimed — but as a 3 s FADE (v1.6.0 D2),
+// never an instant pop — and a normal round keeps every wreck.
 // Intact carrier: 10 chunks over a hull-length ellipse. Per breakup
 // piece: 4 chunks in a tight cluster at the piece's sink point.
 export const WRECK_CHUNKS_INTACT = 10;
@@ -166,12 +166,28 @@ export class WreckageField {
     return null;
   }
   _reclaimOldest() {
-    const f = this.fields.shift();
+    // v1.6.0 D2: reclamation is a FADE, not a pop — the oldest
+    // non-fading field starts a ~3 s fade (chunks shrink, slick/ring
+    // opacity → 0, see update()); its pool slots free only when the
+    // fade completes (_purgeFaded). Returns false when every field is
+    // already fading — the caller then spawns with fewer chunks.
+    const f = this.fields.find(f => f.fading === undefined);
     if (!f) return false;
-    for (const rec of f.chunks) { rec.mesh.visible = false; rec.mesh.userData.wreck = null; }
-    if (f.slick) { f.slick.visible = false; f.slick.userData.wreck = null; }
-    if (f.ring) { f.ring.visible = false; f.ring.userData.wreck = null; }
+    f.fading = 0;
     return true;
+  }
+  _purgeFaded() {
+    let n = 0;
+    for (let i = this.fields.length - 1; i >= 0; i--) {
+      const f = this.fields[i];
+      if (f.fading === undefined || f.fading < 3) continue;
+      for (const rec of f.chunks) { rec.mesh.visible = false; rec.mesh.userData.wreck = null; }
+      if (f.slick) { f.slick.visible = false; f.slick.userData.wreck = null; }
+      if (f.ring) { f.ring.visible = false; f.ring.userData.wreck = null; }
+      this.fields.splice(i, 1);
+      n++;
+    }
+    return n;
   }
   // Spawn one wreck field. opts: {name, heading, along (field half-length
   // along the hull, m), across (half-width, m), chunks, slickR0 (oil
@@ -181,14 +197,23 @@ export class WreckageField {
   // whole fields — but a single huge request is clamped, never fatal).
   spawn(x, z, opts = {}) {
     const n = Math.min(opts.chunks || WRECK_CHUNKS_INTACT, WRECK_MAX_CHUNKS);
-    // Make room: reclaim oldest fields until the pool holds this field.
+    // Make room: purge finished fades, then fade the oldest field if
+    // still short. A fade frees its slots in ~3 s — the spawn does not
+    // wait for it, it just gets fewer chunks if the pools are full
+    // (the allocation loop below breaks on a null mesh).
+    this._purgeFaded();
     let free = this.chunkPool.filter(m => !m.visible).length;
     let guard = 0;
-    while (free < n && this.fields.length && guard++ < WRECK_MAX_FIELDS + 1) {
-      this._reclaimOldest();
-      free = this.chunkPool.filter(m => !m.visible).length;
+    while (free < n && this.fields.length && guard++ < WRECK_MAX_FIELDS + 2) {
+      if (this._purgeFaded() > 0) { free = this.chunkPool.filter(m => !m.visible).length; continue; }
+      if (!this._reclaimOldest()) break;
+      break; // one fade at a time per spawn
     }
-    if (this.fields.length >= WRECK_MAX_FIELDS) this._reclaimOldest();
+    while (this.fields.length >= WRECK_MAX_FIELDS) {
+      if (this._purgeFaded() > 0) continue;
+      if (!this._reclaimOldest()) break;
+      break;
+    }
     const heading = opts.heading || 0;
     const along = opts.along || 120, across = opts.across || 35;
     const fx = Math.sin(heading), fz = -Math.cos(heading);
@@ -337,7 +362,21 @@ export class WreckageField {
       }
       if (f.chunks.length) { f.cx = sx / f.chunks.length; f.cz = sz / f.chunks.length; }
       else if (f.slick) { f.cx = f.slick.position.x; f.cz = f.slick.position.z; }
+      // v1.6.0 D2: a fading field shrinks its chunks and fades its
+      // slick/ring to nothing over 3 s, then _purgeFaded frees the
+      // slots. Nothing pops: the wreck visibly disperses instead.
+      if (f.fading !== undefined) {
+        f.fading += dt;
+        const ff = Math.min(1, f.fading / 3);
+        for (const rec of f.chunks) {
+          const k = 1 - ff;
+          rec.mesh.scale.set(rec.len * k, rec.thk * k, rec.wid * k);
+        }
+        if (f.slick) f.slick.material.opacity = 0.55 * (1 - ff);
+        if (f.ring) f.ring.material.opacity = 0.8 * (1 - ff);
+      }
     }
+    this._purgeFaded();
   }
   get chunkCount() { return this.chunkPool.filter(m => m.visible).length; }
   get slickCount() { return this.slickPool.filter(m => m.visible).length; }
@@ -359,6 +398,7 @@ export class WreckageField {
       list: this.fields.map(f => ({
         name: f.name, age: time !== undefined ? +(time - f.born).toFixed(1) : null,
         chunks: f.chunks.length, slick: !!f.slick, burning: !!f.burning,
+        fading: f.fading !== undefined,
         slickR: f.slick ? +f.slick.scale.x.toFixed(1) : 0,
         cx: f.cx !== undefined ? +f.cx.toFixed(1) : +f.x.toFixed(1),
         cz: f.cz !== undefined ? +f.cz.toFixed(1) : +f.z.toFixed(1),

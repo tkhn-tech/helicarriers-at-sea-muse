@@ -20,6 +20,7 @@ import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 // Models are embedded as base64 JS modules (Pandora-style) because the
 // GitHub snapshot-push route only accepts UTF-8 text files — no binary .glb
 // files are shipped. See assets/ASSETS.md.
+import { SEA_FLOOR_Y } from './sea.js'; // v1.6.0 Item 2: wrecks rest on the seabed, never despawn
 import { HELICARRIER_B64 } from '../assets/helicarrier.b64.js';
 import { FA18_B64 } from '../assets/fa18.b64.js';
 
@@ -318,10 +319,43 @@ function jaggedFracturePath(seed, zc, hitLx) {
   const p = pts[bi];
   const dx = cx - p.x, dy = cy - p.y, dl = Math.hypot(dx, dy) || 1;
   p.x += (dx / dl) * notch; p.y += (dy / dl) * notch;
+  // v1.6.0 V6: the random walk (up to ±5 m × 1.5 near the hit, plus the
+  // fine octave) could push the outline ~8 m OUTSIDE the hull section
+  // it is meant to cap — the cap then overhangs the hull in mid-air.
+  // Clamp every point to the hull section expanded by ≤1 m.
+  for (const q of pts) {
+    q.x = Math.max(-w2, Math.min(w2, q.x));
+    q.y = Math.max(k2, Math.min(topY, q.y));
+  }
   return pts;
 }
+// v1.6.0 V2: clip a closed outline polygon to an x-range (Sutherland–
+// Hodgman against x >= xMin and x <= xMax). Longitudinal halves get a
+// transverse cap/petals only over their own half of the hull — a
+// full-width cap on a half-hull is an open hollow face on the other side.
+function clipPolyX(pts, xMin, xMax) {
+  const clip = (list, keep, edge) => {
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i], b = list[(i + 1) % list.length];
+      const aIn = keep(a.x), bIn = keep(b.x);
+      if (aIn) out.push(a);
+      if (aIn !== bIn) {
+        const f = (edge - a.x) / ((b.x - a.x) || 1e-9);
+        out.push({ x: edge, y: a.y + (b.y - a.y) * f });
+      }
+    }
+    return out;
+  };
+  let r = pts;
+  if (xMin !== undefined && xMin !== null) r = clip(r, x => x >= xMin, xMin);
+  if (xMax !== undefined && xMax !== null) r = clip(r, x => x <= xMax, xMax);
+  return r;
+}
 function addSectionCap(group, zc, islBox, opts = {}) {
-  const pts = jaggedFracturePath(opts.seed || 1, zc, opts.hitLx || 0);
+  let pts = jaggedFracturePath(opts.seed || 1, zc, opts.hitLx || 0);
+  if (opts.xRange) pts = clipPolyX(pts, opts.xRange[0], opts.xRange[1]);
+  if (pts.length < 3) return null;
   const s = new THREE.Shape();
   pts.forEach((p, i) => { if (i === 0) s.moveTo(p.x, p.y); else s.lineTo(p.x, p.y); });
   s.closePath();
@@ -365,21 +399,30 @@ function addSectionCap(group, zc, islBox, opts = {}) {
   // a uniform tower, so a full-height rectangle would poke above the
   // wedge at a forward cut. A trapezoid — full width at the deck,
   // narrow at the wedge's local top — follows the island's shape.
+  // v1.6.0 V2: on a longitudinal half the trapezoid is clipped to the
+  // half's x-range (and skipped entirely when the island is wholly on
+  // the other side), so it never floats over open water.
   if (islBox && zc >= islBox.min.z && zc <= islBox.max.z) {
     const islTop = islandTopYAt(zc, islBox);
-    const ix0 = islBox.min.x, ix1 = islBox.max.x;
-    const icx = (ix0 + ix1) / 2, ihw = (ix1 - ix0) / 2;
-    const baseY = deckLocalYAt(zc); // local deck height at the cut
-    const is = new THREE.Shape();
-    is.moveTo(icx - ihw, baseY);
-    is.lineTo(icx + ihw, baseY);
-    is.lineTo(icx + ihw * 0.45, islTop);
-    is.lineTo(icx - ihw * 0.45, islTop);
-    is.closePath();
-    const icap = new THREE.Mesh(new THREE.ShapeGeometry(is), DM.capSteel);
-    icap.position.set(0, 0, zc);
-    icap.name = 'breakCapIsland';
-    group.add(icap);
+    let ix0 = islBox.min.x, ix1 = islBox.max.x;
+    if (opts.xRange) {
+      ix0 = Math.max(ix0, opts.xRange[0] === null || opts.xRange[0] === undefined ? -Infinity : opts.xRange[0]);
+      ix1 = Math.min(ix1, opts.xRange[1] === null || opts.xRange[1] === undefined ? Infinity : opts.xRange[1]);
+    }
+    if (ix1 - ix0 > 0.5) {
+      const icx = (ix0 + ix1) / 2, ihw = (ix1 - ix0) / 2;
+      const baseY = deckLocalYAt(zc); // local deck height at the cut
+      const is = new THREE.Shape();
+      is.moveTo(icx - ihw, baseY);
+      is.lineTo(icx + ihw, baseY);
+      is.lineTo(icx + ihw * 0.45, islTop);
+      is.lineTo(icx - ihw * 0.45, islTop);
+      is.closePath();
+      const icap = new THREE.Mesh(new THREE.ShapeGeometry(is), DM.capSteel);
+      icap.position.set(0, 0, zc);
+      icap.name = 'breakCapIsland';
+      group.add(icap);
+    }
   }
   return cap;
 }
@@ -393,7 +436,15 @@ function addSectionCap(group, zc, islBox, opts = {}) {
 // them 0→1 over the 0.25 s hinge as the gap opens (they were hidden
 // inside the closed crack).
 function addTornPetals(group, zc, zDir, opts = {}) {
-  const pts = jaggedFracturePath((opts.seed || 1) + 31, zc, opts.hitLx || 0);
+  let pts = jaggedFracturePath((opts.seed || 1) + 31, zc, opts.hitLx || 0);
+  // v1.6.0 V2: longitudinal halves get petals only over their own half.
+  if (opts.xRange) pts = clipPolyX(pts, opts.xRange[0], opts.xRange[1]);
+  // v1.6.0 V4: on a diagonal cut the petal ring is stretched 1/cos θ
+  // along x — the same transform as the diagonal cap — so the flaps
+  // sit on the cut face instead of ~5 m inside it. (The group is
+  // rotated -θ about Y by the caller, exactly like the cap.)
+  if (opts.stretchX && opts.stretchX !== 1) for (const p of pts) p.x *= opts.stretchX;
+  if (pts.length < 3) { const g0 = new THREE.Group(); g0.position.set(0, 0, zc); g0.scale.setScalar(0.001); g0.name = 'breakPetalsGroup'; group.add(g0); return g0; }
   const cx = 0, cy = (deckLocalYAt(zc) + 0.3 + (hullSectionAt(zc).k - 1)) / 2;
   const rng = mulberry32((opts.seed || 1) + 57);
   const count = Math.max(8, Math.min(14, Math.round(pts.length / 2) + (opts.detonation ? 2 : 0)));
@@ -455,9 +506,20 @@ function addTornPetals(group, zc, zDir, opts = {}) {
 // existing BreakupPiece.update already computes). Pieces differ from
 // the hull only where their area/mass ratio differs from a hull
 // section's: a light draggy piece (deck strip, pulverised plate) has
-// A/m several times a hull section's, so vt falls as 1/sqrt(dragK):
-//   dragK 1 (hull section) -> vt 291 m/s; 2 (pod) -> 206; 3 (island) -> 168;
-//   6 (deck strip) -> 119; 10-15 (pulverised debris) -> 75-92 m/s.
+// A/m several times a hull section's, so its vt is lower. vt follows the
+// piece's own area and mass — area = fallProjectedArea * lenFrac *
+// areaFrac * dragK, mass = PHYSICS.MASS * massFrac (lenFrac is clamped
+// to a minimum of 20/333 in the fall branch) — NOT 291/sqrt(dragK), which
+// ignores areaFrac and massFrac. True flat vt per type (measured
+// 2026-11-27, v16-items12 probes — implied vt from the vy series matches
+// these code values within ~1% for every type):
+//   hull section (dragK 1, areaFrac 1, massFrac = lenFrac) -> vt 291 m/s
+//   island (dragK 1, areaFrac 0.34, massFrac 0.008) -> vt 114 m/s (implied 113.4)
+//   pod (dragK 1.5, areaFrac 0.44, massFrac 0.012) -> vt 116 m/s (implied 115.2)
+//   deck strip (dragK 3, areaFrac 0.18, massFrac 0.002) -> vt 46 m/s (implied 45.6)
+//   pulverised remnant (dragK 4, areaFrac 0.5, massFrac 0.005) -> vt 59 m/s (implied 57-61)
+// (An earlier version of this comment listed 206/168/119/75-92 from the
+// dragK-only formula — those numbers were wrong, the code below was right.)
 // dragK, areaFrac and massFrac on a BreakupPiece encode exactly that:
 // area = fallProjectedArea * lenFrac * areaFrac * dragK, mass =
 // PHYSICS.MASS * massFrac. Light draggy debris falls slowly and drifts
@@ -507,6 +569,27 @@ function addDiagonalCap(group, zc, angle, islBox, opts = {}) {
   cap.userData.hotIdx = hotIdx;
   cap.userData.hotFade = hot ? 20 : 0;
   group.add(cap);
+  // v1.6.0 V5: the diagonal cap had no island trapezoid — a diagonal
+  // cut through the island left it hollow. Same trapezoid as the
+  // transverse cap, stretched 1/cos θ and rotated -θ like the hull cap,
+  // so it sits on the cut plane (shape-u = hull-x / cos θ).
+  if (islBox && zc >= islBox.min.z && zc <= islBox.max.z) {
+    const islTop = islandTopYAt(zc, islBox);
+    const ix0 = islBox.min.x, ix1 = islBox.max.x;
+    const icx = (ix0 + ix1) / 2, ihw = (ix1 - ix0) / 2;
+    const baseY = deckLocalYAt(zc);
+    const is = new THREE.Shape();
+    is.moveTo((icx - ihw) / cosA, baseY);
+    is.lineTo((icx + ihw) / cosA, baseY);
+    is.lineTo((icx + ihw * 0.45) / cosA, islTop);
+    is.lineTo((icx - ihw * 0.45) / cosA, islTop);
+    is.closePath();
+    const icap = new THREE.Mesh(new THREE.ShapeGeometry(is), DM.capSteel);
+    icap.position.set(0, 0, zc);
+    icap.rotation.y = -angle;
+    icap.name = 'breakCapIsland';
+    group.add(icap);
+  }
   return cap;
 }
 // v1.5.0 D1: the diagonal clip plane in the piece's local space.
@@ -549,7 +632,30 @@ function hullSideProfilePath(seed) {
   return pts;
 }
 function addSideProfileCap(group, xOff, opts = {}) {
-  const pts = hullSideProfilePath(opts.seed || 1);
+  let pts = hullSideProfilePath(opts.seed || 1);
+  // v1.6.0 V1: the side-profile cap is the split face of ONE half, so
+  // it is built only over that half's own [zLo, zHi] (local z). The
+  // full-length cap used to overhang both ends of a short half.
+  if (opts.zLo !== undefined || opts.zHi !== undefined) {
+    const zLo = opts.zLo !== undefined ? opts.zLo : -Infinity;
+    const zHi = opts.zHi !== undefined ? opts.zHi : Infinity;
+    const clip = (list, keep, edge) => {
+      const out = [];
+      for (let i = 0; i < list.length; i++) {
+        const a = list[i], b = list[(i + 1) % list.length];
+        const aIn = keep(a.z), bIn = keep(b.z);
+        if (aIn) out.push(a);
+        if (aIn !== bIn) {
+          const f = (edge - a.z) / ((b.z - a.z) || 1e-9);
+          out.push({ z: edge, y: a.y + (b.y - a.y) * f });
+        }
+      }
+      return out;
+    };
+    pts = clip(pts, z => z >= zLo, zLo);
+    pts = clip(pts, z => z <= zHi, zHi);
+  }
+  if (pts.length < 3) return null;
   const s = new THREE.Shape();
   pts.forEach((p, i) => { if (i === 0) s.moveTo(p.z, p.y); else s.lineTo(p.z, p.y); });
   s.closePath();
@@ -936,6 +1042,8 @@ export function applyEnemyLivery(group) {
 }
 
 const _bpV = new THREE.Vector3(); // BreakupPiece cut-face scratch
+// v1.6.0 B1: piece world-box scratch (see BreakupPiece.pieceBoxCorners).
+const _bpBox = { minY: 0, maxY: 0, minX: 0, minZ: 0, cx: 0, cy: 0, cz: 0 };
 // v1.4.0 venting pool guards (research §5): cut-face venting stops
 // emitting once live sprites exceed 300 of S_MAX (420) or live
 // particles exceed 1200 of P_MAX (1600) — the pools are shared
@@ -977,6 +1085,12 @@ export class BreakupPiece {
     this.cookoffs = []; this.imploded = false; this.rockAmp = 0;
     this.rockT = 0; this.smokeTrail = false; this.burning = false;
     this.assembly = null; // 'island' | 'pod' | 'strip' | 'remnant' | null
+    // v1.6.0 duplicates fix (B): a HELD piece is a segment that has
+    // been spawned as a piece but not yet released — it rides with the
+    // carrier (transform driven by updateBreakup) until its releaseAt,
+    // when _armPiece gives it motion. While held it has no physics of
+    // its own and is not a collision body (see solidBodies).
+    this.held = false;
     this.halfBeamOverride = null; this.halfHOverride = null;
     this.centreLocal = null; // {x,y,z} centre offset in group-local space
     this._cookAcc = 0; this._trailT = 0; this._rockShedT = 0;
@@ -996,7 +1110,61 @@ export class BreakupPiece {
     this.group.updateWorldMatrix(true, false);
     return out.set(f.lx, f.ly, f.lz).applyMatrix4(this.group.matrixWorld);
   }
+  // v1.6.0 B1: the piece's world-space box, from its own geometry —
+  // never the carrier origin. Hull pieces span local x ±halfBeam
+  // (centred on centreLocal.x), y keel -34 to deck +6 (+34 with an
+  // island segment — the measured solid-mesh extents, 27 Nov), z -segHi..-segLo (local z = -d). Assemblies are
+  // centred on their own origin with (halfBeamOverride,
+  // halfHOverride, segLen/2). Fills `out` with minY/maxY, the lowest
+  // corner's (minX, minZ) for the sea sample, and the box centre.
+  pieceBoxCorners(out) {
+    const g = this.group;
+    g.updateWorldMatrix(true, false);
+    const m = g.matrixWorld.elements;
+    const hb = this.halfBeamOverride || 42;
+    const cx = (this.centreLocal && this.centreLocal.x) || 0;
+    let yLo, yHi;
+    if (this.assembly) {
+      const hh = this.halfHOverride || 3;
+      yLo = -hh; yHi = hh;
+    } else {
+      yLo = -34;
+      yHi = (this.segLo !== undefined && this.segLo <= -47 && this.segHi >= -98) ? 34 : 6;
+    }
+    let zLo, zHi;
+    if (this.segLo !== undefined && this.segHi !== undefined) { zLo = -this.segHi; zHi = -this.segLo; }
+    else { const c = -(this.segCentre || 0), h = (this.segLen || 60) / 2; zLo = c - h; zHi = c + h; }
+    const xs = [cx - hb, cx + hb], ys = [yLo, yHi], zs = [zLo, zHi];
+    let minY = Infinity, maxY = -Infinity, minX = 0, minZ = 0, cxW = 0, cyW = 0, czW = 0;
+    for (const x of xs) for (const y of ys) for (const z of zs) {
+      const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+      const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+      const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+      if (wy < minY) { minY = wy; minX = wx; minZ = wz; }
+      if (wy > maxY) maxY = wy;
+      cxW += wx; cyW += wy; czW += wz;
+    }
+    out.minY = minY; out.maxY = maxY; out.minX = minX; out.minZ = minZ;
+    out.cx = cxW / 8; out.cy = cyW / 8; out.cz = czW / 8;
+    return out;
+  }
+  // v1.6.0 B2: per-fragment buoyancy — equilibrium draft (metres the
+  // lowest corner sits below the sea) and flood time (seconds to flood
+  // from equilibrium to fully submerged). Hull sections are big sealed
+  // boxes (~6 m draft); island/pod/strip are light and ride high;
+  // pulverised remnants are negatively buoyant and sink at once.
+  _buoyancy() {
+    if (this.assembly === 'island') return { draft: 0.8, floodDur: 150 };
+    if (this.assembly === 'pod') return { draft: 1.2, floodDur: 80 };
+    if (this.assembly === 'strip') return { draft: 0.4, floodDur: 180 };
+    if (this.assembly === 'remnant') return { draft: 0, floodDur: 6 };
+    return { draft: 6, floodDur: this.sinkDur || 30 };
+  }
   update(dt, ctx) {
+    // v1.6.0 duplicates fix (B): a held piece does not integrate — the
+    // carrier drives its transform (updateBreakup) and re-aims its clip
+    // planes there. Its own fall starts at release (_armPiece).
+    if (this.held) return;
     if (this.state === 'falling') {
       const lenFrac = Math.max(20, this.segLen || 60) / 333;
       // v1.5.0: piece drag/mass from the piece's own identity (see the
@@ -1004,7 +1172,8 @@ export class BreakupPiece {
       // piece's planform and dragK, mass with massFrac. A hull section
       // keeps lenFrac for both (vt 291 m/s, as before); an island, a
       // pod, a deck strip or pulverised debris falls at its own vt
-      // (168 / 206 / 119 / 75-92 m/s) and sorts itself along the flight
+      // (114 / 116 / 46 / 59 m/s — measured 2026-11-27, see the table
+      // above addDiagonalCap) and sorts itself along the flight
       // path by ballistic coefficient (TWA 800 debris zones).
       const area = fallProjectedArea(this.pitch, this.roll) * lenFrac * (this.areaFrac || 1) * (this.dragK || 1);
       const mass = PHYSICS.MASS * (this.massFrac !== null && this.massFrac !== undefined ? this.massFrac : lenFrac);
@@ -1133,20 +1302,119 @@ export class BreakupPiece {
           colAttr.needsUpdate = true;
         }
       }
-      const seaH = ctx.sea.waveHeight(this.group.position.x, this.group.position.z, ctx.time);
-      if (this.y <= seaH + 1) {
-        this.state = 'sinking'; this.sinkT = 0; this.impactY = seaH;
+      // v1.6.0 B1: water entry is anchored to the piece's own lowest
+      // corner, not the carrier origin — the old origin test fired the
+      // splash up to 151 m early or 31 m late, and the sink curve below
+      // jumped the group origin to the sea in one frame. The splash
+      // lands at the lowest corner's position on the water.
+      const box = this.pieceBoxCorners(_bpBox);
+      const seaH = ctx.sea.waveHeight(box.minX, box.minZ, ctx.time);
+      if (box.minY <= seaH) {
+        this.impactY = seaH;
         this.impactRoll = this.roll;
         // v1.4.0: a piece that hits nose-first gains a one-off pitch
         // kick toward its heavy end (research §4.2).
         if (Math.abs(this.pitch) > 0.15) this.pitchRate += Math.sign(this.pitch) * 0.15;
-        ctx.vfx.splash(this.group.position.x, seaH, this.group.position.z, Math.abs(this.vy));
-        ctx.vfx.burst(this.group.position.x, seaH + 2, this.group.position.z, 30, [0.9, 0.9, 0.9], 8, 6);
+        ctx.vfx.splash(box.minX, seaH, box.minZ, Math.abs(this.vy));
+        ctx.vfx.burst(box.minX, seaH + 2, box.minZ, 30, [0.9, 0.9, 0.9], 8, 6);
+        // v1.6.0 B2: a buoyant piece floats at its equilibrium draft
+        // and floods from there; a negatively buoyant remnant sinks
+        // straight away on the deep curve (anchored to its own origin
+        // altitude at entry, so there is no one-frame jump).
+        const b = this._buoyancy();
+        if (b.floodDur <= 8) {
+          this.state = 'sinking'; this.sinkT = 0; this._deepStartY = this.y;
+        } else {
+          this.state = 'floating'; this.floodF = 0; this._buoy = b;
+          this._floodSide = Math.sign(this.rollRate) || (this.roll >= 0 ? 1 : -1);
+        }
+      }
+    } else if (this.state === 'floating') {
+      // v1.6.0 B2: the piece rides at its equilibrium draft, bobbing
+      // with the live sea and listing/trimming as it floods. It only
+      // leaves the surface by sinking once fully flooded — never by
+      // popping, never flat like a stone unless the physics says so.
+      // The waterline is controlled by the box CENTRE, not the lowest
+      // corner: a long tilted piece touches with one corner while its
+      // centre is still tens of metres up, and chasing the corner
+      // would hang it in the air. Centre target = sea + halfV − draft,
+      // so the lowest corner still sits exactly `draft` under at
+      // equilibrium, and the piece settles DOWN onto the water as it
+      // rights itself (halfV shrinks as it levels).
+      const b = this._buoy || (this._buoy = this._buoyancy());
+      this.floodF = Math.min(1, (this.floodF || 0) + dt / b.floodDur);
+      const box = this.pieceBoxCorners(_bpBox);
+      const seaH = ctx.sea.waveHeight(box.cx, box.cz, ctx.time);
+      const boxH = Math.max(1, box.maxY - box.minY);
+      const halfV = boxH / 2;
+      const draft = b.draft + this.floodF * (boxH - b.draft);
+      const err = (seaH + halfV - draft) - box.cy;
+      const dy = Math.max(-5 * dt, Math.min(5 * dt, err));
+      this.y += dy; this.group.position.y = this.y;
+      // Horizontal drift decays in water; tumbling decays too.
+      const drag = Math.exp(-dt * 0.6);
+      this.vx *= drag; this.vz *= drag;
+      this.group.position.x += this.vx * dt;
+      this.group.position.z += this.vz * dt;
+      const rDecay = Math.exp(-dt / 8);
+      this.rollRate *= rDecay; this.pitchRate *= rDecay; this.yawRate *= rDecay;
+      this.roll += this.rollRate * dt * 0.3;
+      this.pitch += this.pitchRate * dt * 0.3;
+      this.heading += this.yawRate * dt * 0.3;
+      // Flooding list/trim (intact model): the list grows toward the
+      // flood side as compartments fill, bow-first trim, wave-slope
+      // coupling while near the surface. A floating section also
+      // RIGHTS itself toward level as the tumble dies — a 110 m piece
+      // that touched corner-first at 60° roll must settle onto the
+      // water, not hang tilted for the rest of the round — so the
+      // impact roll decays and the chase runs at 0.10 rad/s, not the
+      // intact hull's 0.03.
+      const od = ctx.sea.getOceanDataAt(box.cx, box.cz, ctx.time);
+      const listTarget = this.impactRoll * (1 - this.floodF * 0.5) + (this._floodSide || 1) * 0.35 * this.floodF
+        + od.slopeX * 0.3 * (1 - this.floodF);
+      const rollErr = listTarget - this.roll;
+      this.roll += Math.max(-0.10 * dt, Math.min(0.10 * dt, rollErr));
+      this.pitch += (-0.05 - this.pitch) * Math.min(1, dt * 0.2);
+      this.group.rotation.set(this.pitch, -this.heading, this.roll);
+      // Bubbles while flooding (same cadence shape as the sinking
+      // branch, driven by flood fraction instead of sink fraction).
+      this.bubbleT -= dt;
+      if (this.bubbleT <= 0 && this.floodF < 0.9) {
+        this.bubbleT = 0.12 - 0.08 * Math.min(1, this.floodF / 0.7);
+        ctx.vfx.bubbles(this.group.position.x, this.impactY, this.group.position.z, 4, 60);
+      }
+      this._fireCookoffs(dt, ctx);
+      if (this.floodF >= 1) {
+        // Fully flooded: hand over to the deep sink, anchored to the
+        // origin altitude at handover (no jump).
+        this.state = 'sinking'; this.sinkT = 0; this._deepStartY = this.y;
       }
     } else if (this.state === 'sinking') {
       this.sinkT += dt / this.sinkDur;
       const f = Math.min(1, this.sinkT);
-      this.group.position.y = this.impactY - f * f * 55;
+      // v1.6.0 B1: the deep curve is anchored to the origin altitude
+      // at water entry / flood handover, not to the sea — the old
+      // impactY-anchored curve teleported the piece to the surface.
+      const fu = Math.min(4, this.sinkT);
+      const startY = this._deepStartY !== undefined ? this._deepStartY : this.impactY;
+      // v1.6.0 Item 2: the deep curve ends on the seabed, not at -55 m +
+      // hide. restY is the origin altitude at which this piece's lowest
+      // corner touches SEA_FLOOR_Y (from its own live box, so a rolled
+      // piece rests on its bilge, not through the floor or hovering).
+      // The curve is clamped from below: once a corner touches the floor
+      // the piece has arrived and becomes a resting wreck.
+      const restBox = this.pieceBoxCorners(_bpBox);
+      const restY = SEA_FLOOR_Y - (restBox.minY - this.y);
+      // Item 2 fix (27 Nov): the old fixed 55 m drop stranded thin
+      // pieces — a level remnant rests at -87 m but the curve bottomed
+      // at -55 m, so it hovered there until the sinkT>=4 safety snapped
+      // it 32 m to the floor. The drop is now deep enough to reach the
+      // floor (55 m minimum, so carriers behave exactly as before), and
+      // the clamp lands the piece on the seabed with no snap.
+      const drop = Math.max(55, startY - restY + 5);
+      const curveY = startY - fu * fu * drop;
+      const clamped = curveY <= restY;
+      this.group.position.y = clamped ? restY : curveY;
       this.y = this.group.position.y; // v1.4.0: keep the field honest (was stale at impactY in v1.3)
       // v1.3.2: sinking pieces keep drifting apart horizontally (with
       // drag) and slowly tumbling instead of freezing in a pile at the
@@ -1194,8 +1462,18 @@ export class BreakupPiece {
       // v1.5.0 D11: a burning wreck keeps cooking off on the surface
       // after the sinking starts (post-splashdown cook-offs).
       this._fireCookoffs(dt, ctx);
-      if (f >= 1) {
-        this.state = 'gone'; this.group.visible = false;
+      // v1.6.0 Item 2: the piece never leaves. When its lowest corner
+      // reaches the seabed it becomes a resting wreck — visible and
+      // selectable for the rest of the round (the old pop hid it at
+      // ~-55 m and the L3144 filter then deleted it from c.pieces).
+      // Safety: if the floor test somehow never fires, rest at sinkT >= 4.
+      if (clamped || this.sinkT >= 4) {
+        this.state = 'rested';
+        // Snap exactly onto the floor with the final attitude (a few
+        // metres at most — the clamp already holds it there).
+        const rb = this.pieceBoxCorners(_bpBox);
+        this.y += SEA_FLOOR_Y - rb.minY; this.group.position.y = this.y;
+        this.rollRate = 0; this.pitchRate = 0; this.yawRate = 0;
         // v1.4.0 (item 6): the piece leaves floating wreckage where it
         // sank — 4 scorched chunks + an oil slick that persist for the
         // rest of the round (see js/wreckage.js). Guarded: hand-built
@@ -1208,10 +1486,28 @@ export class BreakupPiece {
           chunks: 4, slickR0: 22, vx: this.vx, vz: this.vz, born: ctx.time,
           burning: !!this.burning,
         });
+        // At rest on the seabed: no drift, no fall speed (the slick above
+        // already inherited the drift velocity).
+        this.vx = 0; this.vz = 0; this.vy = 0;
       }
+    } else if (this.state === 'rested') {
+      // v1.6.0 Item 2: a wreck on the seabed. It never despawns — it stays
+      // visible and selectable for the rest of the round. The attitude
+      // keeps settling toward its impact list (≤0.03 rad/s, as while
+      // sinking) and the origin is re-snapped every frame so the lowest
+      // corner stays exactly on the floor as it rolls — no sinking
+      // through it, no hovering above it. No bubbles, no drift: at rest.
+      const rollErr = this.impactRoll - this.roll;
+      this.roll += Math.max(-0.03 * dt, Math.min(0.03 * dt, rollErr));
+      this.group.rotation.set(this.pitch, -this.heading, this.roll);
+      const rb = this.pieceBoxCorners(_bpBox);
+      this.y += SEA_FLOOR_Y - rb.minY; this.group.position.y = this.y;
+      this._fireCookoffs(dt, ctx);
     }
     // v1.3.2: re-aim the cut planes every frame (see refreshClipPlanes).
-    if (this.state !== 'gone') this.refreshClipPlanes();
+    // v1.6.0 Item 2: no piece state is 'gone' any more (wrecks rest on
+    // the seabed instead of despawning), so this is unconditional.
+    this.refreshClipPlanes();
   }
   // v1.5.0 D11: fire any pending cook-offs whose clock has come due.
   // Each burst is visual/audio only. The clock is the compressed real
@@ -1247,7 +1543,10 @@ export class BreakupPiece {
       }
     }
   }
-  get gone() { return this.state === 'gone'; }
+  // v1.6.0 Item 2: the old `get gone()` (state === 'gone') fed the
+  // L3144 filter that deleted pieces from c.pieces. No piece ever goes
+  // 'gone' now — wrecks rest on the seabed in state 'rested' — so the
+  // getter and the filter are both gone with it.
 }
 let _carrierSeq = 0;
 let _pieceSeq = 0; // breakup-piece ids (collisions.js pair keys + probe logs)
@@ -1272,6 +1571,11 @@ export class Helicarrier {
     this.rudderDeg = 0;
     this.telegraphIdx = 5; // ALL STOP
     this.spoolSpeed = 0;
+    // v1.6.0 hold (INDV/ANCHOR): the ordered speed + heading captured
+    // at the moment a ship becomes held, so she sails on in her
+    // previous state instead of being ordered to stop. Null = not held.
+    this.holdSpeed = null;
+    this.holdHeading = null;
     // v1.4.0 flight-physics states (spec §9): headingRate/pitchRate are
     // lagged rate states, bank is the coordinated-turn result (never an
     // input), spoolSpeed is the ordered-speed state (see game.js).
@@ -1297,7 +1601,7 @@ export class Helicarrier {
     this.yawRate = 0;
     this.slot = { dx: 0, dz: 0, dy: 0 };
     this.avoidUntil = 0; this.avoidOther = null; // post-impact avoidance window (collisions.js NEW-1)
-    this.state = 'alive'; // alive | falling | sinking | gone
+    this.state = 'alive'; // alive | falling | sinking | capsizing | gone | rested (v1.6.0 Item 2: 'rested' = wreck on the seabed)
     this.fallT = 0; this.sinkT = 0; this.impactY = 0;
     this.fallRollRate = 0; this.fallPitchRate = 0; this.fallYawRate = 0;
     this.breakupT = 0; this.pieces = [];
@@ -1309,6 +1613,11 @@ export class Helicarrier {
     this.breakState = 'none'; this.breakT = 0; this.breakHinge = 0;
     this._breakPlan = null; this._breakCtx = null; this._breakReleased = 0;
     this._breakFirstReleased = false; this._crackRibbons = [];
+    // v1.6.0 duplicates fix (C): after a D9 crippled core falls, any
+    // later breakUp re-segments ONLY this surviving [lo, hi] range
+    // (d units) — never the full hull, whose other regions already
+    // exist as pieces. Null unless a D9 has happened.
+    this._coreRange = null;
     this._brkSeq = 0; this._hitSeq = 0; this._lastBlastKey = null;
     // v1.4.1 breakup variety: a per-carrier, per-round seed. Every
     // breakup decision — fracture paths (fracSeed), cut spread, stagger,
@@ -1496,9 +1805,20 @@ export class Helicarrier {
   // a 20.8 m/s instant shove on a neighbour 100 m away (2.5 GN·s, 46 s
   // of full flank thrust in one frame). Callers pass one event key per
   // kill; only the largest application of that key lands, the rest is
-  // the delta. Coefficient 0.35 -> 0.06 and total Δv capped at 3 m/s
-  // per event: a neighbour at 100 m gets ≤ ~1.5 m/s, a heavy slide,
-  // not a 75 km/h shove.
+  // the delta.
+  // v1.6.0 mass discipline (27 Nov): the F8 coefficients were still
+  // ~2000x too violent for a 120,000,000 kg ship — a 30-damage bomb
+  // heeled her 5.7 deg and shoved her ~1 m/s, a 70-damage hit 2.2 m/s.
+  // A real 500 kg bomb at ~300 m/s carries J ~= 1.5e5 N*s, so
+  // dv = J/m ~= 0.001 m/s, and the roll impulse (J x ~30 m lever
+  // against I_roll ~= 7e10 kg*m^2) is ~0.004 deg — the ship should
+  // barely move. The retune below is ~100x the physical value, not
+  // exact physics: a readable shudder (heel <= 0.46 deg, shove
+  // <= 0.1 m/s, yaw <= 0.06 deg total) with the flash/fireball/smoke
+  // carrying the hit feedback at range. Coefficient 0.06 -> 0.002 and
+  // total dv capped at 0.1 m/s per event; heel 0.1 -> 0.008 rad,
+  // clamped to +-0.015 rad total so repeated hits cannot stack it
+  // into a big roll; yaw 0.05 -> 0.002 rad/s, clamped to +-0.0015.
   blastImpulse(bx, bz, power, key) {
     if (this.state !== 'alive') return;
     const dx = this.x - bx, dz = this.z - bz;
@@ -1513,16 +1833,18 @@ export class Helicarrier {
       fall = fall - prev; // apply only the delta
       this._blastVByKey = this._blastVByKey || {};
       const applied = this._blastVByKey[key] || 0;
-      const addV = fall * 0.06;
-      if (applied + addV > 3) fall = Math.max(0, (3 - applied) / 0.06);
-      this._blastVByKey[key] = Math.min(3, applied + fall * 0.06);
+      const addV = fall * 0.002;
+      if (applied + addV > 0.1) fall = Math.max(0, (0.1 - applied) / 0.002);
+      this._blastVByKey[key] = Math.min(0.1, applied + fall * 0.002);
     }
     const nx = dx / d, nz = dz / d;
-    this.blastVx += nx * fall * 0.06;
-    this.blastVz += nz * fall * 0.06;
+    this.blastVx += nx * fall * 0.002;
+    this.blastVz += nz * fall * 0.002;
     const lat = dx * Math.cos(this.heading) + dz * Math.sin(this.heading);
-    this.heelKick -= Math.sign(lat || 1) * 0.1 * Math.min(1, fall / 6);
-    this.blastYaw += (Math.random() - 0.5) * 0.05 * Math.min(1, fall / 6);
+    this.heelKick -= Math.sign(lat || 1) * 0.008 * Math.min(1, fall / 6);
+    this.heelKick = Math.max(-0.015, Math.min(0.015, this.heelKick));
+    this.blastYaw += (Math.random() - 0.5) * 0.002 * Math.min(1, fall / 6);
+    this.blastYaw = Math.max(-0.0015, Math.min(0.0015, this.blastYaw));
   }
   zoneAt(lx, lz, fromAbove) {
     const along = -lz / (CARRIER_LEN / 2); // +1 = bow, -1 = stern
@@ -1600,8 +1922,7 @@ export class Helicarrier {
       // The wobble is visual only; lift/damage are unchanged.
       pod.wobble = Math.min(1, (pod.wobble || 0) + amount / 30);
       if (pod.hp <= 0 && pod.alive) {
-        pod.alive = false;
-        pod.meshes.forEach(m => { m.visible = false; });
+        this._killPodVisual(pod); // v1.6.0 D3: scorched husk, not a vanish
         ctx.vfx.burst(wp.x, wp.y, wp.z, 40, [1, 0.6, 0.2], 10, 6);
         this.ignite('pod:' + this.pods.indexOf(pod), lx, lz, amount / 20, ctx);
         // v1.5.0 §6: losing a pod steps the list +3° toward the dead side.
@@ -1657,7 +1978,7 @@ export class Helicarrier {
     // otherwise fire twice for one kill.
     // v1.5.0: a capsizing carrier cannot detonate either — her death is
     // the flooding roll, and a mid-capsize breakup would break the D8 path.
-    if (this.breakState !== 'none' || this.state === 'gone' || this.state === 'capsizing') return;
+    if (this.breakState !== 'none' || this.state === 'gone' || this.state === 'rested' || this.state === 'capsizing') return;
     // v1.2.0: explosions scale with what blew up — a reactor breach is
     // bigger and more violent than a magazine hit, which is bigger than
     // a deck hit. (Damage amounts and detonation gates are unchanged.)
@@ -1771,7 +2092,7 @@ export class Helicarrier {
   // geometric bending waits for phase 4. The old single-frame breakUp
   // (all pieces in one frame) is gone.
   breakUp(ctx, reason, opts = {}) {
-    if (this.state === 'gone' || this.breakState !== 'none' || this.state === 'capsizing') return;
+    if (this.state === 'gone' || this.state === 'rested' || this.breakState !== 'none' || this.state === 'capsizing') return;
     const fallVy = this.state === 'falling' ? this.vy : -5; // capture before state flips
     const hit = this.lastHit || {
       zone: 'reactor', amount: 30, lx: 0, lz: 0,
@@ -1920,7 +2241,27 @@ export class Helicarrier {
     if (opts.bowCrumple && !cuts.some(c => Math.abs(c - 130) < 30)) cuts.push(130);
     if (opts.midshipCut && !cuts.some(c => Math.abs(c) < 30)) cuts.push(0);
     cuts.sort((a, b) => a - b);
-    const bounds = [-CARRIER_LEN / 2, ...cuts, CARRIER_LEN / 2];
+    // v1.6.0 duplicates fix (C): a breakUp after a D9 crippled core
+    // (breakState reset, carrier falling) must only re-segment the
+    // SURVIVING core — re-cutting the full hull would respawn pieces
+    // for regions already released as pieces in the first breakup.
+    // Every cut is clamped inside the core (35 m margins, so no sliver
+    // segment results) and re-spaced; a cut on the core boundary is a
+    // cut through the core's end, not outside it. A core narrower than
+    // 70 m cannot split and stays one piece — safe, nothing is
+    // re-segmented. With no prior D9 the range is the full hull.
+    let rLo = -CARRIER_LEN / 2, rHi = CARRIER_LEN / 2;
+    if (this._coreRange) {
+      [rLo, rHi] = this._coreRange;
+      cutOff = Math.max(rLo + 5, Math.min(rHi - 5, cutOff));
+      if (rHi - rLo < 70) cuts.length = 0;
+      else {
+        for (let i = 0; i < cuts.length; i++) cuts[i] = Math.max(rLo + 35, Math.min(rHi - 35, cuts[i]));
+        cuts.sort((a, b) => a - b);
+        for (let i = cuts.length - 1; i > 0; i--) if (cuts[i] - cuts[i - 1] < 35) cuts.splice(i, 1);
+      }
+    }
+    const bounds = [rLo, ...cuts, rHi];
     const segments = [];
     for (let i = 0; i < bounds.length - 1; i++) {
       segments.push({ lo: bounds[i], hi: bounds[i + 1], centre: (bounds[i] + bounds[i + 1]) / 2 });
@@ -1946,11 +2287,11 @@ export class Helicarrier {
     // transverse tear finishes the job at one end of the split.
     let longCutD = null;
     if (mode === 'longitudinal') {
-      longCutD = Math.max(-120, Math.min(120, cutOff));
+      longCutD = Math.max(rLo + 5, Math.min(rHi - 5, Math.max(-120, Math.min(120, cutOff))));
       segments.length = 0;
-      segments.push({ lo: -166.5, hi: 166.5, centre: 0, kind: 'longPort', half: 'port' });
-      segments.push({ lo: longCutD, hi: 166.5, centre: (longCutD + 166.5) / 2, kind: 'longStbd', half: 'stbd' });
-      segments.push({ lo: -166.5, hi: longCutD, centre: (-166.5 + longCutD) / 2, kind: 'longStbd', half: 'stbd' });
+      segments.push({ lo: rLo, hi: rHi, centre: (rLo + rHi) / 2, kind: 'longPort', half: 'port' });
+      segments.push({ lo: longCutD, hi: rHi, centre: (longCutD + rHi) / 2, kind: 'longStbd', half: 'stbd' });
+      segments.push({ lo: rLo, hi: longCutD, centre: (rLo + longCutD) / 2, kind: 'longStbd', half: 'stbd' });
       cuts.length = 0; cuts.push(longCutD);
     }
     // Island footprint in the carrier's local space, for section caps.
@@ -2093,6 +2434,7 @@ export class Helicarrier {
     this._breakCtx = ctx;
     this.breakState = 'cracking';
     this.breakT = 0; this.breakHinge = 0; this.breakFlex = 0; this._breakReleased = 0;
+    this._flexShown = false; this._flexStaging = null; // v1.6.0 perf: flex halves rebuild per breakup
     this._breakFirstReleased = false;
     // Crack ribbons (§2.4): one jagged dark ribbon per cut, growing
     // around the hull cross-section from the hit — the same seeded path
@@ -2187,6 +2529,41 @@ export class Helicarrier {
     });
     return islBox;
   }
+  // v1.6.0 D3: a pod destroyed by damage/fire leaves a scorched husk —
+  // the fan and duct stay visible, darkened, rotor winding down —
+  // instead of vanishing outright. (A tear-off still hides the parent
+  // pod meshes: the pod physically leaves as its own piece.)
+  _killPodVisual(pod) {
+    if (!pod || !pod.alive) return;
+    pod.alive = false;
+    const husk = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.95, metalness: 0.2 });
+    for (const m of pod.meshes) {
+      m.traverse(o => { if (o.isMesh) { o.material = husk; o.visible = true; } });
+    }
+    // The rotor stays visible and winds down on its own (pod.alive =
+    // false drives the spin target to 0) — the wind-down is the tell
+    // that the pod died instead of leaving.
+    if (pod.rotorSpin) pod.rotorSpin.visible = true;
+  }
+  // v1.6.0 duplicates fix (B): hide an assembly's meshes inside every
+  // piece — held or already released — whose segment contains it (d
+  // units, x for the longitudinal side). A tear-off hides the originals
+  // on the intact group; without this, a piece that already carries the
+  // island/pod (the whole group is cloned at separation) would show it
+  // a second time alongside the tear-off piece. The D4 case: a segment
+  // that released before the tear-off fired (tear-offs run at
+  // releaseStart+0.1..0.8, segments release in a staggered order).
+  // Assembly pieces themselves are skipped (their segLo/segHi are
+  // local, not d-units, and they ARE the assembly).
+  _hideAssemblyInPieces(d, x, pred) {
+    for (const p of this.pieces) {
+      if (p.assembly) continue;
+      if (p.segLo === undefined || d < p.segLo || d > p.segHi) continue;
+      if (p.segKind === 'longPort' && x >= 0) continue;
+      if (p.segKind === 'longStbd' && x < 0) continue;
+      p.group.traverse(o => { if (pred(o)) o.visible = false; });
+    }
+  }
   // v1.5.0 D4/D5/D3/D7: spawn a detached assembly as its own tumbling
   // rigid body with a small collision proxy (see collisions.js
   // pieceBody — assembly pieces carry halfBeamOverride/halfHOverride
@@ -2195,45 +2572,78 @@ export class Helicarrier {
   // mesh, not a full-ship clone — an island/pod/strip is a small
   // fraction of 120,000 t, so it tumbles faster and decelerates
   // faster in air than a hull section.
-  _spawnAssemblyPiece(ctx, kind, podIdx, worldPos, worldRot) {
+  _spawnAssemblyPiece(ctx, kind, podIdx, worldPos, worldRot, salt) {
     const plan = this._breakPlan;
-    const rng = mulberry32(fracSeed(this._brkSeed, 500 + (podIdx || 0), this.lastHit ? this.lastHit.lz : 0));
+    // v1.6.0 V7: per-kind seed salt — the old fixed seed made every
+    // pulverised remnant (and every peel strip) spawn as an identical
+    // coincident cluster. `salt` is the remnant/strip index; the kind
+    // base keeps island/pod/strip/remnant streams apart even when the
+    // pod index coincides (an island and pod 0 used to share a seed).
+    const kindSalt = kind === 'island' ? 900 : kind === 'strip' ? 600 : kind === 'remnant' ? 700 : 500;
+    const rng = mulberry32(fracSeed(this._brkSeed, kindSalt + (podIdx || 0) + (salt || 0) * 37, this.lastHit ? this.lastHit.lz : 0));
     const g = new THREE.Group();
     let segLen = 30, massFrac = 0.01, areaFrac = 0.4, dragK = 1;
     let halfBeam = 12, halfH = 12, spinMesh = null, spinRate = 0;
+    // v1.6.0 V11/D4: clone a mesh into the piece group from its
+    // carrier-local transform (robust to nesting — the mesh's matrix
+    // relative to the carrier group, decomposed). Materials are cloned
+    // with clipping planes nulled, so a parent's breakup clip never
+    // slices the detached piece.
+    const _m4 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _s = new THREE.Vector3(), _p = new THREE.Vector3();
+    const cloneIntoPiece = (src, centre) => {
+      const clone = src.clone();
+      clone.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.material.clippingPlanes = null; } });
+      this.group.updateMatrixWorld(true);
+      const invM = new THREE.Matrix4().copy(this.group.matrixWorld).invert();
+      _m4.copy(src.matrixWorld).premultiply(invM).decompose(_p, _q, _s);
+      clone.position.set(_p.x - centre.x, _p.y - centre.y, _p.z - centre.z);
+      clone.quaternion.copy(_q);
+      clone.scale.copy(_s);
+      clone.visible = true;
+      g.add(clone);
+      return clone;
+    };
     if (kind === 'island') {
-      // Wedge-ish island block + mast + radar bar, at the island's
-      // world pose. Original island meshes are hidden on the parent.
-      const box = new THREE.Mesh(new THREE.BoxGeometry(23, 22, 51), DM.lightGrey);
-      box.name = 'asmIsland';
-      g.add(box);
-      const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.7, 7, 8), DM.darkMark);
-      mast.position.set(0, 14, 10); mast.name = 'asmIslandMast';
-      g.add(mast);
-      const radar = new THREE.Mesh(new THREE.BoxGeometry(9, 0.7, 1.1), DM.lightGrey);
-      radar.position.set(0, 18, 10); radar.name = 'asmIslandRadar';
-      g.add(radar);
-      segLen = 26; massFrac = 0.008; areaFrac = 0.34; dragK = 1; halfBeam = 12; halfH = 18;
+      // Clone the ACTUAL island meshes (island_*, mast, radar, bridge
+      // windows, nav, antenna, panel line), offset so the island
+      // centre sits at the piece origin — the old 23×22×51 box + mast
+      // + radar read as a crate, not the ship's island.
+      const ib = plan && plan.islBox ? plan.islBox : this._islandBoxLocal();
+      const ic = ib ? new THREE.Vector3((ib.min.x + ib.max.x) / 2, (ib.min.y + ib.max.y) / 2, (ib.min.z + ib.max.z) / 2) : new THREE.Vector3(20, 15, -72);
+      const isIslandMesh = (o) => o.isMesh && (o.name.startsWith('island_') || o.name === 'islandCoaming' || o.name === 'islandBridgeWindows' ||
+        o.name === 'islandMast' || o.name === 'islandRadar' || o.name === 'islandNavPort' || o.name === 'islandNavStbd' ||
+        o.name === 'islandAntenna' || o.name === 'islandPanelLine');
       this.group.traverse(o => {
-        if (o.isMesh && (o.name.startsWith('island_') || o.name === 'islandCoaming' || o.name === 'islandBridgeWindows' ||
-          o.name === 'islandMast' || o.name === 'islandRadar' || o.name === 'islandNavPort' || o.name === 'islandNavStbd' ||
-          o.name === 'islandAntenna' || o.name === 'islandPanelLine')) o.visible = false;
+        if (isIslandMesh(o)) {
+          cloneIntoPiece(o, ic);
+          o.visible = false;
+        }
       });
+      // v1.6.0 duplicates fix (B): the island also lives in any piece
+      // whose segment contains it — hide it there too.
+      this._hideAssemblyInPieces(-ic.z, ic.x, isIslandMesh);
+      segLen = 51; massFrac = 0.008; areaFrac = 0.34; dragK = 1; halfBeam = 12; halfH = 18;
     } else if (kind === 'pod') {
       const pod = this.pods[podIdx];
+      // Shallow dark duct cylinder for body (the flat disc alone is
+      // invisible edge-on), plus the real fan / duct-cap / blur meshes.
       const duct = new THREE.Mesh(new THREE.CylinderGeometry(19, 19, 8, 20), DM.ductDark);
       duct.name = 'asmPodDuct';
       g.add(duct);
-      const rotor = new THREE.Group();
-      const disc = new THREE.Mesh(new THREE.CircleGeometry(18, 20),
-        new THREE.MeshBasicMaterial({ color: 0x2a2e33, side: THREE.DoubleSide }));
-      disc.rotation.x = -Math.PI / 2; disc.name = 'asmPodRotor';
-      rotor.add(disc);
-      rotor.position.y = 1;
-      g.add(rotor);
-      spinMesh = rotor; spinRate = 8; // keeps spinning while attached to the piece, decaying
+      if (pod) {
+        const pc = new THREE.Vector3(pod.local.x, pod.local.y, pod.local.z);
+        for (const m of pod.meshes) {
+          const clone = cloneIntoPiece(m, pc);
+          if (m.name.startsWith('rotorSpin_')) { spinMesh = clone; spinRate = 8; }
+        }
+        pod.alive = false; pod.meshes.forEach(m => { m.visible = false; }); if (pod.rotorSpin) pod.rotorSpin.visible = false;
+        // v1.6.0 duplicates fix (B): the pod also lives in any piece
+        // whose segment contains it — hide it there too.
+        const podNames = new Set(pod.meshes.map(m => m.name).filter(n => n));
+        if (pod.rotorSpin && pod.rotorSpin.name) podNames.add(pod.rotorSpin.name);
+        this._hideAssemblyInPieces(-pod.local.z, pod.local.x, (o) => o.isMesh && o.name && podNames.has(o.name));
+      }
       segLen = 38; massFrac = 0.012; areaFrac = 0.44; dragK = 1.5; halfBeam = 19; halfH = 8;
-      if (pod) { pod.alive = false; pod.meshes.forEach(m => { m.visible = false; }); if (pod.rotorSpin) pod.rotorSpin.visible = false; }
     } else if (kind === 'strip') {
       const plate = new THREE.Mesh(new THREE.BoxGeometry(12, 0.5, 50), DM.capSteel);
       plate.name = 'asmStrip';
@@ -2246,8 +2656,20 @@ export class Helicarrier {
       segLen = 14; massFrac = 0.005; areaFrac = 0.5; dragK = 4; halfBeam = 7; halfH = 3;
     }
     g.position.copy(worldPos);
-    if (worldRot) g.rotation.copy(worldRot);
-    else g.rotation.set(this.pitch, -this.heading, this.roll);
+    if (worldRot) {
+      g.rotation.copy(worldRot);
+      // v1.6.0 V8: a world quaternion decomposed to XYZ can land on
+      // the gimbal-flipped branch (pitch ≈ ±π — a curled peel strip
+      // measured 2.82 rad). The initial matrix is identical, but the
+      // piece then tumbles about the wrong body axes. The identity
+      // (x,y,z) -> (x+π, π−y, z+π) is the same rotation with
+      // |pitch| ≤ π/2 (verified numerically against the vendored
+      // three.js over carrier pitch/heading/roll × curl).
+      if (Math.abs(g.rotation.x) > Math.PI / 2) {
+        const wrap = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+        g.rotation.set(wrap(g.rotation.x + Math.PI), wrap(Math.PI - g.rotation.y), wrap(g.rotation.z + Math.PI));
+      }
+    } else g.rotation.set(this.pitch, -this.heading, this.roll);
     const fwd = plan ? plan.fwd : { x: Math.sin(this.heading), z: -Math.cos(this.heading) };
     const rx = -fwd.z, rz = fwd.x;
     let vx = this.vx || 0, vz = this.vz || 0;
@@ -2278,36 +2700,34 @@ export class Helicarrier {
     this.pieces.push(piece);
     return piece;
   }
-  // v1.5.0 D13: build the two hinge segment groups for the flex
-  // prototype (structural kill path only). Each is a clone of the
-  // intact group clipped to one side of the first cut; the original
-  // group hides while they show, and they rotate ±hinge/2 about the
+  // v1.5.0 D13: build ONE hinge segment group for the flex prototype
+  // (structural kill path only) — a clone of the intact group clipped
+  // to one side of the first cut. Built hidden (v1.6.0 perf: one half
+  // per frame, see updateBreakup); shown at hingeStart, when the
+  // original group hides and the two halves rotate ±hinge/2 about the
   // roll axis so the hull visibly bends before it tears.
-  _buildFlexGroups(ctx, plan) {
+  _buildFlexHalf(ctx, plan, which) {
     const cut = plan.cuts[0];
     const zc = -cut;
-    const mk = (locals) => {
-      const clone = this.group.clone(true);
-      const ribbons = [];
-      clone.traverse(o => { if (o.name === 'crackRibbon' || o.name === 'deckRipple' || o.name === 'peelStripGroup') ribbons.push(o); });
-      for (const r of ribbons) r.parent.remove(r);
-      clone.visible = true;
-      const mats = [];
-      clone.traverse(o => {
-        if (o.isMesh) {
-          o.material = o.material.clone();
-          o.material.clippingPlanes = locals.map(() => new THREE.Plane());
-          o.material.userData.clipLocals = locals;
-          mats.push(o.material);
-        }
-      });
-      (this.group.parent || ctx.scene).add(clone);
-      return { group: clone, mats, locals };
-    };
-    const fore = mk([new THREE.Plane(new THREE.Vector3(0, 0, -1), zc)]);
-    const aft = mk([new THREE.Plane(new THREE.Vector3(0, 0, 1), -zc)]);
-    this._flexGroups = { fore, aft };
-    this.group.visible = false;
+    const locals = which === 'fore'
+      ? [new THREE.Plane(new THREE.Vector3(0, 0, -1), zc)]
+      : [new THREE.Plane(new THREE.Vector3(0, 0, 1), -zc)];
+    const clone = this.group.clone(true);
+    const ribbons = [];
+    clone.traverse(o => { if (o.name === 'crackRibbon' || o.name === 'deckRipple' || o.name === 'peelStripGroup') ribbons.push(o); });
+    for (const r of ribbons) r.parent.remove(r);
+    clone.visible = false; // hidden until hingeStart (see updateBreakup)
+    const mats = [];
+    clone.traverse(o => {
+      if (o.isMesh) {
+        o.material = o.material.clone();
+        o.material.clippingPlanes = locals.map(() => new THREE.Plane());
+        o.material.userData.clipLocals = locals;
+        mats.push(o.material);
+      }
+    });
+    (this.group.parent || ctx.scene).add(clone);
+    return { group: clone, mats, locals };
   }
   _aimFlexMats(fg) {
     fg.group.updateMatrix();
@@ -2319,11 +2739,20 @@ export class Helicarrier {
     }
   }
   _teardownFlexGroups() {
+    // v1.6.0 perf: also drop a half-built staged pair (first release
+    // before both halves were built) so no hidden clone leaks.
+    if (this._flexStaging) {
+      for (const fg of [this._flexStaging.fore, this._flexStaging.aft]) {
+        if (fg && fg.group.parent) fg.group.parent.remove(fg.group);
+      }
+      this._flexStaging = null;
+    }
     if (!this._flexGroups) return;
     for (const fg of [this._flexGroups.fore, this._flexGroups.aft]) {
       if (fg.group.parent) fg.group.parent.remove(fg.group);
     }
     this._flexGroups = null;
+    this._flexShown = false;
     this.group.visible = true;
   }
   // v1.5.0 D8 progressive flooding capsize (Concordia/Estonia): the
@@ -2362,6 +2791,19 @@ export class Helicarrier {
     if (!plan) { this.breakState = 'none'; return false; }
     this.breakT += dt;
     const t = this.breakT;
+    // v1.6.0 perf: spread held-piece construction across the cracking
+    // / hinging frames instead of building every remaining piece in
+    // the first-release frame (that was 3-5 full group clones, 15-45 ms
+    // each, in one frame — the breakup hitch). One piece per call,
+    // built hidden (see _separatePiece held) so the intact group still
+    // shows the whole ship exactly once; the pieces flip visible at
+    // the first release, when the group hides. If a release arrives
+    // before all pieces are pre-built (fast timescale, sea release),
+    // the first-release block builds the rest, exactly as before.
+    if (!this._breakFirstReleased) {
+      const next = plan.segments.find(s => !s.released && !s._heldPiece);
+      if (next) next._heldPiece = this._separatePiece(ctx, next, true);
+    }
     // Phase 1 — crack propagation: each ribbon grows from the hit
     // around the cross-section; a smoke wisp rides the moving tip.
     for (const r of this._crackRibbons) {
@@ -2395,8 +2837,35 @@ export class Helicarrier {
     // and drive them ±hinge/2 about the roll axis while the hinge runs
     // — the two segments rotate relative to each other, which is true
     // hull flex, not a gap + attitude cheat.
-    if (plan.flexProto && t >= plan.hingeStart && !this._flexGroups) this._buildFlexGroups(ctx, plan);
-    if (this._flexGroups) {
+    // v1.6.0 duplicates fix (A): the flex groups are built ONCE, before
+    // the first release. _teardownFlexGroups() at the first release used
+    // to be undone on the very next frame by this unlatched rebuild, so
+    // the two half-ship clones stayed visible for the whole separation
+    // alongside the released pieces — every released segment drawn twice.
+    // v1.6.0 perf: the two hinge clones used to be built in a single
+    // frame at hingeStart. They are now built one per frame in the
+    // 0.6 s before the hinge, hidden, and only shown at hingeStart —
+    // the same first visible frame as before. _flexGroups is assigned
+    // only once both halves exist, so readers never see a half-built
+    // pair; _flexShown gates the positioning/aiming work.
+    if (plan.flexProto && !this._breakFirstReleased) {
+      if (!this._flexGroups && t >= plan.hingeStart - 0.6) {
+        if (!this._flexStaging) this._flexStaging = {};
+        if (!this._flexStaging.fore) this._flexStaging.fore = this._buildFlexHalf(ctx, plan, 'fore');
+        else if (!this._flexStaging.aft) {
+          this._flexStaging.aft = this._buildFlexHalf(ctx, plan, 'aft');
+          this._flexGroups = { fore: this._flexStaging.fore, aft: this._flexStaging.aft };
+          this._flexStaging = null;
+        }
+      }
+      if (this._flexGroups && !this._flexShown && t >= plan.hingeStart) {
+        this._flexShown = true;
+        this.group.visible = false;
+        this._flexGroups.fore.group.visible = true;
+        this._flexGroups.aft.group.visible = true;
+      }
+    }
+    if (this._flexGroups && this._flexShown) {
       const h = this.breakHinge;
       const fg = this._flexGroups;
       fg.fore.group.position.set(this.x, this.y, this.z);
@@ -2463,6 +2932,28 @@ export class Helicarrier {
     // v1.5.0 D4/D5: detachable assemblies tear off on schedule — the
     // island shears at its base, a pod rips off its mount. The list
     // jumps toward the dead side at the tear moment.
+    // v1.6.0 V11/D4: skip a tear-off whose assembly already left with
+    // a released segment — the segment clone carries the island/pod
+    // with it, and spawning a second one would duplicate it. A
+    // longitudinal half only contains the assembly on its own side.
+    // v1.6.0 duplicates fix (C): an assembly counts as already gone if
+    // a released segment of THIS breakup covers it — or if NO segment
+    // of this breakup covers it at all (it left in an earlier breakup:
+    // a post-D9 second breakup only segments the surviving core).
+    // Same any-match semantics as the old .some() (a d on a shared cut
+    // or in both longitudinal halves checks every covering segment).
+    const assemblyReleased = (d, x) => {
+      let covered = false;
+      for (const s of plan.segments) {
+        if (d < s.lo || d > s.hi) continue;
+        covered = true;
+        if (!s.released) continue;
+        if (s.kind === 'longPort') { if (x < 0) return true; continue; }
+        if (s.kind === 'longStbd') { if (x >= 0) return true; continue; }
+        return true;
+      }
+      return !covered;
+    };
     for (const tf of plan.tearoffs) {
       if (tf.fired || t < tf.at) continue;
       tf.fired = true;
@@ -2472,12 +2963,14 @@ export class Helicarrier {
         const cx = ib ? (ib.min.x + ib.max.x) / 2 : 20;
         const cy = ib ? (ib.min.y + ib.max.y) / 2 : 15;
         const cz = ib ? (ib.min.z + ib.max.z) / 2 : 72;
+        if (assemblyReleased(-cz, cx)) continue;
         const wp = this.group.localToWorld(new THREE.Vector3(cx, cy, cz));
         this._spawnAssemblyPiece(ctx, 'island', undefined, wp);
         this._breakListTarget += 0.03;
       } else {
         const pod = this.pods[tf.podIdx];
         if (pod) {
+          if (assemblyReleased(-pod.local.z, pod.local.x)) continue;
           const wp = this.group.localToWorld(new THREE.Vector3(pod.local.x, pod.local.y, pod.local.z));
           this._spawnAssemblyPiece(ctx, 'pod', tf.podIdx, wp);
           this._breakListTarget += 0.05 * Math.sign(pod.local.x);
@@ -2507,7 +3000,10 @@ export class Helicarrier {
       if (!seaRelease && t < seg.releaseAt) continue;
       seg.released = true;
       seg.releaseBreakT = this.breakT; // exact in-game release time (probe hinge/stagger proof)
-      this._separatePiece(ctx, seg);
+      // v1.6.0 duplicates fix (B): a segment already spawned held is
+      // armed here; otherwise it is built and released at once.
+      if (seg._heldPiece) this._releaseHeldPiece(ctx, seg);
+      else this._separatePiece(ctx, seg);
       released = true;
     }
     if (released && !this._breakFirstReleased) {
@@ -2519,18 +3015,36 @@ export class Helicarrier {
       ctx.msg(`${this.name} broke up (${plan.reason}) — ${plan.segments.length} pieces falling`);
       // v1.5.0 D3: peel strips become light debris at the first tear.
       if (this._buckleMeshes.length) {
+        let stripIdx = 0;
         for (const b of this._buckleMeshes) {
           if (b.kind !== 'strip') continue;
           b.group.updateWorldMatrix(true, false);
           const wp = new THREE.Vector3(); b.group.getWorldPosition(wp);
           const wq = new THREE.Quaternion(); b.group.getWorldQuaternion(wq);
           const wr = new THREE.Euler().setFromQuaternion(wq);
-          this._spawnAssemblyPiece(ctx, 'strip', undefined, wp, wr);
+          this._spawnAssemblyPiece(ctx, 'strip', undefined, wp, wr, stripIdx++);
           if (b.group.parent) b.group.parent.remove(b.group);
         }
         this._buckleMeshes = this._buckleMeshes.filter(b => b.kind !== 'strip');
       }
       this._teardownFlexGroups(); // D13: pieces take over from the hinge groups
+      // v1.6.0 duplicates fix (B): every still-attached segment becomes
+      // a HELD piece now, so the intact group can hide at the first
+      // release without any part of the ship vanishing — unreleased
+      // segments ride as held pieces until their release time (see
+      // _releaseHeldPiece). From this frame on, each part of the ship
+      // is rendered exactly once: released pieces + held pieces, and
+      // the whole-ship group is gone.
+      for (const s of plan.segments) {
+        if (s.released || s._heldPiece) continue;
+        s._heldPiece = this._separatePiece(ctx, s, true);
+      }
+      // v1.6.0 perf: pre-built held pieces were hidden while the
+      // intact group showed the ship; they take over now, in the same
+      // frame the group hides — the ship is still rendered exactly
+      // once (released pieces + held pieces).
+      for (const s of plan.segments) if (s._heldPiece) s._heldPiece.group.visible = true;
+      this.group.visible = false;
     }
     // v1.5.0 D9: all non-core segments are gone — clip the intact
     // group to the core range and let the remainder fall (it is still
@@ -2538,6 +3052,17 @@ export class Helicarrier {
     if (plan.coreIdx >= 0 && this._breakReleased >= plan.segments.length - 1 && !plan._coreClipped) {
       plan._coreClipped = true;
       const core = plan.segments[plan.coreIdx];
+      // v1.6.0 duplicates fix (B/C): the core's held piece comes off —
+      // the core continues as the intact group, clipped to its own
+      // range (its held piece showed exactly that range, so the swap is
+      // seamless). Removing a never-released held section from c.pieces
+      // is not the v1.6.0 Item-2 case (a wreck leaving the array).
+      if (core._heldPiece) {
+        const hp = core._heldPiece;
+        core._heldPiece = null;
+        if (hp.group.parent) hp.group.parent.remove(hp.group);
+        this.pieces = this.pieces.filter(p => p !== hp);
+      }
       const locals = [];
       if (core.lo > -CARRIER_LEN / 2 + 1) locals.push(new THREE.Plane(new THREE.Vector3(0, 0, -1), -core.lo));
       if (core.hi < CARRIER_LEN / 2 - 1) locals.push(new THREE.Plane(new THREE.Vector3(0, 0, 1), core.hi));
@@ -2550,6 +3075,14 @@ export class Helicarrier {
           this._coreClipMats.push(o.material);
         }
       });
+      // v1.6.0 duplicates fix (B/C): the group was hidden at the first
+      // release, so re-show it here — _teardownFlexGroups below only
+      // re-shows it when flex groups still exist, and the latch (A)
+      // means they do not. Also record the surviving range: any later
+      // breakUp of this falling core re-segments ONLY this range
+      // (see breakUp), never the full hull.
+      this.group.visible = true;
+      this._coreRange = [core.lo, core.hi];
       for (const r of this._crackRibbons) this.group.remove(r.line);
       this._crackRibbons = [];
       this.breakHinge = 0;
@@ -2587,6 +3120,22 @@ export class Helicarrier {
       this.group.visible = false;
       return true;
     }
+    // v1.6.0 duplicates fix (B): held pieces ride with the carrier
+    // until their release time — the same transform a fresh release
+    // would spawn with (position + hinge/list/flex rotation) — then
+    // their clip planes are re-aimed. Runs on every breakup frame; a
+    // piece spawned held this same frame already has this transform,
+    // so the sync is a no-op for it.
+    for (const s of plan.segments) {
+      const hp = s._heldPiece;
+      if (!hp) continue;
+      hp.group.position.set(this.x, this.y, this.z);
+      hp.group.rotation.set(this.pitch + (this.breakFlex || 0), -this.heading, this.roll + this.breakHinge + (this._breakList || 0));
+      // v1.6.0 perf: a pre-built held piece is hidden until the first
+      // release — its clip planes are re-aimed on the flip frame by
+      // this same loop, so skip the per-material re-aim while hidden.
+      if (hp.group.visible) hp.refreshClipPlanes();
+    }
     return false;
   }
   // v1.5.0 D7: the segment bursts into a debris cloud — a big burst
@@ -2609,21 +3158,28 @@ export class Helicarrier {
     for (let i = 0; i < nRem; i++) {
       const off = (rng() - 0.5) * (seg.hi - seg.lo) * 0.7;
       const rp = this.group.localToWorld(new THREE.Vector3((rng() - 0.5) * 30, deckLocalYAt(-seg.centre - off) + 2, -seg.centre - off));
-      this._spawnAssemblyPiece(ctx, 'remnant', undefined, rp);
+      this._spawnAssemblyPiece(ctx, 'remnant', undefined, rp, undefined, i);
     }
   }
   // Phase 4 — one segment becomes a free BreakupPiece (the old mkPiece
   // loop, refactored to a per-segment call). Cut planes live in the
   // piece's LOCAL space and are re-aimed every frame (v1.3.2).
-  _separatePiece(ctx, seg) {
+  // v1.6.0 duplicates fix (B): held=true builds the piece but does not
+  // release it — it rides with the carrier until _releaseHeldPiece arms
+  // it at its releaseAt. Returns the built piece (undefined only for an
+  // immediate pulverised release, which bursts instead of becoming one).
+  _separatePiece(ctx, seg, held = false) {
     const plan = this._breakPlan;
     const { lo, hi, centre: segCentre } = seg;
-    const { severity, speedF, cutOff, hit, islBox, reason } = plan;
+    const { hit, islBox, reason } = plan;
     const segIdx = plan.segments.indexOf(seg);
     // v1.5.0 D7: a pulverised segment is not a piece at all — it
     // bursts into a debris cloud with a few large remnants, leaving
     // the bow and stern sections with a debris-filled gap between them.
-    if (seg.pulverised) {
+    // A pulverised segment built held is NOT burst yet — it stays visible
+    // as part of the ship until its release time, when _releaseHeldPiece
+    // bursts it. Only an immediate (non-held) release bursts at once.
+    if (seg.pulverised && !held) {
       this._pulveriseSegment(ctx, seg);
       this._breakReleased++;
       return;
@@ -2675,23 +3231,37 @@ export class Helicarrier {
     if (seg.kind === 'longPort' || seg.kind === 'longStbd') {
       // D2: the side-profile cap IS the split face — the hull's side
       // profile at x=0, jagged, matching the longitudinal cut.
-      const scap = addSideProfileCap(clone, 0, { seed: fracSeed(this._brkSeed, segIdx * 2, hit.lz) });
+      // v1.6.0 V1: built only over this half's own [zLo, zHi] (local
+      // z = -d, so the segment [lo, hi] spans z in [-hi, -lo]).
+      // v1.6.0 V3: offset ±0.05 m toward its own side — the port and
+      // starboard caps used to share the exact x=0 plane and z-fight.
+      const xOff = seg.half === 'port' ? -0.05 : 0.05;
+      const scap = addSideProfileCap(clone, xOff, { seed: fracSeed(this._brkSeed, segIdx * 2, hit.lz), zLo: -hi, zHi: -lo });
       if (scap) capMeshes.push(scap);
       cutFaces.push({ lx: 0, ly: 0, lz: -segCentre });
-      // Transverse finish cut on the starboard halves gets a normal cap.
-      if (seg.kind === 'longStbd') {
+      // Transverse finish cut gets a normal cap + petals on BOTH
+      // halves (v1.5.0 only capped the starboard half, leaving the
+      // port half open at the cut). v1.6.0 V2: each cap/petal ring is
+      // clipped to its own half's x-range. The full-length port half
+      // has NO transverse cut (both ends are hull ends), so it gets
+      // no cap at all — capping it would plate the stern.
+      {
         const bound = seg.lo > -166 ? seg.lo : seg.hi; // the transverse cut (not the hull end)
-        const zc = -bound;
-        const cap = addSectionCap(clone, zc, islBox, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx });
-        if (cap) capMeshes.push(cap);
-        petalGroups.push(addTornPetals(clone, zc, seg.lo > -166 ? +1 : -1, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx, tensionSide, detonation: hotCut }));
-        cutFaces.push({ lx: 0, ly: deckLocalYAt(zc), lz: zc });
+        if (Math.abs(bound) < 166.5) {
+          const zc = -bound;
+          const xRange = seg.half === 'port' ? [null, 0] : [0, null];
+          const cap = addSectionCap(clone, zc, islBox, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx, xRange });
+          if (cap) capMeshes.push(cap);
+          petalGroups.push(addTornPetals(clone, zc, seg.lo > -166 ? +1 : -1, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx, tensionSide, detonation: hotCut, xRange }));
+          cutFaces.push({ lx: 0, ly: deckLocalYAt(zc), lz: zc });
+        }
       }
     } else if (diagAngle) {
+      const stretchX = 1 / (Math.cos(diagAngle) || 1);
       if (lo > -CARRIER_LEN / 2 + 1) {
         const cap = addDiagonalCap(clone, -lo, diagAngle, islBox, { seed: fracSeed(this._brkSeed, segIdx * 2, hit.lz), hot: hotCut, hitLx: hit.lx });
         if (cap) capMeshes.push(cap);
-        const pg = addTornPetals(clone, -lo, +1, { seed: fracSeed(this._brkSeed, segIdx * 2, hit.lz), hot: hotCut, hitLx: hit.lx, tensionSide, detonation: hotCut });
+        const pg = addTornPetals(clone, -lo, +1, { seed: fracSeed(this._brkSeed, segIdx * 2, hit.lz), hot: hotCut, hitLx: hit.lx, tensionSide, detonation: hotCut, stretchX });
         pg.rotation.y = -diagAngle;
         petalGroups.push(pg);
         cutFaces.push({ lx: 0, ly: deckLocalYAt(-lo), lz: -lo });
@@ -2699,7 +3269,7 @@ export class Helicarrier {
       if (hi < CARRIER_LEN / 2 - 1) {
         const cap = addDiagonalCap(clone, -hi, diagAngle, islBox, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx });
         if (cap) capMeshes.push(cap);
-        const pg = addTornPetals(clone, -hi, -1, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx, tensionSide, detonation: hotCut });
+        const pg = addTornPetals(clone, -hi, -1, { seed: fracSeed(this._brkSeed, segIdx * 2 + 1, hit.lz), hot: hotCut, hitLx: hit.lx, tensionSide, detonation: hotCut, stretchX });
         pg.rotation.y = -diagAngle;
         petalGroups.push(pg);
         cutFaces.push({ lx: 0, ly: deckLocalYAt(-hi), lz: -hi });
@@ -2720,6 +3290,73 @@ export class Helicarrier {
     }
     clone.position.set(this.x, this.y, this.z);
     clone.rotation.set(this.pitch + (this.breakFlex || 0), -this.heading, this.roll + this.breakHinge + (this._breakList || 0));
+    // v1.4.0 mass (audit F4 + research §4.2): tumble comes from the
+    // off-centre blast/hinge geometry, not coin flips — and is capped
+    // by piece size: ω_roll ≤ 21/L rad/s (a 60 m piece ≤ 0.35 rad/s,
+    // 20°/s; a 150 m half-ship ≤ 0.14 rad/s), pitch/yaw ≤ half that.
+    // Nearest-blast pieces tumble fastest. Rates decay τ=8 s in air
+    // (BreakupPiece.update); they never increase after release except
+    // for the water-impact pitch kick.
+    // v1.6.0 duplicates fix (B): the piece is built with NO motion here.
+    // Ejection/tumble/cookoffs/bornT are armed at RELEASE time
+    // (_armPiece) — for an immediate release that is this same call; for
+    // a held piece it is the release loop, seconds later. The arm draws
+    // from the same per-segment seeded RNG, so a held piece arms with
+    // exactly the values an immediate release would have had.
+    const piece = new BreakupPiece(ctx.scene, clone, 0, 0, 0, 0, 0, 0);
+    if (held) { piece.held = true; piece.group.visible = false; } // v1.6.0 perf: pre-built held pieces stay hidden until the first release flips them visible (the intact group shows the ship until then)
+    else this._armPiece(ctx, seg, piece);
+    piece.clipMats = clipMats;
+    piece.segLen = hi - lo; // v1.4.0 (item 6): wreckage field size
+    piece.segLo = lo; piece.segHi = hi; piece.segCentre = segCentre; piece.segKind = seg.kind; // solidity: real section bounds (collisions.js)
+    // v1.6.0 S2: diagonal-cut metadata for the two-box OBB — which
+    // ends are diagonal cuts (a hull end is not a cut).
+    piece.diagAngle = diagAngle || 0;
+    piece.diagLo = !!diagAngle && lo > -CARRIER_LEN / 2 + 1;
+    piece.diagHi = !!diagAngle && hi < CARRIER_LEN / 2 - 1;
+    piece.carrierName = this.name;
+    // v1.5.0: per-piece fall identity. A longitudinal half is half
+    // the ship (massFrac/areaFrac 0.5) and only 42 m wide — its
+    // collision proxy is 21 m half-beam centred at ±21 m local x.
+    if (seg.kind === 'longPort' || seg.kind === 'longStbd') {
+      piece.massFrac = 0.5; piece.areaFrac = 0.5;
+      piece.halfBeamOverride = 21;
+      piece.centreLocal = { x: seg.half === 'port' ? -21 : 21, y: 0, z: 0 };
+    }
+    // v1.5.0 §3 flutter: a long flat piece rocks with growing amplitude.
+    if ((hi - lo) > 100 && Math.abs(this.pitch) < 0.2) piece.rockAmp = 0.03;
+    piece.burning = this.fires.length > 0 || reason === 'fire' || reason === 'detonation';
+    // v1.4.0 solidity: a piece is its parent's own hull — it must
+    // never collide with the parent while the parent is breaking up
+    // (the piece is born inside the parent's OBB; resolving that
+    // overlap shoved pieces vertically at the 12 m/s push-apart cap
+    // and zeroed their fall speed). Pieces still collide with every
+    // OTHER carrier and with each other.
+    piece.parentCarrier = this;
+    piece.reason = reason;
+    piece.capMeshes = capMeshes;
+    piece.petalGroups = petalGroups;
+    piece.cutFaces = cutFaces;
+    piece.refreshClipPlanes(); // aim the planes before the first frame
+    this.pieces.push(piece);
+    // v1.6.0 duplicates fix (B): the release count advances at RELEASE,
+    // not at held-spawn — a held piece is still part of the ship.
+    if (!held) this._breakReleased++;
+    return piece;
+  }
+  // v1.6.0 duplicates fix (B): arm a built piece for release — ejection
+  // velocities, tumble rates, cook-off transfer, bornT, sink duration.
+  // This is the ejection block _separatePiece used to run inline, moved
+  // verbatim (same per-segment seeded RNG, same draw order), so the
+  // values are identical to an immediate release; only the moment they
+  // are applied moves. Also re-derives the piece's integrated state
+  // (y/roll/pitch/heading) from its group, which the carrier has been
+  // driving while the piece was held.
+  _armPiece(ctx, seg, piece) {
+    const plan = this._breakPlan;
+    const { lo, hi, centre: segCentre } = seg;
+    const { severity, cutOff, hit, reason } = plan;
+    const segIdx = plan.segments.indexOf(seg);
     // v1.4.0 mass (audit F4 + research §4.2): tumble comes from the
     // off-centre blast/hinge geometry, not coin flips — and is capped
     // by piece size: ω_roll ≤ 21/L rad/s (a 60 m piece ≤ 0.35 rad/s,
@@ -2771,39 +3408,17 @@ export class Helicarrier {
     let vz = (this.vz || 0) + plan.impactVz + fwd.z * away * along + rz * lat;
     const hSpeed = Math.hypot(vx, vz);
     if (hSpeed > 25) { vx *= 25 / hSpeed; vz *= 25 / hSpeed; }
-    const piece = new BreakupPiece(ctx.scene, clone, plan.fallVy + up,
-      rollRate, pitchRate, yawRate, vx, vz);
-    piece.clipMats = clipMats;
-    piece.segLen = hi - lo; // v1.4.0 (item 6): wreckage field size
-    piece.segLo = lo; piece.segHi = hi; piece.segCentre = segCentre; // solidity: real section bounds (collisions.js)
-    piece.carrierName = this.name;
-    // v1.5.0: per-piece fall identity. A longitudinal half is half
-    // the ship (massFrac/areaFrac 0.5) and only 42 m wide — its
-    // collision proxy is 21 m half-beam centred at ±21 m local x.
-    if (seg.kind === 'longPort' || seg.kind === 'longStbd') {
-      piece.massFrac = 0.5; piece.areaFrac = 0.5;
-      piece.halfBeamOverride = 21;
-      piece.centreLocal = { x: seg.half === 'port' ? -21 : 21, y: 0, z: 0 };
-    }
-    // v1.5.0 §3 flutter: a long flat piece rocks with growing amplitude.
-    if ((hi - lo) > 100 && Math.abs(this.pitch) < 0.2) piece.rockAmp = 0.03;
+    piece.vy = plan.fallVy + up;
+    piece.vx = vx; piece.vz = vz;
+    piece.rollRate = rollRate; piece.pitchRate = pitchRate; piece.yawRate = yawRate;
+    piece.y = piece.group.position.y;
+    piece.roll = piece.group.rotation.z; piece.pitch = piece.group.rotation.x; piece.heading = -piece.group.rotation.y;
     piece.burning = this.fires.length > 0 || reason === 'fire' || reason === 'detonation';
     // v1.5.0 D11: cook-offs whose clock falls after this release ride
     // on the piece (times re-based to seconds after bornT).
     piece.cookoffs = plan.cookoffs
       .filter(ck => ck.segIdx === segIdx && !ck.fired)
       .map(ck => { ck.fired = true; return { at: Math.max(0.1, ck.at - (seg.releaseBreakT || 0)), size: ck.size, fired: false }; });
-    // v1.4.0 solidity: a piece is its parent's own hull — it must
-    // never collide with the parent while the parent is breaking up
-    // (the piece is born inside the parent's OBB; resolving that
-    // overlap shoved pieces vertically at the 12 m/s push-apart cap
-    // and zeroed their fall speed). Pieces still collide with every
-    // OTHER carrier and with each other.
-    piece.parentCarrier = this;
-    piece.reason = reason;
-    piece.capMeshes = capMeshes;
-    piece.petalGroups = petalGroups;
-    piece.cutFaces = cutFaces;
     piece.bornT = ctx.time || 0;
     // v1.4.0 mass (audit F11): sinking duration from size —
     // v_max = 3.5·√(60/segLen) m/s, clamped 2–6 m/s, so a 150 m
@@ -2811,22 +3426,64 @@ export class Helicarrier {
     // v1.4.1: ±20% per piece (seeded), so identical-size pieces do
     // not sink in lockstep.
     const vMaxPiece = Math.max(2, Math.min(6, 3.5 * Math.sqrt(60 / L)));
-    piece.sinkDur = 110 / vMaxPiece * (0.85 + rng() * 0.4); // max descent rate = 2·55/dur
-    piece.refreshClipPlanes(); // aim the planes before the first frame
-    this.pieces.push(piece);
+    piece.sinkDur = 110 / vMaxPiece * (0.85 + rng() * 0.4); // max descent rate = 2·drop/dur (drop >= 55 m, see the sink branch)
+    piece.held = false;
+  }
+  // v1.6.0 duplicates fix (B): release a held piece at its releaseAt.
+  // A pulverised held segment bursts instead of becoming a piece — its
+  // held group is removed first, so the burst replaces it in the same
+  // frame instead of doubling it. Removing a never-released held
+  // section from c.pieces is not the v1.6.0 Item-2 case (a wreck
+  // leaving the array) — it never existed as an independent piece.
+  _releaseHeldPiece(ctx, seg) {
+    const piece = seg._heldPiece;
+    seg._heldPiece = null;
+    if (!piece) return;
+    if (seg.pulverised) {
+      if (piece.group.parent) piece.group.parent.remove(piece.group);
+      this.pieces = this.pieces.filter(p => p !== piece);
+      this._pulveriseSegment(ctx, seg);
+      this._breakReleased++;
+      return;
+    }
+    this._armPiece(ctx, seg, piece);
+    piece.group.visible = true; // v1.6.0 perf: a piece released before the first-release flip (or pre-built hidden) shows now
     this._breakReleased++;
+  }
+  // v1.6.0 Item 2: the origin altitude at which this carrier's lowest
+  // corner touches the seabed (SEA_FLOOR_Y), from the group's live
+  // transform — exact for any pitch/roll. The local box is the game's own
+  // hull box (x ±42, keel -34, island top +34, z ±166) — the keel/top
+  // are the measured solid-mesh extents (hull_16 keel -33.9, island_6
+  // top +34.0 at level, probed 27 Nov), not the old -30/+20 guess, so
+  // the true keel rests on the floor instead of 4 m under it. Only the
+  // rotation row enters: the translation in the matrix is the group's
+  // position, which is stale by a frame when this is called mid-update.
+  _floorRestY() {
+    this.group.updateWorldMatrix(true, false);
+    const m = this.group.matrixWorld.elements;
+    let minOff = Infinity;
+    for (const x of [-42, 42]) for (const y of [-34, 34]) for (const z of [-166, 166]) {
+      const off = m[1] * x + m[5] * y + m[9] * z;
+      if (off < minOff) minOff = off;
+    }
+    return SEA_FLOOR_Y - minOff;
   }
   update(dt, ctx) {
     // Breakup pieces always update.
     for (const p of this.pieces) p.update(dt, ctx);
-    this.pieces = this.pieces.filter(p => !p.gone);
+    // v1.6.0 Item 2: pieces are NEVER removed from c.pieces any more —
+    // the old `filter(p => !p.gone)` deleted a wreck from the array the
+    // same frame it went 'gone', so it could never rest on the seabed or
+    // stay selectable. Wrecks now go to state 'rested' and stay in the
+    // array (and visible) for the rest of the round.
     // v1.4.0 progressive breakup: drive phases 1–3 on the intact
     // group while it is coming apart; updateBreakup() returns true
     // once the last piece has released (state now 'gone').
     if (this.breakState !== 'none') {
       if (this.updateBreakup(dt, ctx)) return;
     }
-    if (this.state === 'gone') return;
+    if (this.state === 'gone' || this.state === 'rested') return;
     // v1.4.0 rotor spool (spec §2.4): spin rate follows rotor demand —
     // throttle first (the lift fans hold the ship up), forward speed
     // second, a touch more while climbing — with a 6 s first-order lag,
@@ -2909,7 +3566,7 @@ export class Helicarrier {
       const drain = f.intensity * FIRE_DRAIN_RATE * dt;
       if (f.zone.startsWith('pod:')) {
         const pod = this.pods[+f.zone.split(':')[1]];
-        if (pod && pod.alive) { pod.hp -= drain; if (pod.hp <= 0) { pod.alive = false; pod.meshes.forEach(m => { m.visible = false; }); if (this.lift <= 0) this.startFall(ctx, 'last lift pod burned out'); } }
+        if (pod && pod.alive) { pod.hp -= drain; if (pod.hp <= 0) { this._killPodVisual(pod); if (this.lift <= 0) this.startFall(ctx, 'last lift pod burned out'); } }
       } else {
         const z = this.zones[f.zone];
         if (z) { z.hp = Math.max(0, z.hp - drain); if (z.hp <= 0 && f.zone === 'reactor') { this.detonate(ctx, 'reactor'); return; } }
@@ -3297,7 +3954,14 @@ export class Helicarrier {
         const seaH1 = ctx.sea.waveHeight(this.x, this.z, ctx.time);
         if (this.y > seaH1 + 80 && this._brkRng() < (1 - this.hpFrac) * 0.05) {
           this._fallTearDone = true;
-          const deadPod = this.pods.findIndex(p => !p.alive);
+          // v1.6.0 duplicates fix (C): after a D9 the surviving core is
+          // the only hull left — only tear off an assembly still on it.
+          // A pod/island outside the core range already left with its
+          // segment in the first breakup, and a pod whose meshes are
+          // already hidden was already torn off; tearing either off
+          // again would duplicate it.
+          const onCore = (d) => !this._coreRange || (d >= this._coreRange[0] && d <= this._coreRange[1]);
+          const deadPod = this.pods.findIndex(p => !p.alive && onCore(-p.local.z) && p.meshes.some(m => m.visible));
           this.group.updateMatrixWorld(true);
           if (deadPod >= 0) {
             const pod = this.pods[deadPod];
@@ -3309,8 +3973,10 @@ export class Helicarrier {
             const cx = ib ? (ib.min.x + ib.max.x) / 2 : 20;
             const cy = ib ? (ib.min.y + ib.max.y) / 2 : 15;
             const cz = ib ? (ib.min.z + ib.max.z) / 2 : 72;
-            const wp = this.group.localToWorld(new THREE.Vector3(cx, cy, cz));
-            this._spawnAssemblyPiece(ctx, 'island', undefined, wp);
+            if (onCore(-cz)) {
+              const wp = this.group.localToWorld(new THREE.Vector3(cx, cy, cz));
+              this._spawnAssemblyPiece(ctx, 'island', undefined, wp);
+            }
           }
         }
       }
@@ -3414,12 +4080,23 @@ export class Helicarrier {
       if (cap.stage >= cap.stages.length - 1) {
         cap.sinkT += dt / cap.sinkDur;
         const f = Math.min(1, cap.sinkT);
-        this.y = cap.impactY - f * f * 55 + seaHc * (1 - f) * 0.8;
+        // v1.6.0 Item 2: the sink ends on the seabed — the curve is
+        // clamped at the floor (see _floorRestY) and the wreck rests
+        // there, visible, instead of going 'gone' at -55 m.
+        const capRestY = this._floorRestY();
+        // Item 2 fix (27 Nov): same floor-reach depth as the piece
+        // branch — a level hull rests at -60 m, deeper than the old
+        // fixed 55 m drop, so it would hover at -55 m and snap.
+        const capDrop = Math.max(55, cap.impactY - capRestY + 5);
+        const capCurveY = cap.impactY - f * f * capDrop + seaHc * (1 - f) * 0.8;
+        this.y = Math.max(capCurveY, capRestY);
         this.bubbleT = (this.bubbleT || 0) - dt;
         if (this.bubbleT <= 0 && f < 0.9) { this.bubbleT = 0.12 - 0.08 * Math.min(1, f / 0.7); ctx.vfx.bubbles(this.x, cap.impactY, this.z, 6 + Math.floor(f * 8), 200); }
-        if (f >= 1) {
-          this.state = 'gone';
-          this.group.visible = false;
+        if (capCurveY <= capRestY || cap.sinkT >= 1.5) {
+          this.state = 'rested';
+          // Rotation first, so the rest snap uses this frame's attitude.
+          this.group.rotation.set(this.pitch, -this.heading, this.roll);
+          this.y = this._floorRestY(); this.group.position.y = this.y;
           if (this.lastCapsize) { this.lastCapsize.rollDeg = +(this.roll * 180 / Math.PI).toFixed(1); this.lastCapsize.durationS = +cap.t.toFixed(1); }
           if (ctx.wreckage) ctx.wreckage.spawn(this.x, this.z, {
             name: this.name, heading: this.heading,
@@ -3445,7 +4122,15 @@ export class Helicarrier {
       const f = Math.min(1, this.sinkT);
       const waveH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
       const prevY = this.y;
-      this.y = this.impactY - f * f * 55 + waveH * (1 - f) * 0.8;
+      // v1.6.0 Item 2: the sink ends on the seabed — clamp the curve at
+      // the floor (see _floorRestY). She settles onto it as she rolls,
+      // instead of sinking through to -55 m and vanishing.
+      const sinkRestY = this._floorRestY();
+      // Item 2 fix (27 Nov): see the capsize branch — the drop must
+      // reach the floor (level hull rests at -60 m).
+      const sinkDrop = Math.max(55, this.impactY - sinkRestY + 5);
+      const sinkCurveY = this.impactY - f * f * sinkDrop + waveH * (1 - f) * 0.8;
+      this.y = Math.max(sinkCurveY, sinkRestY);
       this.vy = dt > 0 ? (this.y - prevY) / dt : 0;
       // v1.5.0 §4.2: flooding is a CASCADE, not a fill — the list
       // grows in steps as compartments flood (f = 0.25/0.5/0.75 each
@@ -3499,9 +4184,14 @@ export class Helicarrier {
       if (this.bubbleT <= 0 && f < 0.9) { this.bubbleT = 0.12 - 0.08 * Math.min(1, f / 0.7); ctx.vfx.bubbles(this.x, this.impactY, this.z, 6 + Math.floor(f * 8), 200); }
       this.boilT = (this.boilT || 0) - dt;
       if (this.boilT <= 0 && f > 0.15 && f < 0.9) { this.boilT = 0.4 - 0.2 * Math.min(1, f / 0.7); ctx.vfx.boil(this.x, this.impactY, this.z, 60); }
-      if (f >= 1) {
-        this.state = 'gone';
-        this.group.visible = false;
+      // v1.6.0 Item 2: she rests on the seabed when the curve reaches
+      // the floor (or, as a safety, when the sink clock runs 50% past
+      // its end) — visible and selectable for the rest of the round.
+      // The old f>=1 pop hid her at -55 m. The rotation was already set
+      // above, so the rest snap uses this frame's attitude.
+      if (sinkCurveY <= sinkRestY || this.sinkT >= 1.5) {
+        this.state = 'rested';
+        this.y = this._floorRestY(); this.group.position.y = this.y;
         ctx.vfx.burst(this.x, this.impactY, this.z, 30, [0.8, 0.9, 1], 4, 4);
         // v1.4.0 (item 6): instead of vanishing after ~30 s (the old
         // six life-30 dark sprites below), she leaves persistent

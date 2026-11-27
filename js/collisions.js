@@ -168,41 +168,32 @@ function carrierBody(c) {
 // is exact even when the renderer is no-op'd (probes) and matrixWorld is
 // otherwise stale.
 const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3();
-function pieceBody(p) {
+// One OBB for one box of a piece, from the box's local centre and
+// half-extents. The vertical half-extent is the geometrically correct
+// rotated-box formula (v1.6.0 S3): halfH = |sin pitch|·hz +
+// |cos pitch|·(|sin roll|·hx + |cos roll|·hy). The old code overwrote
+// this with a fixed halfHOverride for assemblies — a pitched island
+// under-covered by ~8 m — and centred hull boxes at local y=0 while
+// the true box centre is y=-12 (keel -30..deck +6, half 18) or y=-5
+// for an island segment (-30..+20, half 25).
+function _pieceBoxBody(p, boxCx, boxCy, boxCz, hx, hy, hz, sub) {
   const g = p.group;
   g.updateWorldMatrix(true, false);
-  // v1.5.0: assembly pieces (D4/D5 island/pod, D3 strips, D7 remnants)
-  // and longitudinal halves (D2) carry their own centre offset in
-  // group-local space — an island's centre is its own origin, a
-  // half-hull's centre is at ±21 m local x. Transverse pieces keep the
-  // segment-centre convention (0, 0, -segCentre).
-  const cl = p.centreLocal || { x: 0, y: 0, z: 0 };
-  _v1.set(cl.x, cl.y, -p.segCentre + (cl.z || 0)).applyMatrix4(g.matrixWorld);
+  _v1.set(boxCx, boxCy, boxCz).applyMatrix4(g.matrixWorld);
   const cx = _v1.x, cy = _v1.y, cz = _v1.z;
-  _v2.set(cl.x, cl.y, -p.segCentre - 10 + (cl.z || 0)).applyMatrix4(g.matrixWorld);
+  _v2.set(boxCx, boxCy, boxCz - 10).applyMatrix4(g.matrixWorld);
   let fx = _v2.x - cx, fz = _v2.z - cz;
   const fl = Math.hypot(fx, fz);
   if (fl < 0.01) { // near-vertical piece: no horizontal forward — use heading
     fx = Math.sin(p.heading); fz = -Math.cos(p.heading);
   } else { fx /= fl; fz /= fl; }
-  const halfLenFull = (p.segLen || 60) / 2;
-  // Horizontal projection of the tumbling segment: a piece pitched up
+  // Horizontal projection of the tumbling box: a piece pitched up
   // presents a shorter footprint and a taller vertical extent.
   const cosP = Math.abs(Math.cos(p.pitch || 0));
-  const halfLen = Math.max(12, halfLenFull * cosP);
-  let halfH = Math.abs(Math.sin(p.pitch || 0)) * halfLenFull
-    + PIECE_HALF_H_LEVEL * cosP
-    + Math.abs(Math.sin(p.roll || 0)) * PIECE_HALF_BEAM * 0.5;
-  // Island allowance: the island wedge (local z 47..98, i.e. d -98..-47)
-  // rises ~14 m above the deck line, so a piece containing it is that
-  // much taller. Without it an island piece could clip a deck above it.
-  if (p.segLo !== undefined && p.segLo <= -47 && p.segHi >= -98) halfH += 14;
-  // v1.5.0: assembly pieces carry small proxies (~30 m sphere/capsule
-  // scale) instead of the 42 m half-beam of a hull section, and
-  // longitudinal halves are 21 m half-beam — the always-solid rule
-  // must hold for the new piece shapes, so the proxy matches the piece.
-  const halfBeam = p.halfBeamOverride || PIECE_HALF_BEAM;
-  if (p.halfHOverride) halfH = p.halfHOverride;
+  const halfLen = Math.max(6, hz * cosP);
+  const halfH = Math.abs(Math.sin(p.pitch || 0)) * hz
+    + cosP * (Math.abs(Math.sin(p.roll || 0)) * hx + Math.abs(Math.cos(p.roll || 0)) * hy);
+  const halfBeam = hx;
   // Sinking pieces sink at a fixed rate from sinkT (carrier.js derives y
   // from sinkT, it does not integrate a vy) — recover it analytically.
   // v1.4.0: sinkDur is size-scaled (audit F11), so the analytic vy uses
@@ -211,12 +202,12 @@ function pieceBody(p) {
     ? -2 * Math.min(1, p.sinkT || 0) * 55 / (p.sinkDur || 30)
     : p.vy;
   // v1.5.0: piece mass from massFrac when set (assemblies and halves),
-  // else ∝ segLen as before.
+  // else ∝ segLen as before. Sub-boxes of one piece share its mass.
   const mass = p.massFrac !== null && p.massFrac !== undefined
     ? Math.max(1.5, CARRIER_MASS * p.massFrac)
     : Math.max(1.5, Math.min(CARRIER_MASS, CARRIER_MASS * (p.segLen || 60) / CARRIER_LEN));
   return {
-    kind: 'piece', ref: p, id: 'p' + p.id, name: (p.carrierName || 'carrier') + ' piece',
+    kind: 'piece', ref: p, id: 'p' + p.id + (sub ? '.' + sub : ''), name: (p.carrierName || 'carrier') + ' piece',
     x: cx, z: cz, y: cy, fx, fz, rx: -fz, rz: fx,
     halfLen, halfBeam, halfH,
     vel: { x: p.vx || 0, z: p.vz || 0, y: vy || 0 },
@@ -224,16 +215,62 @@ function pieceBody(p) {
     segLen: p.segLen || 60, mass,
   };
 }
+// Every OBB of a piece. Hull pieces and assemblies are one box; a
+// diagonal-cut hull piece is a main full-width box (length reduced by
+// the diagonal leg at each diagonal end) plus one half-width box per
+// diagonal end, on the long side only (v1.6.0 S2 — the old single box
+// over-covered a diagonal wedge by ~32%, blocking passages the wedge
+// should fit through). Cut plane z = zc + x·tanθ in piece-local
+// coordinates: for a lo cut the long side is +x when tanθ > 0, for a
+// hi cut it is −x. Local z = −d, so the segment [lo, hi] spans
+// z ∈ [−hi, −lo].
+function pieceBodies(p) {
+  const hb = p.halfBeamOverride || PIECE_HALF_BEAM;
+  let cy, hy;
+  if (p.assembly) { cy = 0; hy = p.halfHOverride || 3; }
+  else if (p.segLo !== undefined && p.segLo <= -47 && p.segHi >= -98) { cy = -5; hy = 25; }
+  else { cy = -12; hy = 18; }
+  const hz = (p.segLen || 60) / 2;
+  const cx = (p.centreLocal && p.centreLocal.x) || 0;
+  const cz = -(p.segCentre || 0) + ((p.centreLocal && p.centreLocal.z) || 0);
+  const diag = p.diagAngle || 0;
+  if (!diag || (!p.diagLo && !p.diagHi) || p.assembly) {
+    return [_pieceBoxBody(p, cx, cy, cz, hb, hy, hz, 0)];
+  }
+  const leg = hb * Math.abs(Math.tan(diag));
+  const legLo = p.diagLo ? leg : 0, legHi = p.diagHi ? leg : 0;
+  const zLoM = -p.segHi + legHi, zHiM = -p.segLo - legLo;
+  const out = [];
+  if (zHiM - zLoM > 4) {
+    out.push(_pieceBoxBody(p, cx, cy, (zLoM + zHiM) / 2, hb, hy, (zHiM - zLoM) / 2, 0));
+  }
+  const s = Math.sign(Math.tan(diag)) || 1;
+  if (p.diagLo) {
+    // Lo end: long side is +x for tanθ > 0 (cut z = −lo + x·tanθ).
+    out.push(_pieceBoxBody(p, cx + s * hb / 2, cy, -p.segLo, hb / 2, hy, leg, 1));
+  }
+  if (p.diagHi) {
+    // Hi end: long side is −x for tanθ > 0.
+    out.push(_pieceBoxBody(p, cx - s * hb / 2, cy, -p.segHi, hb / 2, hy, leg, 2));
+  }
+  return out.length ? out : [_pieceBoxBody(p, cx, cy, cz, hb, hy, hz, 0)];
+}
 
 // Every solid body in the round: carriers (alive/falling/sinking) plus
 // the live pieces of every carrier, including carriers already 'gone'
-// whose pieces are still falling/sinking.
+// whose pieces are still falling/sinking. A diagonal piece contributes
+// several boxes (pieceBodies); floating pieces are NOT solid — like
+// wreckage, they are debris to sail through, not obstacles (v1.6.0 B2).
 export function solidBodies(G) {
   const out = [];
   for (const c of G.allCarriers) {
     if (isSolid(c)) out.push(carrierBody(c));
     for (const p of c.pieces) {
-      if (p.state === 'falling' || p.state === 'sinking') out.push(pieceBody(p));
+      // v1.6.0 duplicates fix (B): a HELD piece is still part of its
+      // parent carrier — the parent body already covers it. Counting it
+      // as a second body would double-push anything it touches.
+      if (p.held) continue;
+      if (p.state === 'falling' || p.state === 'sinking') out.push(...pieceBodies(p));
     }
   }
   return out;
@@ -686,6 +723,9 @@ export function checkCarrierCollisions(G, ctx, dt) {
           // Pieces still collide with every other carrier and each other.
           if ((A.kind === 'carrier' && B.kind === 'piece' && B.ref.parentCarrier === A.ref) ||
               (B.kind === 'carrier' && A.kind === 'piece' && A.ref.parentCarrier === B.ref)) continue;
+          // v1.6.0 S2: sub-boxes of the SAME piece never collide with
+          // each other (they overlap by construction at the seams).
+          if (A.ref === B.ref) continue;
           candPairs.push([A, B]);
         }
       }
@@ -696,12 +736,14 @@ export function checkCarrierCollisions(G, ctx, dt) {
     // residual overlap behind — the pair resolved first can be
     // re-overlapped by a pair resolved later in the same pass. Keep
     // re-testing every candidate pair from its pushed positions until
-    // a full pass finds zero overlaps (cap 6 — candidate counts are
-    // small, and a touching pair reports separated, so this terminates).
+    // a full pass finds zero overlaps (cap 12 — v1.6.0 S4: 6 passes
+    // left up to 1.94 m of transient sibling interpenetration;
+    // candidate counts are small, and a touching pair reports
+    // separated, so this terminates).
     // Damage/log cooldowns (same G.time in every iteration) stop any
     // double impact or grind.
     let itersUsed = 0;
-    for (let iter = 0; iter < 6; iter++) {
+    for (let iter = 0; iter < 12; iter++) {
       itersUsed = iter + 1;
       let any = false;
       for (const [A, B] of candPairs) {
@@ -767,6 +809,8 @@ export function soliditySnapshot(G) {
       // Same parent-piece exclusion as the resolution loop above.
       if ((A.kind === 'carrier' && B.kind === 'piece' && B.ref.parentCarrier === A.ref) ||
           (B.kind === 'carrier' && A.kind === 'piece' && A.ref.parentCarrier === B.ref)) continue;
+      // v1.6.0 S2: sub-boxes of the same piece overlap by construction.
+      if (A.ref === B.ref) continue;
       const dy = B.y - A.y;
       const vHalf = A.halfH + B.halfH;
       const vGap = Math.abs(dy) - vHalf;
@@ -787,7 +831,7 @@ export function soliditySnapshot(G) {
     bodies: bodies.map(b => ({
       kind: b.kind, id: b.id, name: b.name, state: b.state,
       x: +b.x.toFixed(1), y: +b.y.toFixed(1), z: +b.z.toFixed(1),
-      segLen: b.segLen || null, halfLen: +b.halfLen.toFixed(1), halfH: +b.halfH.toFixed(1),
+      segLen: b.segLen || null, halfLen: +b.halfLen.toFixed(1), halfH: +b.halfH.toFixed(1), halfBeam: +b.halfBeam.toFixed(1),
       vx: +(b.vel.x || 0).toFixed(1), vy: +(b.vel.y || 0).toFixed(1), vz: +(b.vel.z || 0).toFixed(1),
     })),
     pairsChecked: checked,

@@ -228,6 +228,7 @@ function initScene() {
   scene.add(amb);
   G.sea = new Sea(scene, G.stage);
   G.vfx = new VFX(scene);
+  G.vfx.bindView(renderer, G.camera); // v1.6.0: batched sprite point-size scale
   // v1.4.0 (item 6): persistent floating wreckage after a carrier sinks.
   G.wreckage = new WreckageField(scene, G.sea);
   // v1.3.0 (I) CCIP rings: gold (leader) + white (wingman), hidden until a dive.
@@ -305,16 +306,37 @@ function drivenShips() {
 }
 function setTelegraph(i) {
   G.telegraphIdx = clamp(i, 0, TELEGRAPH.length - 1);
-  for (const c of G.playerFleet) if (c.alive) c.telegraphIdx = G.telegraphIdx;
+  // v1.6.0: the notch applies to the driven set only — in ANCHOR the
+  // command ship's notch is frozen at its pre-ANCHOR value (inert
+  // while held, preserved for ANCHOR exit); in FLEET this narrows the
+  // loop to the selected ship, which is behaviour-preserving because
+  // escorts never read telegraphIdx (escortControl uses flag speed).
+  for (const c of drivenShips()) c.telegraphIdx = G.telegraphIdx;
   updateTeleBox();
 }
 function switchShip(next) {
   if (!next || !next.alive) return;
   const prev = G.selected;
-  G.waypoint = null;
+  // v1.6.0: the waypoint belongs to the selected ship in FLEET/INDV
+  // but to the driven group in ANCHOR — Tab must not cancel the
+  // group's waypoint steering.
+  if (G.mode !== 'ANCHOR') G.waypoint = null;
   G.camSpectate = null; // v1.2.0: tapping another live ship exits spectate
   rederiveSlots(next, G.playerFleet);
-  if (prev) { next.telegraphIdx = prev.telegraphIdx; next.rudderDeg = next.rudder * 35; }
+  if (G.mode === 'ANCHOR') {
+    // New command ship becomes held (fresh capture); the departing
+    // ship joins the driven group on the group notch, with a fresh
+    // heading capture as the group-heading reference (her holdSpeed
+    // is unused while driven).
+    captureHold(next);
+    if (prev) { prev.telegraphIdx = G.telegraphIdx; captureHold(prev); }
+  } else {
+    if (prev) { next.telegraphIdx = prev.telegraphIdx; next.rudderDeg = next.rudder * 35; }
+    // v1.6.0 INDV: the ship Tabbed away from becomes held — fresh
+    // capture of her spool speed + heading at the Tab frame.
+    if (prev && G.mode === 'INDV') captureHold(prev);
+    clearHold(next);
+  }
   // v1.4.0 (spec §12.1): spoolSpeed is the ordered-speed state and is
   // NOT overwritten on transfer — the new flagship keeps its own spool
   // and the spool slews to the (copied) telegraph at 0.45/0.60 m/s^2,
@@ -326,51 +348,62 @@ function switchShip(next) {
   msg('Command: ' + next.name);
   renderFleetPanels();
 }
-// (c) Flagship death must never leave the helm on a dead carrier. The
-// moment the selected carrier stops being alive (falling, sinking or
-// gone), command passes to the next live carrier of the same side —
-// EXCEPT a zero-throttle fall (v1.4.1): the pods are alive and the
-// player can spool her back up, so the helm stays on her while she is
-// falling-and-recoverable (see the guard in ensureLiveCommand).
-// Called every frame from updateSteering — so the transfer lands within
-// a frame of the loss, even for a fall (onCarrierLost only fires once
-// the wreck is 'gone', ~40 s of game time later) — and from
-// onCarrierLost as a backstop. No-op while the selection is alive.
-// Telegraph carries over: switchShip copies the dead flagship's notch
-// onto the new one (and the global G.telegraphIdx never changes), and
-// rudder is never snapped: the new flagship keeps its own rudderDeg
-// and the player's live rudder input keeps steering it from the next
-// frame, per the Hurricane no-snap rule. If no live carrier is left
-// the dead selection is cleared and checkEnd ends the round (defeat)
-// once the wrecks have finished sinking — the game never hangs on it.
-function ensureLiveCommand(dead) {
-  if (G.over) return false;
-  if (G.selected && G.selected.alive) return false;
-  // v1.4.1: a zero-throttle fall is not a loss — the pods are alive and
-  // the player can spool her back up, so the helm stays on her while
-  // she is falling-and-recoverable. (switchShip/Tab refuse non-alive
-  // carriers, so transferring away would make recovery impossible.)
-  // The moment she stops being falling-and-recoverable (sinking,
-  // breakup, gone) the transfer below proceeds as before.
-  if (G.selected && G.selected.state === 'falling' && G.selected._fallZeroThrottle) return false;
-  if (!G.selected) return false; // already cleared; Tab/click re-takes command
-  const fleet = G.playerFleet;
-  if (!fleet.length) return false;
-  const lost = dead && fleet.includes(dead) ? dead : G.selected;
-  const start = lost ? fleet.indexOf(lost) : -1;
-  for (let k = 1; k <= fleet.length; k++) {
-    const c = fleet[(start + k) % fleet.length];
-    if (c && c.alive) {
-      switchShip(c);
-      // v1.4.2: the old command-transfer toast is gone (see msg());
-      // the new command ship shows in the top pill + fleet panel.
-      return true;
-    }
+// v1.6.0 hold (INDV/ANCHOR): a held ship sails on in her previous
+// state — the ordered speed and heading captured at the moment she
+// becomes held — instead of being ordered to stop. Capture records
+// spoolSpeed (the ORDERED-speed state, not forwardSpeed), so the
+// spool slew term is zero at capture and the ship's speed evolution
+// is exactly continuous, including finishing a spool she was already
+// on. No write to spoolSpeed / forwardSpeed / rudderDeg / telegraphIdx
+// happens on any mode or selection change (v11.44 no-snap rule).
+function captureHold(c) {
+  if (!c || !c.alive) return;
+  c.holdSpeed = c.spoolSpeed;
+  c.holdHeading = c.heading;
+}
+function clearHold(c) { if (c) { c.holdSpeed = null; c.holdHeading = null; } }
+// Heading-hold rudder: steer back to the captured heading, same gain
+// shape as wpRudderFor (1.5x clamped to +-35 deg). Also the ANCHOR
+// group no-input rudder — a group ship's holdHeading is its heading
+// reference from when it joined the group (captured in setMode /
+// switchShip); if it is somehow unset, capture live rather than
+// steering on NaN.
+function holdRudderFor(c) {
+  if (c.holdHeading == null) captureHold(c);
+  let dh = c.holdHeading - c.heading;
+  dh = ((dh + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+  return clamp(dh * 1.5, -1, 1) * 35;
+}
+function driveHeld(c, dt) {
+  if (!c.alive || c.holdSpeed == null || c.holdHeading == null) captureHold(c);
+  driveCarrierPhysics(c, dt, holdRudderFor(c), c.holdSpeed);
+}
+// v1.6.0: mode entry hook — the old code flipped G.mode by direct
+// assignment with no capture at all. Holds are captured synchronously
+// here, before the first updateSteering() frame runs in the new mode.
+// Entering INDV: every ship that stops being helm/formation-driven
+// becomes held. Entering ANCHOR: the command ship becomes held and
+// the rest become the driven group (adopting the current group notch
+// so every group ship answers the telegraph uniformly). Entering
+// FLEET: all holds cleared — stale values must never be read later.
+function setMode(next) {
+  const prevMode = G.mode, sel = G.selected;
+  if (next === prevMode || !sel) { G.mode = next; updateTeleBox(); return; }
+  if (next === 'INDV') {
+    for (const c of G.playerFleet) if (c !== sel && c.alive) captureHold(c);
+    clearHold(sel);
+  } else if (next === 'ANCHOR') {
+    captureHold(sel);
+    // Group ships adopt the group notch and capture their heading as
+    // the group-heading reference (holdRudderFor) for the no-input,
+    // no-waypoint case; their holdSpeed is unused while driven.
+    for (const c of G.playerFleet) if (c !== sel && c.alive) { clearHold(c); c.telegraphIdx = G.telegraphIdx; captureHold(c); }
+  } else { // FLEET
+    for (const c of G.playerFleet) clearHold(c);
   }
-  G.selected = null;
-  G.camFollow = null;
-  renderFleetPanels();
-  return false;
+  G.mode = next;
+  msg('Steering mode: ' + next + (next === 'ANCHOR' ? ' (command ship holds course, rest driven)' : next === 'INDV' ? ' (others hold course)' : ' (flagship + escorts)'));
+  updateTeleBox();
 }
 function wpRudderFor(c) {
   if (!G.waypoint) return 0;
@@ -637,10 +670,16 @@ function escortControl(c, flag, dt) {
   c.targetAlt = flag.targetAlt + c.slot.dy;
 }
 function updateSteering(dt) {
-  // (c) Helm recovery first: if the flagship just died, command has
-  // already moved to a live carrier before anything steers this frame,
-  // so escortControl always gets a live flag and never early-returns.
-  ensureLiveCommand();
+  // v1.6.0 camera no-hop: there is no auto-transfer any more —
+  // selection stays on a destroyed ship and the camera stays on her
+  // wreck until the player manually Tabs / taps another ship. The
+  // steering block below is therefore gated on a LIVE selection
+  // (camera plan D1): with no live selection, every surviving player
+  // carrier stops through the shared physics, uniformly in all modes.
+  // Nothing here re-derives a flagship — that would be a transfer by
+  // another name. The pitch/throttle block below is deliberately NOT
+  // gated on alive (v1.4.1 recoverable zero-throttle fall: a falling
+  // ship with live pods must stay helmable, or recovery is impossible).
   // v1.2.0 pitch: spring-return track + ArrowUp/Down combine into one
   // pitch command on the selected carrier, every frame. The track and
   // the rudder each own their pointer, so both can be driven at once.
@@ -691,7 +730,7 @@ function updateSteering(dt) {
     }
   }
   const sel = G.selected;
-  if (sel) {
+  if (sel && sel.alive) {
     const manualRudder = Math.abs(G.rudderInput) > 0.02 || G.keys['ArrowLeft'] || G.keys['ArrowRight'] || G.keys['a'] || G.keys['d'];
     if (manualRudder && G.waypoint) { G.waypoint = null; msg('Waypoint cancelled — manual helm'); }
     const rudderKeys = (G.keys['ArrowLeft'] || G.keys['a'] ? -1 : 0) + (G.keys['ArrowRight'] || G.keys['d'] ? 1 : 0);
@@ -701,30 +740,46 @@ function updateSteering(dt) {
       for (const c of G.playerFleet) if (c !== sel && c.alive && !inCollidePair(c)) escortControl(c, sel, dt);
     } else if (G.mode === 'INDV') {
       if (!inCollidePair(sel)) driveCarrier(sel, dt, rudderTarget, true);
-      // v1.4.0 mass (audit F1): non-selected ships stop through the
-      // shared physics (ordered speed 0, rudder 0) — the old branch
-      // decayed only the speed READOUT (τ=2 s) while vx/vz stayed
-      // stale, so a ship sailed 643 m in 39 s at 15.7 m/s while
-      // reading 0. The stop now follows the spec spool-down
-      // (0.60 m/s², τ=4 s, ~31 s / 274 m) with vx/vz consistent.
-      for (const c of G.playerFleet) if (c !== sel && c.alive && !inCollidePair(c)) driveCarrierPhysics(c, dt, 0, 0);
-    } else { // ANCHOR: selected holds, the rest are driven together
+      // v1.6.0 (INDV/ANCHOR fix): non-selected ships sail on in their
+      // previous state — captured spool speed + heading-hold rudder —
+      // instead of being ordered to stop (the v1.4.0 audit-F1 stop).
+      for (const c of G.playerFleet) if (c !== sel && c.alive && !inCollidePair(c)) driveHeld(c, dt);
+    } else { // ANCHOR: command ship holds course, the rest are driven together
       for (const c of G.playerFleet) {
         if (inCollidePair(c)) continue;
-        // v1.4.0 mass (audit F2): the selected ship stops through the
-        // shared physics too — the old branch froze her position in a
-        // single frame (16 m/s → 0 in one frame, infinite
-        // deceleration for a 120,000 t ship). Station-keeping, if
-        // ever needed, must be an ordered speed toward the anchor
-        // point capped at 2 m/s — never a position freeze.
-        if (c === sel) driveCarrierPhysics(c, dt, 0, 0);
-        else driveCarrier(c, dt, keepOutRudder(c, G.waypoint ? wpRudderFor(c) : 0), true);
+        if (c === sel) { driveHeld(c, dt); continue; }
+        // Driven group: manual rudder steers the whole group in
+        // parallel (same target on every ship); otherwise each ship
+        // steers to the shared waypoint per-ship; otherwise each ship
+        // holds the heading it had when it joined the group.
+        let r;
+        if (manualRudder) r = rudderTarget;
+        else if (G.waypoint) r = wpRudderFor(c);
+        else r = holdRudderFor(c);
+        driveCarrier(c, dt, keepOutRudder(c, r), true);
       }
     }
     if (G.waypoint) {
-      const d = Math.hypot(G.waypoint.x - sel.x, G.waypoint.z - sel.z);
+      // v1.6.0: arrival is measured off the driven set — in ANCHOR
+      // the nearest alive driven ship, in FLEET/INDV the selected
+      // ship (the old check measured the command ship, which never
+      // sails to the waypoint in ANCHOR, so it could never clear).
+      let d = 1e18;
+      if (G.mode === 'ANCHOR') {
+        for (const c of G.playerFleet) if (c !== sel && c.alive) d = Math.min(d, Math.hypot(G.waypoint.x - c.x, G.waypoint.z - c.z));
+      } else {
+        d = Math.hypot(G.waypoint.x - sel.x, G.waypoint.z - sel.z);
+      }
       if (d < 100) { G.waypoint = null; msg('Waypoint reached'); }
     }
+  } else {
+    // v1.6.0 camera plan D1: no live selection — no steering orders in
+    // any mode. Every surviving player carrier stops through the
+    // shared physics (ordered speed 0, rudder 0), the same stop INDV
+    // already applies to non-selected ships (spool-down 0.60 m/s²,
+    // τ=4 s). Helm inputs do nothing until the player manually
+    // selects a live ship.
+    for (const c of G.playerFleet) if (c.alive) driveCarrierPhysics(c, dt, 0, 0);
   }
   // Enemy flagship holds a standoff ring on the player flagship
   // (v1.4.0 item 3) — Hurricane's close-to-band-then-circle, rescaled:
@@ -794,17 +849,21 @@ function cameraTarget() {
   // v1.2.0 spectate (Hurricane v11.15): while a destroyed carrier is
   // falling, sinking, or breaking up, the camera follows HER — through
   // the fall, the breakup pieces, the splash and the sinking. The
-  // follow ends by itself when the wreck is fully gone, and the camera
-  // returns to the selected live carrier. Helm/telegraph/rudder are
+  // follow ends by itself when the wreck is fully gone. v1.6.0: the
+  // fall-through target is whatever G.selected / G.camFollow currently
+  // are, and those are never auto-moved off a dead ship — so a
+  // resolved spectate can never hop to a different ship; it returns
+  // to the selected ship (live or wreck). Helm/telegraph/rudder are
   // untouched: they keep driving the selected carrier throughout.
   if (G.camSpectate) {
     const c = G.camSpectate;
     if (c.state === 'falling' || c.state === 'sinking') return { x: c.x, y: c.y, z: c.z };
+    if (c.state === 'rested') return { x: c.x, y: c.y, z: c.z }; // v1.6.0 Item 2: a floor wreck stays followed, at her real depth
     if (c.state === 'gone' && c.pieces.length) {
       const p = c.pieces[0];
       return { x: p.group.position.x, y: p.group.position.y, z: p.group.position.z };
     }
-    G.camSpectate = null; // wreck resolved — back to the fleet
+    G.camSpectate = null; // wreck resolved — back to the selected ship (never auto-moved)
     renderFleetPanels();
   }
   // v1.3.0 (E) detonation hold: while the hold runs the camera frames
@@ -827,9 +886,25 @@ function cameraTarget() {
     $('btnCam').textContent = '📷 Fleet [C]';
   }
   if (G.camTac) return G.camTac;
-  if (G.camFollow) return G.camFollow.group ? { x: G.camFollow.x, y: G.camFollow.y, z: G.camFollow.z } : G.camFollow;
+  // v1.6.0 D3: a fully-gone wreck's frozen y is ~55 m below the
+  // surface — frame the slick / floating wreckage instead of staring
+  // underwater at empty water.
+  // v1.6.0 Item 2: a 'rested' wreck keeps its real y — the camera goes
+  // underwater to her on the seabed (the 'gone' clamp below does not
+  // apply to her).
+  if (G.camFollow) {
+    const f = G.camFollow;
+    const t = f.group ? { x: f.x, y: f.y, z: f.z } : f;
+    if (f.state === 'gone') t.y = G.sea.waveHeight(t.x, t.z, G.time);
+    return t;
+  }
   const s = G.selected;
-  return s ? { x: s.x, y: s.y, z: s.z } : { x: 0, y: 350, z: 0 };
+  if (s) {
+    const t = { x: s.x, y: s.y, z: s.z };
+    if (s.state === 'gone') t.y = G.sea.waveHeight(t.x, t.z, G.time);
+    return t;
+  }
+  return { x: 0, y: 350, z: 0 };
 }
 function updateCamera(dt) {
   const t = cameraTarget();
@@ -961,7 +1036,7 @@ function zoneLine(c) {
   return `${podLine}<br>${f('reactor', 'R')} · ${f('magazine', 'M')} · ${f('bridge', 'B')} · ${f('deck', 'D')} · ${f('engines', 'E')}${fires ? '<br>' + fires : ''}`;
 }
 function carrierRowHTML(c, selectable) {
-  const cls = 'carrierRow' + (G.selected === c ? ' sel' : '') + (c.state === 'gone' || c.state === 'sinking' ? ' dead' : '') + (G.camSpectate === c ? ' watch' : '');
+  const cls = 'carrierRow' + (G.selected === c ? ' sel' : '') + (c.state === 'gone' || c.state === 'rested' || c.state === 'sinking' ? ' dead' : '') + (G.camSpectate === c ? ' watch' : '');
   const hpCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? ' hurt' : ' crit';
   const barCls = c.hpFrac > 0.6 ? '' : c.hpFrac > 0.3 ? 'mid' : 'low';
   const wing = c.wing ? ` · ✈ ${c.wing.remaining} (${c.wing.airborneCount()} ↑)` + (c.wing.squadrons.some(s => s.state === 'launchQueued') ? ' · ⏳' : '') + (c.wing.squadrons.some(s => s.loadout === 'cap' && ['catapult', 'climb', 'patrol', 'intercept'].includes(s.state)) ? ' · 🛡' : c.wing.capOn ? ' · 🛡' : '') : '';
@@ -995,13 +1070,13 @@ function renderFleetPanels() {
       // takes command (and clears any spectate). Tapping the spectated
       // row again returns the camera to the fleet.
       if (c.side === 'player' && !c.alive) {
-        if (c.state === 'falling' || c.state === 'sinking' || (c.state === 'gone' && c.pieces.length)) {
+        if (c.state === 'falling' || c.state === 'sinking' || c.state === 'rested' || (c.state === 'gone' && c.pieces.length)) {
           if (G.camSpectate === c) {
             G.camSpectate = null;
             msg('Camera back on ' + (G.selected ? G.selected.name : 'the fleet'));
           } else {
             G.camSpectate = c;
-            msg('🎥 Watching ' + c.name + ' go down — helm still live, R or a live ship returns');
+            msg('🎥 Watching ' + c.name + (c.state === 'rested' ? ' — wreck on the seabed, R or a live ship returns' : ' go down — helm still live, R or a live ship returns'));
           }
           renderFleetPanels();
           return;
@@ -1104,7 +1179,7 @@ function drawMinimap() {
     g.fillStyle = color;
     g.beginPath(); g.moveTo(0, -14); g.lineTo(9, 10); g.lineTo(-9, 10); g.closePath(); g.fill();
     g.restore();
-    if (c.state === 'gone') { g.strokeStyle = color; g.beginPath(); g.arc(px(c.x), pz(c.z), 8, 0, Math.PI * 2); g.stroke(); }
+    if (c.state === 'gone' || c.state === 'rested') { g.strokeStyle = color; g.beginPath(); g.arc(px(c.x), pz(c.z), 8, 0, Math.PI * 2); g.stroke(); }
   };
   for (const c of G.playerFleet) drawCarrier(c, G.selected === c ? '#ffd166' : '#58c98a');
   for (const c of G.enemyFleet) drawCarrier(c, '#e4572e');
@@ -1368,10 +1443,20 @@ function enemyDirector(dt) {
 }
 function checkEnd() {
   if (G.over) return;
-  // A carrier counts as destroyed only when its wreck is fully gone:
+  // A carrier counts as destroyed once its wreck is no longer in play:
   // breakup sets state='gone' at once, but the pieces are still falling
   // and sinking — the round must not end while wreckage is in the air.
-  const destroyed = c => c.state === 'gone' && c.pieces.length === 0;
+  // v1.6.0 Item 2: an intact sinking/capsizing carrier now ends in
+  // state='rested' (on the seabed, visible) instead of 'gone' — it
+  // counts as destroyed the same way. A carrier that is still
+  // falling/sinking, or whose pieces are still falling/sinking, does not.
+  // v1.6.0 B2: floating pieces do NOT block the end — a buoyant hull
+  // section rides the sea as wreck for the rest of the round (like the
+  // wreckage fields), and the round would otherwise never end. (The
+  // old pieces.length===0 test could never pass at all: pieces are
+  // never removed from the array, so a breakup kill hung the
+  // round-end check forever.)
+  const destroyed = c => (c.state === 'gone' || c.state === 'rested') && !c.pieces.some(p => p.state === 'falling' || p.state === 'sinking');
   // (e) Survivors are carriers in state 'alive' ONLY. A carrier that is
   // falling/sinking is doomed, not a survivor — and while one is still
   // falling/sinking the outcome is undecided, so the round waits for it
@@ -1446,7 +1531,9 @@ function makeCtx() {
       // called from checkEnd() or any per-frame path.
       if (!G._hapticBuzzed.has(c.id) && !G._hapticPending.some(p => p.id === c.id))
         G._hapticPending.push({ id: c.id, side: c.side });
-      ensureLiveCommand(c); renderFleetPanels(); checkEnd();
+      // v1.6.0 camera no-hop: no auto-transfer on loss — selection
+      // stays on the dead ship and the camera stays on her wreck.
+      renderFleetPanels(); checkEnd();
     },
     bombLog: (hit, along, across, by) => {
       G.bombStats.drops++;
@@ -1993,9 +2080,9 @@ function bindInput() {
   $('teleUp').addEventListener('click', () => setTelegraph(G.telegraphIdx - 1));
   $('teleDn').addEventListener('click', () => setTelegraph(G.telegraphIdx + 1));
   $('modeBtn').addEventListener('click', () => {
-    G.mode = G.mode === 'FLEET' ? 'INDV' : G.mode === 'INDV' ? 'ANCHOR' : 'FLEET';
-    msg('Steering mode: ' + G.mode + (G.mode === 'ANCHOR' ? ' (selected ship holds, rest driven)' : G.mode === 'INDV' ? ' (selected ship only)' : ' (flagship + escorts)'));
-    updateTeleBox();
+    // v1.6.0: mode changes go through setMode() — holds are captured
+    // synchronously at entry; never flip G.mode directly.
+    setMode(G.mode === 'FLEET' ? 'INDV' : G.mode === 'INDV' ? 'ANCHOR' : 'FLEET');
   });
   $('btnAgain').addEventListener('click', () => location.reload());
   // v1.3.0 (G/C): pause overlay + mute toggle.
@@ -2018,10 +2105,24 @@ function bindInput() {
   syncMute();
 }
 function cycleShip() {
-  const alive = G.playerFleet.filter(c => c.alive);
-  if (!alive.length) return;
-  const i = alive.indexOf(G.selected);
-  switchShip(alive[(i + 1) % alive.length]);
+  // v1.6.0 Item 2: Tab cycles the live player ships (command, via
+  // switchShip) AND the wrecks (rested, or gone-with-pieces) as camera
+  // targets — a floor wreck stays Tab-reachable all round without
+  // moving the helm. Live ships come first, so a Tab from a live ship
+  // still lands on the next live ship while any survive.
+  const live = G.playerFleet.filter(c => c.alive);
+  const wrecks = G.playerFleet.filter(c => !c.alive && (c.state === 'rested' || (c.state === 'gone' && c.pieces.length)));
+  const order = [...live, ...wrecks];
+  if (!order.length) return;
+  const cur = (G.camSpectate && order.includes(G.camSpectate)) ? G.camSpectate : (G.selected && order.includes(G.selected) ? G.selected : null);
+  const i = cur ? order.indexOf(cur) : -1;
+  const next = order[(i + 1) % order.length];
+  if (next.alive) switchShip(next);
+  else {
+    G.camSpectate = next;
+    msg('🎥 Watching ' + next.name + ' — wreck on the seabed, R returns');
+    renderFleetPanels();
+  }
 }
 function adjustAlt(d) {
   if (!G.selected) return;
@@ -2253,6 +2354,7 @@ async function startGame() {
   G.playerFleet = spawnFleet('player', G.playerN, 1500, 0);
   G.enemyFleet = spawnFleet('enemy', G.enemyN, -1500, Math.PI);
   G.allCarriers = [...G.playerFleet, ...G.enemyFleet];
+  buildWarmupQueue(); // v1.6.0 perf: pre-warm GL programs (see pumpWarmup)
   // v1.4.0 (item 6): a new round starts with a clean sea — no wreckage
   // carried over from the attract scene or a previous round.
   if (G.wreckage) G.wreckage.clear();
@@ -2354,6 +2456,109 @@ function stepSim(dt) {
   // drops the queue so only H3 fires).
   flushHaptics();
 }
+// Program-cache signature for warm-up dedupe: two materials share a
+// GL program iff the program-key inputs match (three r160
+// WebGLPrograms: shader id, map presence per slot, vertexColors,
+// flatShading, side, alphaTest, fog, emissive presence). Colour,
+// opacity, metalness/roughness values, transparent and depthWrite are
+// uniforms/render state, NOT program inputs — colour-only clones
+// (enemy livery, per-carrier light clones) collapse to one entry.
+// Under-dedupe is safe: a missed program simply compiles on first
+// use, as before; over-dedupe only wastes warm-up budget.
+// v1.6.0 perf: GL program pre-warm. Three.js compiles a GL program
+// lazily on the first render of each (material, clipping-plane-count)
+// combination, and in this game new combinations only appear mid-combat
+// (clipped piece materials at breakup, cap/petal materials, wreckage
+// slicks, SAM bodies, scorch sprites) — each compile is a mid-frame
+// hitch (tens of ms on a real GPU, seconds under SwiftShader). The
+// program cache is refcounted (WebGLPrograms.releaseProgram destroys
+// a program at zero users), so throwaway warm-up materials would NOT
+// keep the programs — the warmed clones are kept alive in
+// G._warmMats for the session. Warm-up is spread across frames (4
+// dummy renders per frame, 1-triangle meshes far below the sea) so
+// boot takes no hit and the queue drains in the first ~1 s of play,
+// long before combat. Dummy meshes are removed the next frame; only
+// the materials persist.
+function warmProgSig(m) {
+  if (m.isShaderMaterial) return 'shader|' + m.vertexShader + '|' + m.fragmentShader;
+  const has = (k) => (m[k] ? '1' : '0');
+  return [m.type, has('map'), has('alphaMap'), has('emissiveMap'), has('metalnessMap'),
+    has('roughnessMap'), has('normalMap'), has('bumpMap'), has('aoMap'), has('lightMap'),
+    m.vertexColors ? '1' : '0', m.flatShading ? '1' : '0', m.side,
+    (m.alphaTest || 0) > 0 ? '1' : '0', m.fog === false ? '0' : '1',
+    (m.emissive && m.emissive.getHex() !== 0) ? '1' : '0'].join('|');
+}
+function collectWarmupMaterials() {
+  // Returns [{ mat, planes }] — planes lists the clipping-plane counts
+  // to warm. ONLY the carrier template materials ever receive
+  // clipping planes (piece/flex/core clips); every other lazily-used
+  // material (SAM, caps, sprites, wreckage, CCIP, freak wall) is only
+  // ever rendered unclipped, so warming plane variants of those would
+  // compile programs the game never uses.
+  const seenClip = new Set(), seenPlain = new Set();
+  const out = [];
+  const addClip = (m) => { const s = warmProgSig(m); if (m && !seenClip.has(s)) { seenClip.add(s); out.push({ mat: m, planes: [0, 1, 2, 3] }); } };
+  const addPlain = (m) => { const s = warmProgSig(m); if (m && !seenPlain.has(s)) { seenPlain.add(s); out.push({ mat: m, planes: [0] }); } };
+  for (const c of [G.playerFleet[0], G.enemyFleet[0]]) {
+    if (!c) continue;
+    c.group.traverse(o => { if (o.isMesh) addClip(o.material); });
+  }
+  if (G.wreckage) {
+    for (const m of G.wreckage.chunkMats) addPlain(m);
+    for (const s of G.wreckage.slickPool) addPlain(s.material);
+    for (const r of G.wreckage.ringPool) addPlain(r.material);
+  }
+  // SAM body (airdefense.js: one new MeshStandardMaterial per SAM
+  // launch) and the per-cap/petal material (carrier.js: one new
+  // vertex-colours standard material per cap/petal group).
+  addPlain(new THREE.MeshStandardMaterial({ color: 0xeeeeee, metalness: 0.5, roughness: 0.4 }));
+  addPlain(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0.3, side: THREE.DoubleSide }));
+  // Scorch / nav-light sprite material (SpriteMaterial + soft texture).
+  addPlain(new THREE.SpriteMaterial({ map: G.vfx.softTex, color: 0xffffff, transparent: true, opacity: 0.9, depthWrite: false }));
+  if (G.ccipMeshes) for (const r of G.ccipMeshes) addPlain(r.material);
+  if (G.freakMesh) addPlain(G.freakMesh.material);
+  return out;
+}
+function buildWarmupQueue() {
+  const queue = [];
+  // Plane counts 0-3 for clippable materials: intact pieces render
+  // unclipped (0, already compiled by normal rendering — included so
+  // the lazily-created materials get their 0-plane program too),
+  // pieces use 1-2, and longitudinal halves use 3.
+  for (const { mat, planes } of collectWarmupMaterials()) for (const n of planes) {
+    const c = mat.clone();
+    if (n > 0) {
+      const pls = [];
+      for (let i = 0; i < n; i++) pls.push(new THREE.Plane(new THREE.Vector3(0, 0, i % 2 ? 1 : -1), 0));
+      c.clippingPlanes = pls;
+    }
+    queue.push(c);
+  }
+  G._warmQueue = queue;
+  G._warmMats = queue; // kept alive — see the note above
+  G._warmActive = [];
+  G._warmGeo = new THREE.PlaneGeometry(0.01, 0.01);
+  G._warmDone = 0;
+}
+function pumpWarmup() {
+  if (!G._warmQueue) return;
+  if (G._warmActive) { for (const d of G._warmActive) G.scene.remove(d); G._warmActive.length = 0; }
+  if (!G._warmQueue.length) return;
+  for (let i = 0; i < 4 && G._warmQueue.length; i++) {
+    const mat = G._warmQueue.shift();
+    // A SpriteMaterial MUST render on a Sprite: the renderer reads
+    // object.center for sprite uniforms, and a Mesh has none (throws
+    // reading .x of undefined). Every other material renders on the
+    // shared 1-triangle dummy mesh.
+    const d = mat.isSpriteMaterial ? new THREE.Sprite(mat) : new THREE.Mesh(G._warmGeo, mat);
+    d.frustumCulled = false;
+    d.position.set(0, -5000, 0);
+    G.scene.add(d);
+    G._warmActive.push(d);
+    G._warmDone++;
+  }
+}
+
 function loop(now) {
   requestAnimationFrame(loop);
   const rawDt = Math.min(0.10, (now - lastT) / 1000);
@@ -2385,7 +2590,7 @@ function loop(now) {
   const alive = G.allCarriers.filter(c => c.state !== 'gone');
   const fx = alive.reduce((a, c) => a + c.x, 0) / Math.max(1, alive.length);
   const fz = alive.reduce((a, c) => a + c.z, 0) / Math.max(1, alive.length);
-  const wakeShips = G.allCarriers.filter(c => c.y < 60).map(c => ({ x: c.x, z: c.z, heading: c.heading, forwardSpeed: c.forwardSpeed, len: CARRIER_LEN, beam: 70 }));
+  const wakeShips = G.allCarriers.filter(c => c.y < 60 && c.state !== 'rested').map(c => ({ x: c.x, z: c.z, heading: c.heading, forwardSpeed: c.forwardSpeed, len: CARRIER_LEN, beam: 70 })); // v1.6.0 Item 2: a floor wreck leaves no surface wake
   // v1.4.2 rotor downwash — momentum theory with the game's own numbers
   // (documented here so the values are checkable, not tuned to look nice):
   //   weight W = 120,000,000 kg * 9.81 = 1.1772e9 N; fan radius r = 19 m
@@ -2446,6 +2651,7 @@ function loop(now) {
   G.vfx.update(rawDt);
   updateCamera(rawDt);
   drawMinimap();
+  pumpWarmup(); // v1.6.0 perf: 4 warmed materials render this frame
   if (DEBUG) {
     $('dbgInfo').textContent = `t=${G.time.toFixed(0)}s · jets up ${G.allCarriers.reduce((a, c) => a + (c.wing ? c.wing.airborneCount() : 0), 0)} · bombs ${G.bombs.length} · missiles ${G.missiles.length} · SAMs ${G.airDefense ? G.airDefense.sams.length : 0} · parts steal: P ${G.vfx.pCursor}/${1600} S ${G.vfx.spCursor}/${420}` +
       (G.wreckage ? ` · wreck ${G.wreckage.fields.length} fields / ${G.wreckage.chunkCount} chunks / ${G.wreckage.slickCount} slicks` : '') +
