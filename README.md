@@ -1,4 +1,4 @@
-# Helicarriers at Sea — v1.6.0
+# Helicarriers at Sea — v1.6.1
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
@@ -6,6 +6,7 @@ home. **Jets strike only in v1 — no dogfighting.** v1.4.0 adds defensive
 CAP gun passes against inbound strikes (see below) — interception,
 not dogfighting.
 
+v1.6.1: hotfix — underwater-camera crash fixed (VFX sprite shader now declares fogDensity; the linear→FogExp2 fog switch no longer throws at three.module.js:27531).
 v1.6.0: performance, fragment solidity/buoyancy/persistence, INDV/ANCHOR steering, camera no-hop, seabed wrecks, damage-shake retune, duplicates fix.
 - **Performance** — program pre-warm (shader compiles front-loaded at boot), VFX sprites batched to a single Points draw, sea on a wave table with analytic normals, cheap JS wins, breakup spread over frames. Whole-run work −44% vs v1.5.0 in the headless harness (phone calm ~12–14 ms, kill phases improved).
 - **Fragments stay solid** — carriers and fragments never phase through each other; pieces settle, float and sink per buoyancy physics and rest on the seabed (`rested`) instead of despawning; no part of a ship ever just disappears. The one vanish-probe flag on the final tree was a same-frame core held-piece swap to the clipped intact group, proven seamless per-frame.

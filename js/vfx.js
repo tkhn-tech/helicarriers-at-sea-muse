@@ -129,6 +129,16 @@ export class VFX {
         uScale: { value: 1 },
         fogColor: { value: new THREE.Color(0x9fc3d8) },
         fogNear: { value: 800 }, fogFar: { value: 6000 },
+        // v1.6.1 HOTFIX: fogDensity MUST be declared. This material has
+        // fog:true, so when the scene fog flips linear -> FogExp2 (the
+        // camera goes underwater, game.js updateCamera) Three's
+        // refreshFogUniforms sets uniforms.fogDensity.value
+        // (three.module.js:27531) — without this entry that is
+        // "Cannot set properties of undefined (setting 'value')" and
+        // the game shows the "Failed to start" overlay mid-round.
+        // The value is overwritten from the scene fog on every program
+        // switch; 0.005 matches the underwater murk density.
+        fogDensity: { value: 0.005 },
       },
       vertexShader: `
         attribute vec3 aColor; attribute vec2 aSize; attribute float aOpacity;
