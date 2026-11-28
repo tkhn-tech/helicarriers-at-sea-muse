@@ -103,8 +103,9 @@ const G = {
   // time of the last pattern (500 ms global floor); _hapticBuzzed =
   // carrier ids already buzzed once (H1/H2 fire once per carrier);
   // _hapticPending = kills/losses queued in onCarrierLost and flushed
-  // after checkEnd() in stepSim, so a mutual destruction fires H3
-  // only, never H1+H2+H3; _hapticLog = attempts, for probes.
+  // in stepSim after checkOutcome(), so a mutual destruction fires
+  // H1/H2 for the carriers and then H3 for the outcome, in order;
+  // _hapticLog = attempts, for probes.
   _hapticLast: 0, _hapticBuzzed: new Set(), _hapticPending: [], _hapticLog: [],
   // v1.2.0 spectate (Hurricane v11.15 flow): the destroyed carrier the
   // camera follows through the fall/breakup/splash/sinking. Command and
@@ -130,7 +131,7 @@ const G = {
     waveInterval: 0, waveAttempted: new Set(), waveLaunched: 0,
     log: [], stats: { waves: 0, launches: 0, coordinatedWaves: 0 },
   },
-  over: false, bombStats: { drops: 0, hits: 0, log: [] },
+  over: false, bombStats: { drops: 0, hits: 0, log: [] }, // v1.6.2: 'over' is dead — the round never ends on its own, so nothing sets it; kept only so old probe/debug reads of G.over return false instead of undefined
   // v1.4.0 (item 5) CAP stats — launches, intercepts, gun passes /
   // hits, strike aborts + ordnance denied, enemy jets spun out by CAP
   // gunfire. Read by the v14-cap probes; never shown in the HUD.
@@ -148,7 +149,8 @@ const G = {
   collidePair: null, // [a, b] carriers forced onto a collision course (?collide= / debug button)
   collideMode: null, // 'headon' | 'gentle' | 'drift'
   enemyFlag: null, // (c) current live enemy flagship (role moves when it dies)
-  endResult: null, // (e) 'win' | 'lose' | 'draw' once the round ends
+  endResult: null, // (e) 'win' | 'lose' | 'draw' — the DECIDED outcome, shown as information only (v1.6.2: the round never ends on its own; see checkOutcome/showOutcome). outcomeDismissed = the player tapped Keep playing for this result, so it is not re-shown unless the outcome changes.
+  outcomeDismissed: false,
 };
 
 // v1.4.2: the toast/event-message system is removed entirely — the
@@ -166,9 +168,9 @@ const G = {
 function msg(text) {}
 
 // v1.4.0 (item 7, touch spec §5): haptics — navigator.vibrate only,
-// five rare events only (H1 kill, H2 own loss, H3 round end, H4 freak
-// wave; H5 flagship-under-fire is NOT shipped, see spawnFreakWave /
-// endGame / flushHaptics). Gated on the same flag as audio
+// five rare events only (H1 kill, H2 own loss, H3 outcome announced,
+// H4 freak wave; H5 flagship-under-fire is NOT shipped, see
+// spawnFreakWave / showOutcome / flushHaptics). Gated on the same flag as audio
 // (G.audio.muted, localStorage 'helicarriers_muted'): Sound off also
 // silences vibration, and muting cancels a pattern in flight
 // (navigator.vibrate(0) in the mute handler). 500 ms real-time floor
@@ -182,7 +184,7 @@ function msg(text) {}
 // (kind/pattern/game time) so probes can count patterns headless,
 // where no motor exists. This helper is never called from a per-frame
 // path: H1/H2 go through the once-per-carrier pending queue, H3
-// through endGame (runs once), H4 through spawnFreakWave.
+// through showOutcome (once per outcome value), H4 through spawnFreakWave.
 function haptic(pattern, kind) {
   if (G.audio && G.audio.muted) return false;
   const now = Date.now();
@@ -193,11 +195,11 @@ function haptic(pattern, kind) {
   return true;
 }
 // Flush the kill/loss queue (see G._hapticPending). Called from
-// stepSim after checkEnd(): if the round just ended, the pending
-// kills are dropped — a mutual destruction fires H3 only.
+// stepSim after checkOutcome(). v1.6.2: there is no round end to drop
+// the queue for any more — the outcome buzz (H3) fires alongside the
+// kill/loss buzzes, in order, and play carries on.
 function flushHaptics() {
   if (!G._hapticPending.length) return;
-  if (G.over) { G._hapticPending.length = 0; return; }
   for (const p of G._hapticPending) {
     if (G._hapticBuzzed.has(p.id)) continue;
     G._hapticBuzzed.add(p.id);
@@ -845,6 +847,21 @@ function orbitPos(target, yaw, pitch, dist) {
     target.y + Math.sin(pitch) * dist,
     target.z + Math.cos(yaw) * Math.cos(pitch) * dist);
 }
+function largestWreckPiece(c) {
+  // v1.6.2: the largest wreck piece — hull sections first, longest wins.
+  // The camera follows THIS when a carrier is 'gone', so the follow
+  // target survives the whole-ship -> fragments transition: at the
+  // release frame the pieces still ride at the carrier's position, so
+  // the target does not jump, and it then rides the wreck down instead
+  // of snapping to the sea surface at the frozen x/z (the v1.6.0 'gone'
+  // clamp — the hop Nicholas reported when carriers explode).
+  if (!c || !c.pieces || !c.pieces.length) return null;
+  const hull = c.pieces.filter(p => !p.assembly);
+  const pool = hull.length ? hull : c.pieces;
+  let big = pool[0];
+  for (const p of pool) if ((p.segLen || 0) > (big.segLen || 0)) big = p;
+  return big;
+}
 function cameraTarget() {
   // v1.2.0 spectate (Hurricane v11.15): while a destroyed carrier is
   // falling, sinking, or breaking up, the camera follows HER — through
@@ -859,9 +876,9 @@ function cameraTarget() {
     const c = G.camSpectate;
     if (c.state === 'falling' || c.state === 'sinking') return { x: c.x, y: c.y, z: c.z };
     if (c.state === 'rested') return { x: c.x, y: c.y, z: c.z }; // v1.6.0 Item 2: a floor wreck stays followed, at her real depth
-    if (c.state === 'gone' && c.pieces.length) {
-      const p = c.pieces[0];
-      return { x: p.group.position.x, y: p.group.position.y, z: p.group.position.z };
+    if (c.state === 'gone') {
+      const p = largestWreckPiece(c);
+      if (p) return { x: p.group.position.x, y: p.group.position.y, z: p.group.position.z };
     }
     G.camSpectate = null; // wreck resolved — back to the selected ship (never auto-moved)
     renderFleetPanels();
@@ -894,12 +911,24 @@ function cameraTarget() {
   // apply to her).
   if (G.camFollow) {
     const f = G.camFollow;
+    if (f.state === 'gone') {
+      // v1.6.2: stay on the wreck — the largest piece — through the
+      // explosion and the fall. The old clamp put the target on the sea
+      // surface at the frozen x/z, so the camera snapped away from the
+      // falling wreck the moment the last piece released.
+      const p = largestWreckPiece(f);
+      if (p) return { x: p.group.position.x, y: p.group.position.y, z: p.group.position.z };
+    }
     const t = f.group ? { x: f.x, y: f.y, z: f.z } : f;
     if (f.state === 'gone') t.y = G.sea.waveHeight(t.x, t.z, G.time);
     return t;
   }
   const s = G.selected;
   if (s) {
+    if (s.state === 'gone') {
+      const p = largestWreckPiece(s);
+      if (p) return { x: p.group.position.x, y: p.group.position.y, z: p.group.position.z };
+    }
     const t = { x: s.x, y: s.y, z: s.z };
     if (s.state === 'gone') t.y = G.sea.waveHeight(t.x, t.z, G.time);
     return t;
@@ -1394,7 +1423,7 @@ function directorReset() {
   D.log = []; D.stats = { waves: 0, launches: 0, coordinatedWaves: 0 };
 }
 function enemyDirector(dt) {
-  if (G.enemyAI !== 'auto' || G.over) return;
+  if (G.enemyAI !== 'auto') return; // v1.6.2: no G.over any more — the director keeps running after the outcome is decided, so surviving jets and the AI keep doing whatever they do with no enemy left
   const D = G.director;
   const aliveE = G.enemyFleet.filter(c => c.alive && c.wing);
   const aliveP = G.playerFleet.filter(c => c.alive);
@@ -1441,45 +1470,68 @@ function enemyDirector(dt) {
     }
   }
 }
-function checkEnd() {
-  if (G.over) return;
+function computeOutcome() {
+  // v1.6.2: the outcome is a fact about the fleets, not a round end.
   // A carrier counts as destroyed once its wreck is no longer in play:
   // breakup sets state='gone' at once, but the pieces are still falling
-  // and sinking — the round must not end while wreckage is in the air.
-  // v1.6.0 Item 2: an intact sinking/capsizing carrier now ends in
-  // state='rested' (on the seabed, visible) instead of 'gone' — it
+  // and sinking — the outcome must not be decided while wreckage is in
+  // the air. v1.6.0 Item 2: an intact sinking/capsizing carrier now ends
+  // in state='rested' (on the seabed, visible) instead of 'gone' — it
   // counts as destroyed the same way. A carrier that is still
   // falling/sinking, or whose pieces are still falling/sinking, does not.
-  // v1.6.0 B2: floating pieces do NOT block the end — a buoyant hull
+  // v1.6.0 B2: floating pieces do NOT block the outcome — a buoyant hull
   // section rides the sea as wreck for the rest of the round (like the
-  // wreckage fields), and the round would otherwise never end. (The
-  // old pieces.length===0 test could never pass at all: pieces are
+  // wreckage fields), and the outcome would otherwise never be decided.
+  // (The old pieces.length===0 test could never pass at all: pieces are
   // never removed from the array, so a breakup kill hung the
   // round-end check forever.)
   const destroyed = c => (c.state === 'gone' || c.state === 'rested') && !c.pieces.some(p => p.state === 'falling' || p.state === 'sinking');
   // (e) Survivors are carriers in state 'alive' ONLY. A carrier that is
   // falling/sinking is doomed, not a survivor — and while one is still
   // falling/sinking the outcome is undecided, so the round waits for it
-  // to resolve instead of ending early on a wrong count. In particular
+  // to resolve instead of deciding early on a wrong count. In particular
   // both fleets gone at once is NOT a victory: it is a draw.
   const pAlive = G.playerFleet.some(c => c.state === 'alive');
   const eAlive = G.enemyFleet.some(c => c.state === 'alive');
   const pDestroyed = G.playerFleet.every(destroyed);
   const eDestroyed = G.enemyFleet.every(destroyed);
-  if (pDestroyed && eDestroyed) return endGame('draw');
-  if (eDestroyed && pAlive) return endGame('win');
-  if (pDestroyed && eAlive) return endGame('lose');
+  if (pDestroyed && eDestroyed) return 'draw';
+  if (eDestroyed && pAlive) return 'win';
+  if (pDestroyed && eAlive) return 'lose';
   // Otherwise the round is still live, or a carrier is still
   // falling/sinking/breaking up with the outcome undecided — wait.
+  return null;
 }
-function endGame(result) {
-  G.over = true;
+function checkOutcome() {
+  // v1.6.2: the round NEVER ends on its own (Nicholas, 01:57 SGT).
+  // When a fleet is destroyed the outcome is announced once, as
+  // information — showOutcome puts up the card, the player dismisses
+  // it with Keep playing, and the round carries on: remaining ships
+  // keep sailing, wrecks stay toggle-able and spectate-able, jets and
+  // the AI keep doing whatever they do with no enemy left. The card is
+  // re-shown only if the outcome itself changes (e.g. a win becomes a
+  // draw because the last survivor is then lost — to a freak wave, a
+  // collision, or enemy jets still airborne). Nothing here sets G.over
+  // or freezes the sim.
+  const result = computeOutcome();
+  if (!result || result === G.endResult) return;
   G.endResult = result;
-  // v1.4.0 (item 7, touch spec §5.2 H3): round end buzzes exactly
-  // once — win is a rising triple-tick, loss/draw a single heavy
-  // thud. endGame runs once (G.over is set first), and flushHaptics
-  // drops any pending kill/loss buzzes when the round ends, so a
-  // mutual destruction fires H3 only, never H1+H2+H3.
+  G.outcomeDismissed = false;
+  showOutcome(result);
+}
+function showEndCard(title, text, titleColor) {
+  $('endTitle').textContent = title;
+  $('endTitle').style.color = titleColor;
+  $('endText').textContent = text;
+  $('endOverlay').style.display = 'flex';
+}
+function showOutcome(result) {
+  // v1.4.0 (item 7, touch spec §5.2 H3): the outcome buzzes once per
+  // announcement — win is a rising triple-tick, loss/draw a single
+  // heavy thud. checkOutcome announces each outcome value once
+  // (G.endResult is set first); tapping 🏁 End round re-shows the card
+  // and buzzes again, since he asked for it. The kill/loss buzzes
+  // queued in onCarrierLost flush in order around it.
   haptic(result === 'win' ? [20, 60, 20, 60, 40] : [80, 80, 120], 'end-' + result);
   // Survivors: 'alive' only — a falling/sinking carrier is not one.
   const pSurv = G.playerFleet.filter(c => c.state === 'alive').length;
@@ -1495,20 +1547,37 @@ function endGame(result) {
     try { localStorage.setItem('helicarriers_best', JSON.stringify(best)); } catch (_) {}
   }
   const bestLine = `Score ${score} · Best: ${G.best.result.toUpperCase()} ${G.best.score} pts (${G.best.survivors} survived, ${G.best.date})`;
+  // v1.6.2: the card is information, not an end screen — the round
+  // stays open behind it. Keep playing dismisses it; 🏁 End round in
+  // the top bar (or Play again here) ends the round when he chooses.
+  const stayOpen = ' The round stays open — keep playing as long as you like, or end it with 🏁 End round.';
   if (result === 'win') {
-    $('endTitle').textContent = '🏆 VICTORY';
-    $('endTitle').style.color = '#ffd166';
-    $('endText').textContent = `All enemy helicarriers destroyed. ${pSurv} of your carriers survived. ${bestLine}`;
+    showEndCard('🏆 VICTORY', `All enemy helicarriers destroyed. ${pSurv} of your carriers survived. ${bestLine}${stayOpen}`, '#ffd166');
   } else if (result === 'lose') {
-    $('endTitle').textContent = '💥 DEFEAT';
-    $('endTitle').style.color = '#e4572e';
-    $('endText').textContent = `Your fleet is gone. The sea keeps the wreckage. ${eSurv} enemy carrier${eSurv === 1 ? '' : 's'} survived. ${bestLine}`;
+    showEndCard('💥 DEFEAT', `Your fleet is gone. The sea keeps the wreckage. ${eSurv} enemy carrier${eSurv === 1 ? '' : 's'} survived. ${bestLine}${stayOpen}`, '#e4572e');
   } else { // draw — both fleets gone at once is not a victory
-    $('endTitle').textContent = '💥 MUTUAL DESTRUCTION';
-    $('endTitle').style.color = '#e8b13c';
-    $('endText').textContent = 'Both fleets are gone — mutual destruction. No carriers survived. ' + bestLine;
+    showEndCard('💥 MUTUAL DESTRUCTION', 'Both fleets are gone — mutual destruction. No carriers survived. ' + bestLine + stayOpen, '#e8b13c');
   }
-  $('endOverlay').style.display = 'flex';
+}
+function endRoundManually() {
+  // v1.6.2: the ONLY way a round ends is Nicholas ending it — the 🏁
+  // End round button in the top bar. It shows the end card with the
+  // current state: the decided outcome if there is one (re-shown even
+  // if he dismissed it — he asked for it), otherwise a plain end-round
+  // card with the score so far. Play again reloads to the menu; Keep
+  // playing dismisses the card and the round goes on. The sim keeps
+  // running behind the card until he reloads — ending the round is the
+  // reload, not the card.
+  if (!G.started) return;
+  if (G.endResult) {
+    G.outcomeDismissed = false;
+    showOutcome(G.endResult);
+    return;
+  }
+  const pSurv = G.playerFleet.filter(c => c.state === 'alive').length;
+  const eSurv = G.enemyFleet.filter(c => c.state === 'alive').length;
+  const score = pSurv * 100 + (G.enemyFleet.length - eSurv) * 50 + G.bombStats.hits * 5;
+  showEndCard('🏁 END ROUND?', `Score so far ${score} — ${pSurv} of your carriers and ${eSurv} enemy carriers still afloat. Play again starts a fresh round from the menu; Keep playing carries on with this one.`, '#ffd166');
 }
 
 function makeCtx() {
@@ -1526,14 +1595,15 @@ function makeCtx() {
       // flush time) — enemy kill [30,50,60], own loss [25,40,25], so
       // the player can tell them apart without looking. Queued, not
       // fired here: onCarrierLost runs inside the carrier update, and
-      // checkEnd() may end the round in the same frame — the flush in
-      // stepSim drops the queue when the round ends (H3 only). Never
-      // called from checkEnd() or any per-frame path.
+      // checkOutcome() may announce the outcome in the same frame —
+      // the flush in stepSim fires the queue in order around the
+      // outcome buzz. Never called from checkOutcome() or any
+      // per-frame path.
       if (!G._hapticBuzzed.has(c.id) && !G._hapticPending.some(p => p.id === c.id))
         G._hapticPending.push({ id: c.id, side: c.side });
       // v1.6.0 camera no-hop: no auto-transfer on loss — selection
       // stays on the dead ship and the camera stays on her wreck.
-      renderFleetPanels(); checkEnd();
+      renderFleetPanels(); checkOutcome();
     },
     bombLog: (hit, along, across, by) => {
       G.bombStats.drops++;
@@ -1548,7 +1618,7 @@ function makeCtx() {
 // Pause screen (P or Esc): resume / restart / back to menu. The sim
 // freezes; rendering, the sea and the camera keep running underneath.
 function togglePause() {
-  if (!G.started || G.over) return;
+  if (!G.started) return; // v1.6.2: pause works any time the round is running — including after the outcome is decided, since the round never ends on its own
   G.paused = !G.paused;
   $('pauseOverlay').style.display = G.paused ? 'flex' : 'none';
   if (G.audio) G.audio.click();
@@ -1657,7 +1727,7 @@ function updateLightning(dt) {
 // deck/sea plus the minimap marker (drawn in drawMinimap from G.ccip).
 function updateCCIP() {
   G.ccip = [];
-  if (!G.started || G.over) return;
+  if (!G.started) return; // v1.6.2: no G.over — CCIP keeps showing while the round runs on after the outcome
   let mi = 0;
   for (const c of G.playerFleet) {
     if (!c.wing) continue;
@@ -2085,6 +2155,15 @@ function bindInput() {
     setMode(G.mode === 'FLEET' ? 'INDV' : G.mode === 'INDV' ? 'ANCHOR' : 'FLEET');
   });
   $('btnAgain').addEventListener('click', () => location.reload());
+  // v1.6.2: the round ends only when Nicholas ends it — 🏁 End round
+  // in the top bar shows the end card (the decided outcome, or the
+  // score so far mid-round); Keep playing dismisses the card and the
+  // round goes on. Play again reloads to the menu.
+  $('btnEndRound').addEventListener('click', endRoundManually);
+  $('btnKeepPlaying').addEventListener('click', () => {
+    $('endOverlay').style.display = 'none';
+    G.outcomeDismissed = true;
+  });
   // v1.3.0 (G/C): pause overlay + mute toggle.
   $('btnResume').addEventListener('click', togglePause);
   $('btnRestart').addEventListener('click', () => location.reload());
@@ -2226,6 +2305,28 @@ function clickPick(cx, cy) {
   }
 }
 
+// ---------- v1.6.2 timescale control ----------
+// The whole game runs on G.timeScale (default 1 = real time). The HUD
+// seg (#segTimeScale, 1×/2×/4×/8×) is the player-facing control; the
+// debug button cycles the same steps; ?timescale= is snapped to the
+// nearest step on load. setTimeScale is the single setter — every path
+// (HUD click, debug button, URL param) goes through it, so the control
+// always shows the speed the sim is actually running at. The chosen
+// speed is never reset by Tab, mode changes, round events or ship
+// destruction: startGame only (re)sets it from the URL param, and
+// nothing else in the round touches G.timeScale.
+const TS_STEPS = [1, 2, 4, 8];
+function setTimeScale(v) {
+  v = +v;
+  if (!TS_STEPS.includes(v)) v = TS_STEPS.reduce((a, b) => Math.abs(b - v) < Math.abs(a - v) ? b : a);
+  G.timeScale = v;
+  const seg = document.getElementById('segTimeScale');
+  if (seg) seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', +b.dataset.ts === v));
+  const dt = document.getElementById('dbgTime');
+  if (dt) dt.textContent = '⏩ Time scale ×' + v + ' toggle';
+  return v;
+}
+
 // ---------- Debug hooks ----------
 function bindDebug() {
   if (!DEBUG) return;
@@ -2249,8 +2350,17 @@ function bindDebug() {
     }
     msg('Player fleet repaired (debug)'); renderFleetPanels();
   });
-  $('dbgTime').addEventListener('click', () => { G.timeScale = G.timeScale === 1 ? 4 : 1; msg('Time scale ×' + G.timeScale); });
+  $('dbgTime').addEventListener('click', () => { const v = setTimeScale(TS_STEPS[(TS_STEPS.indexOf(G.timeScale) + 1) % TS_STEPS.length]); msg('Time scale ×' + v); });
 }
+
+// v1.6.2: wire the HUD timescale seg to the same setter. (The generic
+// .seg click handler above only toggles the .on class; this sets the
+// sim speed. Bound once at module load — the seg exists in the DOM
+// by then, and the handler reads data-ts from the clicked button.)
+document.getElementById('segTimeScale').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (b && b.dataset.ts) setTimeScale(+b.dataset.ts);
+});
 function killCarrier(c, zone) {
   if (!c || c.state !== 'alive') return;
   if (zone === 'reactor') c.damage(500, 0, 0, false, makeCtx());
@@ -2380,7 +2490,7 @@ async function startGame() {
   window.__bombBallisticsProbe = bombBallisticsProbe;
   window.__predictBombImpact = predictBombImpact;
   window.__noteDetonation = noteDetonation;
-  if (params.has('timescale')) G.timeScale = clamp(+params.get('timescale') || 1, 1, 8);
+  if (params.has('timescale')) setTimeScale(clamp(+params.get('timescale') || 1, 1, 8)); else setTimeScale(1); // v1.6.2: default real time; URL param snaps to nearest step and the HUD seg shows it
   // Debug URL hooks
   if (params.has('collide')) forceCollisionCourse(params.get('collide') === '1' ? 'headon' : params.get('collide'));
   if (params.get('kill') === '1') setTimeout(() => killCarrier(G.enemyFleet[0], 'reactor'), 3000);
@@ -2402,58 +2512,56 @@ let lastT = performance.now();
 // unboundedly). Debug timeScale multiplies the cap, as before.
 function stepSim(dt) {
   G.time += dt;
-  // Post-game freeze (Job B): once G.over is set, the world stops — no
-  // steering, carrier/wing, ordnance or director updates — so the frozen
-  // scene stays exactly the end state the overlay describes (a survivor
-  // can no longer die behind the overlay). Rendering, the sea, VFX
-  // decay, camera orbit and the overlay itself keep running below.
-  // The freeze starts at endGame, never before: checkEnd only ends the
-  // round once every wreck's pieces have resolved, so the
-  // wait-for-pieces-to-sink rule is untouched.
-  if (!G.over) {
-    updateSteering(dt);
-    const ctx = makeCtx();
-    for (const c of G.allCarriers) c.update(dt, ctx);
-    for (const c of G.allCarriers) if (c.wing) c.wing.update(dt, ctx);
-    checkCarrierCollisions(G, ctx, dt);
-    // Release a forced collision course after the first impact: normal
-    // steering (incl. the 600 m keep-out) takes over so the carriers
-    // separate instead of ramming each other again on the next frame.
-    if (G.collidePair && G.collLog.some(e => (e.kind === 'impact' || e.kind === 'catastrophic') &&
-        G.collidePair.some(c => c.id === e.aId) && G.collidePair.some(c => c.id === e.bId))) {
-      G.collidePair = null;
-      msg('Collision course released — carriers separating');
-    }
-    for (const b of G.bombs) b.update(dt);
-    G.bombs = G.bombs.filter(b => b.alive);
-    for (const m of G.missiles) m.update(dt);
-    G.missiles = G.missiles.filter(m => m.alive);
-    // v1.3.0 (A): air defence on both sides.
-    if (G.airDefense) G.airDefense.update(dt, ctx, G);
-    enemyDirector(dt);
-    updateWeatherProgression(dt);
-    updateFreakWave(dt, ctx);
-    updateLightning(dt);
-    // v1.3.0 (C): alarm when the flagship takes fire.
-    if (G.selected && G.selected.fires.length && G.audio && G.time > (G.alarmCool || 0)) {
-      G.audio.alarm(G.time);
-      G.alarmCool = G.time + 5;
-    }
-    // v1.4.0: rotor hum follows the selected carrier's mean spin rate
-    // (throttle-driven — quiet at idle, loud at full rotor strength).
-    if (G.audio && G.selected) {
-      const pods = G.selected.pods;
-      const meanSpin = pods.reduce((a, p) => a + p.spinRate, 0) / Math.max(1, pods.length) / 30;
-      G.audio.rotor(meanSpin);
-    }
-    // v1.4.0 (item 6): wreckage drifts/spreads/bobs with game time.
-    // v1.5.0 D12: pass the VFX pool so burning slicks can throw flames.
-    if (G.wreckage) G.wreckage.update(dt, G.time, G.vfx);
-    checkEnd(); // every frame: a breakup's pieces take ~40 s of game time to sink
+  // v1.6.2: there is NO post-game freeze any more — the round never
+  // ends on its own, so the sim always steps: steering, carriers,
+  // wings, ordnance, director, weather, all of it, even after the
+  // outcome is decided. (The old Job B freeze stopped the world once
+  // G.over was set, so a survivor could no longer die behind the
+  // overlay — that whole path is gone with the forced round end.)
+  // checkOutcome only ANNOUNCES the outcome, once every wreck's
+  // pieces have resolved, so the wait-for-pieces-to-sink rule is
+  // untouched.
+  updateSteering(dt);
+  const ctx = makeCtx();
+  for (const c of G.allCarriers) c.update(dt, ctx);
+  for (const c of G.allCarriers) if (c.wing) c.wing.update(dt, ctx);
+  checkCarrierCollisions(G, ctx, dt);
+  // Release a forced collision course after the first impact: normal
+  // steering (incl. the 600 m keep-out) takes over so the carriers
+  // separate instead of ramming each other again on the next frame.
+  if (G.collidePair && G.collLog.some(e => (e.kind === 'impact' || e.kind === 'catastrophic') &&
+      G.collidePair.some(c => c.id === e.aId) && G.collidePair.some(c => c.id === e.bId))) {
+    G.collidePair = null;
+    msg('Collision course released — carriers separating');
   }
-  // v1.4.0 (item 7): flush queued kill/loss buzzes after checkEnd()
-  // has had its say (see flushHaptics — a round that just ended
-  // drops the queue so only H3 fires).
+  for (const b of G.bombs) b.update(dt);
+  G.bombs = G.bombs.filter(b => b.alive);
+  for (const m of G.missiles) m.update(dt);
+  G.missiles = G.missiles.filter(m => m.alive);
+  // v1.3.0 (A): air defence on both sides.
+  if (G.airDefense) G.airDefense.update(dt, ctx, G);
+  enemyDirector(dt);
+  updateWeatherProgression(dt);
+  updateFreakWave(dt, ctx);
+  updateLightning(dt);
+  // v1.3.0 (C): alarm when the flagship takes fire.
+  if (G.selected && G.selected.fires.length && G.audio && G.time > (G.alarmCool || 0)) {
+    G.audio.alarm(G.time);
+    G.alarmCool = G.time + 5;
+  }
+  // v1.4.0: rotor hum follows the selected carrier's mean spin rate
+  // (throttle-driven — quiet at idle, loud at full rotor strength).
+  if (G.audio && G.selected) {
+    const pods = G.selected.pods;
+    const meanSpin = pods.reduce((a, p) => a + p.spinRate, 0) / Math.max(1, pods.length) / 30;
+    G.audio.rotor(meanSpin);
+  }
+  // v1.4.0 (item 6): wreckage drifts/spreads/bobs with game time.
+  // v1.5.0 D12: pass the VFX pool so burning slicks can throw flames.
+  if (G.wreckage) G.wreckage.update(dt, G.time, G.vfx);
+  checkOutcome(); // every frame: a breakup's pieces take ~40 s of game time to sink
+  // v1.4.0 (item 7): flush queued kill/loss buzzes after checkOutcome()
+  // has had its say (see flushHaptics).
   flushHaptics();
 }
 // Program-cache signature for warm-up dedupe: two materials share a
@@ -2571,16 +2679,27 @@ function loop(now) {
     const fx = alive.reduce((a, c) => a + c.x, 0) / Math.max(1, alive.length);
     const fz = alive.reduce((a, c) => a + c.z, 0) / Math.max(1, alive.length);
     G.sea.update(G.time, rawDt, fx, fz, [], []);
-    G.vfx.update(rawDt);
+    G.vfx.update(rawDt); // v1.6.2 fix: attract mode has no simDt yet
+    // (it is declared below the attract branch) — and the round has
+    // not started, so there is no game time for VFX to age in. The
+    // simDt form here threw a TDZ ReferenceError every frame in menu
+    // mode, freezing the attract scene behind the menu.
     updateCamera(rawDt);
     G.renderer.render(G.scene, G.camera);
     return;
   }
   // v1.3.0 (G) pause: the sim freezes, the scene keeps rendering.
+  // v1.6.2: the sim's per-frame dt is computed once here and reused
+  // below, so the sea and VFX age in game time exactly like the ships,
+  // jets and combat — no part of the game ignores the timescale
+  // control. (At ×1 simDt === rawDt, so this changes nothing for the
+  // default speed; while paused the sea/VFX keep their old rawDt so
+  // the pause card's "the sea keeps moving" still holds.)
+  let simDt = 0;
   if (!G.paused) {
     const totalDt = rawDt * G.timeScale;
     const cap = 0.10 * G.timeScale;
-    const simDt = Math.min(totalDt, cap);
+    simDt = Math.min(totalDt, cap);
     const steps = Math.max(1, Math.ceil(simDt / 0.05));
     const sub = simDt / steps;
     for (let i = 0; i < steps; i++) stepSim(sub);
@@ -2637,7 +2756,7 @@ function loop(now) {
     if (washSources.length >= 32) break;
   }
   G.washDebug = { vDiscHover: 325.5, vDiscFull: 392, h0: 76, sources: washSources.map(s => ({ x: +s.x.toFixed(1), z: +s.z.toFixed(1), strength: +s.strength.toFixed(4), radius: +s.radius.toFixed(1) })) };
-  G.sea.update(G.time, rawDt, fx, fz, wakeShips, washSources);
+  G.sea.update(G.time, G.paused ? rawDt : simDt, fx, fz, wakeShips, washSources);
   // v1.3.0 (D) freak-wave crest wall follows the crest.
   if (G.freakMesh) {
     const fw = G.sea.freak;

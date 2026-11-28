@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>Helicarriers at Sea — v1.6.1</title>
+<title>Helicarriers at Sea — v1.6.2</title>
 <style>
   html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0b1c26;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#dfeef5;}
   #app{position:fixed;inset:0;}
@@ -38,6 +38,15 @@
   .pill{background:rgba(6,18,30,.72);border:1px solid rgba(140,190,230,.25);border-radius:999px;
     padding:6px 11px;font-size:12.5px;font-weight:650;backdrop-filter:blur(6px);white-space:nowrap;}
   .pill b{color:#ffd166;}
+  /* v1.6.2 timescale control: a compact 1×/2×/4×/8× pill group in the
+     top bar (same pill styling as the other top-bar items). The .on
+     button is the readable current speed; buttons are 44 px targets
+     on narrow screens so it works by touch in phone portrait. It wraps
+     with the rest of the bar (flex-wrap is on below 560 px) and sits
+     clear of the helm controls, which live at the bottom. */
+  #segTimeScale{display:flex;gap:2px;background:rgba(6,18,30,.72);border:1px solid rgba(140,190,230,.25);border-radius:999px;padding:2px;pointer-events:auto;white-space:nowrap;}
+  #segTimeScale button{background:none;border:none;color:#9dc3d8;font-size:12px;font-weight:700;cursor:pointer;padding:5px 8px;border-radius:999px;min-height:28px;min-width:34px;}
+  #segTimeScale button.on{background:#ffd166;color:#1a2a33;}
   /* v1.4.1 icon-dashboard bits: a lift mini-bar inside the ship pill,
      and coloured dots in the minimap stats. */
   .minibar{display:inline-block;width:28px;height:6px;background:rgba(255,255,255,.14);border-radius:3px;overflow:hidden;vertical-align:middle;}
@@ -218,6 +227,7 @@
   #pauseCard{padding:26px 34px;text-align:center;} #pauseCard h2{margin:0 0 8px;font-size:30px;}
   #pauseCard button{display:block;width:220px;margin:8px auto;}
   #endCard{padding:26px 34px;text-align:center;} #endCard h2{margin:0 0 8px;font-size:30px;}
+  #endCard button{display:block;width:220px;margin:8px auto;}
   #debugPanel{position:fixed;left:192px;top:calc(56px + env(safe-area-inset-top));width:230px;padding:10px;display:none;z-index:8;pointer-events:auto;font-size:12px;}
   #debugPanel.on{display:block;} #debugPanel button{display:block;width:100%;margin:4px 0;padding:6px;font-size:12px;text-align:left;}
   #probeOut{position:fixed;left:50%;top:calc(96px + env(safe-area-inset-top));transform:translateX(-50%);max-width:min(640px,92vw);max-height:40vh;overflow:auto;padding:10px;display:none;z-index:8;font:12px/1.5 monospace;white-space:pre-wrap;}
@@ -279,6 +289,7 @@
      132 px dock with a gap. */
   @media (max-width:560px){
     .hudTop{padding-right:calc(112px + env(safe-area-inset-right));flex-wrap:wrap;overflow:visible;}
+    #segTimeScale button{padding:8px 10px;min-height:34px;min-width:38px;}
     #minimap{width:96px;height:96px;}
     #fleetPanel{top:calc(108px + env(safe-area-inset-top));max-height:calc(100dvh - 260px);}
     #dockRight{width:132px;top:calc(130px + env(safe-area-inset-top));}
@@ -355,6 +366,8 @@
     <span class="pill" id="pillAir">✈ 48 · 💣 0/0 · 🌊 Calm 1.4</span>
     <button id="btnPause" class="miniBtn pill" title="Pause (P / Esc)" style="pointer-events:auto;">⏸</button>
     <button id="btnMute" class="miniBtn pill" title="Mute / unmute sound" style="pointer-events:auto;">🔊</button>
+    <button id="btnEndRound" class="miniBtn pill" title="End round — back to menu" style="pointer-events:auto;">🏁 End round</button>
+    <div class="seg" id="segTimeScale" title="Game speed — 1× is real time" style="pointer-events:auto;"><button data-ts="1" class="on">1×</button><button data-ts="2">2×</button><button data-ts="4">4×</button><button data-ts="8">8×</button></div>
   </div>
   <div id="fleetPanel" class="panel">
     <div class="panelHead"><span>Your fleet</span><button id="fleetToggle" class="miniBtn" title="Collapse fleet list">▾</button></div>
@@ -427,7 +440,7 @@
 
 <div id="menu"><div id="menuCard" class="panel">
   <h1>HELICARRIERS <span>AT SEA</span></h1>
-  <p class="sub">v1.6.1 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New in v1.6.1: crash fix — the camera going underwater no longer kills the game (the VFX sprite shader was missing its fogDensity uniform, so the fog switch to underwater murk threw at three.module.js:27531). New in v1.6.0: performance (pre-warmed programs, batched VFX sprites, wave-table sea), fragments that stay solid, settle and sink by buoyancy and never vanish, wrecks resting on the seabed, INDV/ANCHOR steering, a camera that stays on your wreck, gentler damage shake, and the duplicate-ship glitch fixed. Also: destruction detail and realism — ships no longer break only in clean slices across the width. Kills now play out as diagonal tears (wedge pieces sliding past each other), asymmetric breakups (one clean end, one shredded end), longitudinal deck splits (the deck unzips along the centreline trench and the hull parts into side-by-side halves), crippled-flight shedding (she keeps flying while pieces leave in order along her flight path), mid-section pulverisation (the centre bursts into a debris cloud), progressive flooding capsizes (she lists in steps, rolls to 90° and sinks intact), and slamming shatter on water entry (nose-down crumples the bow, flat entries whip the hull and fracture midship, side entries trip and roll). Islands shear off and pods tear away as their own tumbling bodies; cook-offs run one at a time along the magazine on a compressed real clock (94 s–10 min in reality, 0.5–30 s here for playability) including after splashdown; deck fires travel as a front leaving scorch behind; the deck buckles and peels in strips before it tears; and the hull genuinely flexes on the structural kill path. Also: island lights die with the bridge, list grows in steps tied to damage events, sinking ships trim bow-first with bubbles that build then stop, and deep sinkings implode. Sunk carriers leave drifting debris and oil slicks — burning wrecks leave burning slicks — that stay on the sea for the rest of the round. The v1.4.2 changes still hold: no in-game toasts, telegraph anchored on phone portrait, real-physics freefall (zero throttle = zero lift), rotor downwash on the sea, linear throttle. Also: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result.</p>
+  <p class="sub">v1.6.2 — command a fleet of flying SHIELD helicarriers. Strike first, keep your lift pods alive, and bring your jets home. New in v1.6.2: the whole game now runs in real time by default — no more ×8 compression — with a new timescale control (1×/2×/4×/8×) in the top bar if you ever want to speed it up; falls now take their real ~8 seconds from 350 m. Fragmentation is cleaner too — the floating black orbs are gone, pieces are bigger solid chunks that stay visible all the way to the seabed, and the camera stays on your carrier through the explosion. Rounds never end on their own now — when a fleet is destroyed you get the result as a card, keep playing as long as you like, and end the round with 🏁 End round in the top bar. Descent is throttle-continuous too — below the 0.69 hover mark the ship sinks on the lift shortfall, faster the lower the throttle, full freefall at zero. New in v1.6.1: crash fix — the camera going underwater no longer kills the game. New in v1.6.0: performance (pre-warmed programs, batched VFX sprites, wave-table sea), fragments that stay solid, settle and sink by buoyancy and never vanish, wrecks resting on the seabed, INDV/ANCHOR steering, a camera that stays on your wreck, gentler damage shake, and the duplicate-ship glitch fixed. Also: destruction detail and realism — ships no longer break only in clean slices across the width. Kills now play out as diagonal tears (wedge pieces sliding past each other), asymmetric breakups (one clean end, one shredded end), longitudinal deck splits (the deck unzips along the centreline trench and the hull parts into side-by-side halves), crippled-flight shedding (she keeps flying while pieces leave in order along her flight path), mid-section pulverisation (the centre bursts into a debris cloud), progressive flooding capsizes (she lists in steps, rolls to 90° and sinks intact), and slamming shatter on water entry (nose-down crumples the bow, flat entries whip the hull and fracture midship, side entries trip and roll). Islands shear off and pods tear away as their own tumbling bodies; cook-offs run one at a time along the magazine on a compressed real clock (94 s–10 min in reality, 0.5–30 s here for playability) including after splashdown; deck fires travel as a front leaving scorch behind; the deck buckles and peels in strips before it tears; and the hull genuinely flexes on the structural kill path. Also: island lights die with the bridge, list grows in steps tied to damage events, sinking ships trim bow-first with bubbles that build then stop, and deep sinkings implode. Sunk carriers leave drifting debris and oil slicks — burning wrecks leave burning slicks — that stay on the sea for the rest of the round. The v1.4.2 changes still hold: no in-game toasts, telegraph anchored on phone portrait, real-physics freefall (zero throttle = zero lift), rotor downwash on the sea, linear throttle. Also: CIWS + SAM air defence on both sides, per-zone jet damage with fires and spin-outs, synth audio, a Hurricane stage with freak waves and lightning, a tactical camera that cycles every jet and holds on detonations, radar sweep and squadron chevrons, pause and a remembered best result.</p>
   <p class="hint" id="bestLine">No rounds played yet — your best result will be remembered here.</p>
   <div class="pick"><label>Fleet size (you)</label><div class="seg" id="segPlayerFleet">
     <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4" class="on">4</button></div></div>
@@ -449,7 +462,7 @@
   <p class="hint" style="margin-top:12px;">Scale: 1 unit = 1 m. Helicarrier 333 m, F-18 18.79 m. Sea: JONSWAP/Gerstner lifted from Hurricane Fleet. Damage is per-zone — pods, reactor, magazine, bridge, deck, engines. Lose all four lift pods and a carrier falls out of the sky under gravity.</p>
 </div></div>
 
-<div id="endOverlay"><div id="endCard" class="panel"><h2 id="endTitle">VICTORY</h2><p id="endText"></p><button id="btnAgain" class="go">Play again</button></div></div>
+<div id="endOverlay"><div id="endCard" class="panel"><h2 id="endTitle">VICTORY</h2><p id="endText"></p><button id="btnKeepPlaying" class="go">▶ Keep playing</button><button id="btnAgain" class="go">Play again</button></div></div>
 
 <div id="debugPanel" class="panel"><b>DEBUG (?debug=1)</b>
   <button id="dbgKillEnemy">☠ Kill enemy carrier 1 (reactor)</button>

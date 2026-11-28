@@ -1,4 +1,4 @@
-# Helicarriers at Sea — v1.6.1
+# Helicarriers at Sea — v1.6.2
 
 Command a fleet of flying SHIELD helicarriers against an enemy fleet of the
 same. Launch F-18 strikes, keep your lift pods alive, and bring your jets
@@ -6,6 +6,7 @@ home. **Jets strike only in v1 — no dogfighting.** v1.4.0 adds defensive
 CAP gun passes against inbound strikes (see below) — interception,
 not dogfighting.
 
+v1.6.2: the whole game now runs in real time by default (×1), with a HUD timescale control (1×/2×/4×/8×) in the top bar. Falls now take their real ~8.4 s from 350 m; at 8× the fall compresses again exactly as before. Physics and damage amounts unchanged. Fragmentation: the black smoke orbs at breakup are gone, pulverised remnants are bigger solid chunks (segLen 44, vt ~110 m/s) with deck strips thickened to match their physics proxy, and the camera follows the largest wreck piece through the explosion instead of snapping to the sea. Rounds never end on their own — when a fleet is destroyed the outcome is shown as a card, play carries on, and 🏁 End round in the top bar ends the round when you choose. Throttle-continuous descent: below the 0.69 hover threshold the ship now descends on the lift shortfall (a = −g·(1 − lift) + drag) — a slow sink just below hover, faster the lower the throttle, full freefall at zero — with lift spooling back up over 6 s on recovery; above hover the climb is unchanged.
 v1.6.1: hotfix — underwater-camera crash fixed (VFX sprite shader now declares fogDensity; the linear→FogExp2 fog switch no longer throws at three.module.js:27531).
 v1.6.0: performance, fragment solidity/buoyancy/persistence, INDV/ANCHOR steering, camera no-hop, seabed wrecks, damage-shake retune, duplicates fix.
 - **Performance** — program pre-warm (shader compiles front-loaded at boot), VFX sprites batched to a single Points draw, sea on a wave table with analytic normals, cheap JS wins, breakup spread over frames. Whole-run work −44% vs v1.5.0 in the headless harness (phone calm ~12–14 ms, kill phases improved).

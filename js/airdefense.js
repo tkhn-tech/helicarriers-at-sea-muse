@@ -265,7 +265,7 @@ export class AirDefenseSystem {
     }
   }
   update(dt, ctx, G) {
-    if (!G.started || G.over || G.paused) return;
+    if (!G.started || G.paused) return; // v1.6.2: no G.over — air defence keeps firing after the outcome is decided, as long as the round runs
     for (const c of G.allCarriers) {
       if (!c.alive) continue;
       const threats = this.threatsFor(c, G);

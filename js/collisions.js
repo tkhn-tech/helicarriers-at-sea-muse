@@ -392,17 +392,48 @@ function carrierImpactResponse(c, o, closing, depth) {
 }
 
 // Resolve one piece-involved pair (piece-carrier or piece-piece).
+// v1.6.2: per-substep cap on positional correction, piece-piece pairs
+// ONLY. Detonation debris is born overlapping — fragments of one solid
+// start interpenetrated by up to ~24 m — and the solver's one-frame
+// full correction teleported a fragment that already had a history
+// 10–24 m in a single frame (popcheck, diagonal/pulverised breakups).
+// A capped push spreads the separation over ~2–4 substeps (~0.1 s):
+// the fragment slides apart instead of teleporting, and the overlap
+// is gone before any player can read it as interpenetration.
+// This is NOT the v1.4.0 F15 cap that was rejected: F15 capped the
+// correction RATE at 2 m/s, so a 20 m overlap needed ~5 s of grinding
+// to clear. This caps DISPLACEMENT per substep (3 m per body per
+// substep call) — the overlap still clears in ~0.1 s, and sustained
+// contacts (carrier grinding) are untouched: the cap applies only
+// when NEITHER body is a carrier, and the velocity deflection below
+// is never capped. The allowance is per checkCarrierCollisions call
+// (one substep); a fresh call gets a fresh allowance.
+const PUSH_CAP_PIECE = 3; // metres per body per substep call
+function cappedPush(allow, body, want) {
+  if (!allow) return want;
+  const used = allow.get(body.ref) || 0;
+  const room = Math.max(0, PUSH_CAP_PIECE - used);
+  const d = Math.min(Math.abs(want), room) * Math.sign(want);
+  if (d !== 0) allow.set(body.ref, used + Math.abs(d));
+  return d;
+}
+
 // hit: { nx, nz, depth } horizontal MTV, or { vertical: true, depth, dir }
 // closing: horizontal closing speed + the vertical closing speed
 // (audit F19: the old 0.5× vertical discount had no basis; with F3
 // fixed, a falling carrier's real velocity enters closingH properly).
 // dt: the sim substep, retained for the signature (see the positional
-// note below — correction is uncapped, so dt is not used here).
-function resolvePiecePair(G, ctx, A, B, hit, closing, dt = 0.05) {
+// note below — correction is uncapped for carrier-involved pairs; for
+// piece-piece pairs it is capped per substep by PUSH_CAP_PIECE, so dt
+// is not used here).
+function resolvePiecePair(G, ctx, A, B, hit, closing, dt = 0.05, pushAllow = null) {
   const key = A.id < B.id ? `${A.id}:${B.id}` : `${B.id}:${A.id}`;
   const carrier = A.kind === 'carrier' ? A : B.kind === 'carrier' ? B : null;
   const piece = A.kind === 'piece' ? A : B;
   const invSum = A.invMass + B.invMass;
+  // v1.6.2: the per-substep displacement cap applies only when neither
+  // body is a carrier — carrier grinding keeps the uncapped correction.
+  const allow = (A.kind === 'piece' && B.kind === 'piece') ? pushAllow : null;
 
   // --- positional separation, always applied, even for a gentle nudge,
   // so bodies never stay interpenetrated. Split by inverse mass; a body
@@ -421,26 +452,29 @@ function resolvePiecePair(G, ctx, A, B, hit, closing, dt = 0.05) {
   // and they stay fixed: velocity responses remain once-per-impact,
   // spool/lag-gated and reduced-mass (see the impact branches below).
   // Correction therefore removes the full overlap in the substep it is
-  // detected, before any sample — or any player — can see it.
+  // detected, before any sample — or any player — can see it. That
+  // still holds for carrier-involved pairs; piece-piece pairs are the
+  // one exception (PUSH_CAP_PIECE above): debris is born overlapping,
+  // and a one-frame full correction teleports a fragment with history.
   if (hit.vertical) {
     const dir = hit.dir; // +1: B is above A — push B up / A down
     const aCan = canMoveY(A), bCan = canMoveY(B);
     if (aCan || bCan) {
       const shareA = aCan ? (bCan ? A.invMass / invSum : 1) : 0;
       const shareB = bCan ? (aCan ? B.invMass / invSum : 1) : 0;
-      if (shareA) pushBodyY(A, -dir * hit.depth * shareA);
-      if (shareB) pushBodyY(B, dir * hit.depth * shareB);
+      if (shareA) pushBodyY(A, cappedPush(allow, A, -dir * hit.depth * shareA));
+      if (shareB) pushBodyY(B, cappedPush(allow, B, dir * hit.depth * shareB));
     } else {
       // Neither can move vertically (sinking pieces, carriers): fall
       // back to a horizontal shove along the line of centres.
       const dx = B.x - A.x, dz = B.z - A.z, d = Math.hypot(dx, dz) || 1;
       const nx = dx / d, nz = dz / d;
-      pushBodyXZ(A, -nx, -nz, hit.depth * (A.invMass / invSum));
-      pushBodyXZ(B, nx, nz, hit.depth * (B.invMass / invSum));
+      pushBodyXZ(A, -nx, -nz, cappedPush(allow, A, hit.depth * (A.invMass / invSum)));
+      pushBodyXZ(B, nx, nz, cappedPush(allow, B, hit.depth * (B.invMass / invSum)));
     }
   } else {
-    pushBodyXZ(A, -hit.nx, -hit.nz, hit.depth * (A.invMass / invSum));
-    pushBodyXZ(B, hit.nx, hit.nz, hit.depth * (B.invMass / invSum));
+    pushBodyXZ(A, -hit.nx, -hit.nz, cappedPush(allow, A, hit.depth * (A.invMass / invSum)));
+    pushBodyXZ(B, hit.nx, hit.nz, cappedPush(allow, B, hit.depth * (B.invMass / invSum)));
   }
 
   // --- velocity deflection, only for an approaching pair (a separating
@@ -540,7 +574,7 @@ function resolvePiecePair(G, ctx, A, B, hit, closing, dt = 0.05) {
 
 // Check every carrier pair for hull overlap and resolve it. Called once
 // per frame from loop(), after steering + carrier updates, before
-// checkEnd(). G carries the per-pair cooldowns and the collision log
+// checkOutcome(). G carries the per-pair cooldowns and the collision log
 // (exposed to probes on window.__game).
 export function checkCarrierCollisions(G, ctx, dt) {
   const carriers = G.allCarriers;
@@ -742,6 +776,11 @@ export function checkCarrierCollisions(G, ctx, dt) {
     // separated, so this terminates).
     // Damage/log cooldowns (same G.time in every iteration) stop any
     // double impact or grind.
+    // v1.6.2: per-substep displacement allowance for the piece-piece
+    // positional cap (PUSH_CAP_PIECE) — one map per call, so each
+    // substep gets a fresh allowance and a large overlap clears over
+    // ~2–4 substeps instead of teleporting in one.
+    const pushAllow = new Map();
     let itersUsed = 0;
     for (let iter = 0; iter < 12; iter++) {
       itersUsed = iter + 1;
@@ -780,7 +819,7 @@ export function checkCarrierCollisions(G, ctx, dt) {
         const dvy = fallingInvolved ? Math.abs(rvy) : 0;
         const closing = closingH + dvy;
         any = true;
-        resolvePiecePair(G, ctx, A, B, hit, closing, dt);
+        resolvePiecePair(G, ctx, A, B, hit, closing, dt, pushAllow);
       }
       if (!any) break;
     }

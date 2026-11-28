@@ -74,14 +74,21 @@ export const PHYSICS = {
   PITCH_MAX: 0.21, // rad, +-12 deg — unchanged
   PITCH_RATE_MAX: 0.06, // rad/s (3.4 deg/s) — reached at PITCH_ACCEL
   CLIMB_MAX: 6, // m/s — climb is thrust-authority limited
-  // v1.4.2 throttle linearity: the throttle term alone spans
-  // (0-1)*8 = -8..+3.6 m/s, so the climb sum is clamped to -8 below
-  // (not -6) — clamping at -6 saturated the bottom ~17% of the slider
-  // (throttle 0.05-0.15 all gave -6.00 m/s, probed v142-throttle-climb).
-  // Equal 10% slider steps now give equal 1.16 m/s climb steps over
-  // the whole range; hover (0.69) and full-throttle climb (+3.6) are
-  // unchanged, and pitch-only descent is still capped at -6 by the
-  // pitch term's own clamp. Max descent via throttle is now -8 m/s.
+  // v1.4.2 throttle linearity ABOVE hover: the throttle term alone
+  // spans (0-1)*8 = -8..+3.6 m/s, so the climb sum is clamped to -8
+  // below (not -6) — clamping at -6 saturated the bottom ~17% of the
+  // slider (throttle 0.05-0.15 all gave -6.00 m/s, probed
+  // v142-throttle-climb). Equal 10% slider steps now give equal
+  // 1.16 m/s climb steps over the whole range; hover (0.69) and
+  // full-throttle climb (+3.6) are unchanged, and pitch-only descent
+  // is still capped at -6 by the pitch term's own clamp. Max descent
+  // via throttle is now -8 m/s.
+  // v1.6.2: the note above is the ABOVE-hover half only. BELOW hover
+  // the throttle term is no longer a velocity at all — it is the
+  // acceleration a = -g*(1 - liftThrust) + drag (see the alive
+  // branch), uncapped, so there is no -8 floor on a gravity descent.
+  // The -8 clamp survives only as the pitch-down bound in controlled
+  // flight.
   CLIMB_MAX_DN: 8, // m/s — descent authority (throttle term's natural floor)
   TAU_VY: 5.0, // s — vertical speed chases the climb command
   ALT_HOLD_CAP_UP: 6, ALT_HOLD_CAP_DN: -5, // m/s (was +15/-10)
@@ -207,6 +214,12 @@ const DM = {
   // v1.3.2: torn section caps — dark scorched steel, so a cut face reads
   // as a broken edge, not a clean light panel.
   capSteel: new THREE.MeshStandardMaterial({ color: 0x33383d, roughness: 0.9, metalness: 0.3, side: THREE.DoubleSide }),
+  // v1.6.2: pulverised-remnant steel — a mid grey, flat-shaded, so a
+  // tumbling wreck chunk reads as solid steel from every angle. The
+  // old capSteel (0x33383d) on a flat tetrahedron read as a black
+  // card; this plus real volume is what makes a remnant look like a
+  // piece of the carrier instead of a floating black quad.
+  remnantSteel: new THREE.MeshStandardMaterial({ color: 0x565d64, roughness: 0.85, metalness: 0.35, flatShading: true, side: THREE.DoubleSide }),
 };
 function dbox(w, h, d, mat, x, y, z, ry = 0) {
   const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
@@ -517,7 +530,10 @@ function addTornPetals(group, zc, zDir, opts = {}) {
 //   island (dragK 1, areaFrac 0.34, massFrac 0.008) -> vt 114 m/s (implied 113.4)
 //   pod (dragK 1.5, areaFrac 0.44, massFrac 0.012) -> vt 116 m/s (implied 115.2)
 //   deck strip (dragK 3, areaFrac 0.18, massFrac 0.002) -> vt 46 m/s (implied 45.6)
-//   pulverised remnant (dragK 4, areaFrac 0.5, massFrac 0.005) -> vt 59 m/s (implied 57-61)
+//   pulverised remnant (dragK 3, areaFrac 0.7, massFrac 0.04, segLen 44)
+//     -> vt ~110 m/s (v1.6.2: the old flat plate, dragK 4 / areaFrac 0.5 /
+//     massFrac 0.005, was vt 59 — the new solid chunk falls like the
+//     island/pod chunks of the same scale, as it should)
 // (An earlier version of this comment listed 206/168/119/75-92 from the
 // dragK-only formula — those numbers were wrong, the code below was right.)
 // dragK, areaFrac and massFrac on a BreakupPiece encode exactly that:
@@ -1172,8 +1188,8 @@ export class BreakupPiece {
       // piece's planform and dragK, mass with massFrac. A hull section
       // keeps lenFrac for both (vt 291 m/s, as before); an island, a
       // pod, a deck strip or pulverised debris falls at its own vt
-      // (114 / 116 / 46 / 59 m/s — measured 2026-11-27, see the table
-      // above addDiagonalCap) and sorts itself along the flight
+      // (114 / 116 / 46 / ~110 m/s — measured 2026-11-27, see the table
+      // above addDiagonalCap; remnant vt updated v1.6.2 with the chunk)
       // path by ballistic coefficient (TWA 800 debris zones).
       const area = fallProjectedArea(this.pitch, this.roll) * lenFrac * (this.areaFrac || 1) * (this.dragK || 1);
       const mass = PHYSICS.MASS * (this.massFrac !== null && this.massFrac !== undefined ? this.massFrac : lenFrac);
@@ -1219,18 +1235,9 @@ export class BreakupPiece {
       this.roll += this.rollRate * dt; this.pitch += this.pitchRate * dt; this.heading += this.yawRate * dt;
       this.group.position.y = this.y;
       this.group.rotation.set(this.pitch, -this.heading, this.roll);
-      // v1.5.0 D4/D5: a detached assembly trails smoke from its torn
-      // mount while it falls — one sprite per 0.4 s, pool-guarded.
-      if (this.smokeTrail) {
-        this._trailT -= dt;
-        if (this._trailT <= 0) {
-          this._trailT = 0.4;
-          if (ctx.vfx.liveSprites() < S_MAX_GUARD) {
-            const sm = ctx.vfx.spawnSprite(this.group.position.x, this.group.position.y + 2, this.group.position.z, 2.5, 12, 12, 1, 0x141414, 0.5);
-            sm.vy = 1;
-          }
-        }
-      }
+      // v1.6.2: the detached-assembly smoke trail is gone — one black
+      // sprite every 0.4 s behind a falling piece read as a floating
+      // line of black orbs. No replacement; the piece itself is the visual.
       // v1.5.0 D11: cook-offs transferred from the breakup plan fire
       // here, on the piece, on the compressed real clock (see breakUp)
       // — including after the piece has left the ship. Visual/audio
@@ -1256,10 +1263,12 @@ export class BreakupPiece {
         ctx.vfx.spawnParticle(w.x + (Math.random() - 0.5) * 8, w.y + (Math.random() - 0.5) * 6, w.z + (Math.random() - 0.5) * 8,
           (Math.random() - 0.5) * 4, 1 + Math.random() * 3, (Math.random() - 0.5) * 4, 0.6 + Math.random() * 0.7, 1, 0.5, 0.1, -3);
       }
-      // Cut-face venting (research §5): detonation cuts vent flame +
-      // smoke for the first 10 s after release, structural cuts smoke
-      // only; one emission per face per 0.5 s, pool-guarded (never
-      // assume a spawn survives; halve the rate under pool pressure).
+      // Cut-face venting (research §5): detonation cuts vent flame for
+      // the first 10 s after release, structural cuts embers only
+      // (v1.6.2: the black smoke sprite is gone — it lined every tear
+      // with floating black orbs); one emission per face per 0.5 s,
+      // pool-guarded (never assume a spawn survives; halve the rate
+      // under pool pressure).
       if (this.cutFaces.length && tSince < 12) {
         this._ventT -= dt;
         if (this._ventT <= 0) {
@@ -1273,8 +1282,10 @@ export class BreakupPiece {
               if (this.reason === 'detonation' && tSince < 10) {
                 ctx.vfx.spawnSprite(w.x, w.y, w.z, 0.4, 12, 12, 3, 0xff8c2e, 0.9).vy = 3;
               }
-              const sm = ctx.vfx.spawnSprite(w.x, w.y + 2, w.z, 2.5, 14, 14, 1, 0x141414, 0.55);
-              sm.vy = 2;
+              // v1.6.2: the black cut-face smoke sprite is gone — one
+              // per face per 0.5 s, it lined the tear with floating
+              // black orbs. The cut still vents flame (detonation) and
+              // embers below.
               for (let e = 0; e < 3; e++) {
                 ctx.vfx.spawnParticle(w.x, w.y, w.z, (Math.random() - 0.5) * 3, 3 + Math.random() * 2, (Math.random() - 0.5) * 3, 0.8, 1, 0.5, 0.1, -6);
               }
@@ -1376,6 +1387,14 @@ export class BreakupPiece {
       this.roll += Math.max(-0.10 * dt, Math.min(0.10 * dt, rollErr));
       this.pitch += (-0.05 - this.pitch) * Math.min(1, dt * 0.2);
       this.group.rotation.set(this.pitch, -this.heading, this.roll);
+      // v1.6.2: floor-aware floating — a long steep piece floods until
+      // its top is at the surface, which can drive its lowest corner
+      // through the seabed; the sinking branch would then snap it back
+      // UP to its rest altitude in one frame (popcheck: +21 m on a
+      // diagonal hull section). Clamp the corner to the floor here so
+      // the handover to sinking is continuous.
+      const fb = this.pieceBoxCorners(_bpBox);
+      if (fb.minY < SEA_FLOOR_Y) { this.y += SEA_FLOOR_Y - fb.minY; this.group.position.y = this.y; }
       // Bubbles while flooding (same cadence shape as the sinking
       // branch, driven by flood fraction instead of sink fraction).
       this.bubbleT -= dt;
@@ -1586,6 +1605,13 @@ export class Helicarrier {
     // 1/1.45 = 0.69). Player helm sets it on the selected carrier each
     // frame; escorts/AI keep the hover default.
     this.throttle = PHYSICS.THROTTLE_HOVER;
+    // v1.6.2 _liftSpool: lift actually produced (fraction of weight).
+    // It cuts instantly when throttle drops (fans stop — the v1.4.2
+    // freefall model) and spools UP with ROTOR_SPOOL_TAU (6 s), the
+    // same asymmetric spool as the falling branch's _fallSpool. Init
+    // 1.0 = hover lift: every carrier spawns intact at hover throttle
+    // (pods are built below, so lift cannot be read here yet).
+    this._liftSpool = 1;
     this.liftThrustNow = 0; // v1.4.2: lift actually produced (fraction of weight) — read by the downwash builder + probes; set every frame in the alive/falling branches
     // v1.4.0 lever arms measured from the GLB's own pod centres
     // (template.podLocals): mean |z| 65.1 m (pitch), mean |x| 58.2 m
@@ -1982,17 +2008,14 @@ export class Helicarrier {
     // v1.2.0: explosions scale with what blew up — a reactor breach is
     // bigger and more violent than a magazine hit, which is bigger than
     // a deck hit. (Damage amounts and detonation gates are unchanged.)
-    // v1.3.1: also scaled by the killing blow's severity, plus a debris
-    // smoke ring thrown outward from the blast.
+    // v1.3.1: also scaled by the killing blow's severity. (v1.6.2: the
+    // debris smoke ring is gone — six black sprites thrown outward
+    // from the blast read as a ring of black orbs. The fireball,
+    // flash and particle bursts below are the explosion now.)
     const scale = zoneKey === 'reactor' ? 1.35 : zoneKey === 'magazine' ? 1.2 : 1;
     const sev = Math.max(0.6, Math.min(2, (this.lastHit ? this.lastHit.amount : 30) / 40));
     ctx.vfx.magazineSecondary(this.x, this.y, this.z, CARRIER_LEN / 42 * scale * (0.8 + 0.2 * sev));
     ctx.vfx.burst(this.x, this.y, this.z, Math.round(40 * scale), [0.9, 0.9, 0.9], 12, 8);
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2 + Math.random() * 0.5;
-      const s = ctx.vfx.spawnSprite(this.x + Math.cos(a) * 40, this.y + 4, this.z + Math.sin(a) * 40, 4, 18, 18, 0.4, 0x1a1a1a, 0.6);
-      s.vx = Math.cos(a) * 8; s.vz = Math.sin(a) * 8; s.vy = 1;
-    }
     if (ctx.audio) ctx.audio.boom(true);
     if (ctx.noteDetonation) ctx.noteDetonation(this.x, this.y, this.z, 'detonation');
     // v1.4.0 F8: the same event key as the damage() blast above, so
@@ -2057,6 +2080,81 @@ export class Helicarrier {
     ctx.msg(`${this.name} is FALLING — ${reason}`);
     if (this.wing) this.wing.handleCarrierFalling(ctx);
   }
+
+  // v1.6.2: the water-impact ladder, extracted verbatim from the
+  // falling branch so a gravity descent in the ALIVE branch
+  // (throttle below hover — the ship falls to the sea instead
+  // of stopping at the 150 m floor) takes the same impact
+  // decision: level + slow + healthy stays intact and sinks;
+  // hard or nose-first shatters. Called when y reaches the sea;
+  // no-op above it. The formulas, thresholds and outcomes are
+  // unchanged.
+  _waterImpact(ctx) {
+    const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+    if (this.breakState === 'none' && this.y <= seaH + 2) {
+      // v1.3.1 water-impact evaluation: the breakup decision is made
+      // HERE, not only at the kill — a carrier can fall whole and
+      // then fragment (or not) on how she hits the water. Level +
+      // slower stays largely intact and sinks; hard or nose-first
+      // shatters into many pieces, which inherit the impact
+      // velocity and attitude.
+      const impactSpeed = Math.abs(this.vy);
+      const rollW = Math.atan2(Math.sin(this.roll), Math.cos(this.roll));
+      // frag: impact speed relative to a 65 m/s reference, attitude
+      // (nose-down and rolled entries hit far harder than level ones),
+      // and remaining structural health. Level + slower + healthy
+      // stays intact; hard or nose-first shatters.
+      const attF = 1 + 2 * Math.abs(this.pitch) + 1.2 * Math.abs(rollW);
+      // v1.4.1: the impact also follows the ship's state on arrival —
+      // a burning ship is structurally weaker (fires), and residual
+      // lift thrust cushions the blow (lift). Both are neutral for a
+      // cold zero-throttle fall (no fires, no thrust) and bite only
+      // when the condition is present: 4 fires raise frag ~48%, full
+      // thrust cuts it 35%.
+      const liftThrustAtImpact = Math.min(this.throttle * PHYSICS.T_LIFT_MAX_RATIO, this.lift * PHYSICS.T_LIFT_MAX_RATIO);
+      const fireF = 1 + 0.12 * Math.min(4, this.fires.length);
+      const liftF = 1 - 0.35 * Math.min(1, liftThrustAtImpact);
+      const frag = (impactSpeed / 65) * attF * (1.3 - 0.6 * this.hpFrac) * fireF * liftF;
+      const outcome = frag < 1.0 ? 'intact' : frag < 1.8 ? 'partial' : 'shatter';
+      // v1.5.0 D10 slamming shatter: entry angle decides the damage.
+      // Nose-down (|pitch| > 0.25): bow-flare slamming — the bow
+      // crumples and the slam load runs aft as a whipping wave.
+      // Flat: whole-bottom slam — largest total force, strongest
+      // whipping, most likely midship fracture. On her side
+      // (|roll| > 0.2): the side shell takes the slam, the deck edge
+      // digs in and the ship trips and rolls. Slam pressure peaks
+      // ~625 kPa bow-flare; whipping adds 30-40% bending moment.
+      const slamBranch = Math.abs(rollW) > 0.2 ? 'side' : Math.abs(this.pitch) > 0.25 ? 'nose-down' : 'flat';
+      this.lastImpact = { speed: +impactSpeed.toFixed(1), pitch: +this.pitch.toFixed(2), roll: +rollW.toFixed(2), hpFrac: +this.hpFrac.toFixed(2), fires: this.fires.length, liftThrust: +liftThrustAtImpact.toFixed(2), fireF: +fireF.toFixed(2), liftF: +liftF.toFixed(2), frag: +frag.toFixed(2), outcome, slamBranch };
+      ctx.vfx.splash(this.x, seaH, this.z, impactSpeed);
+      // White slam ring racing outward + spray sheet up the hull side.
+      ctx.vfx.slamSheet(this.x, seaH, this.z, this.heading, CARRIER_LEN, slamBranch === 'side' ? Math.sign(rollW) : 0);
+      ctx.msg(`${this.name} hit the sea at ${impactSpeed.toFixed(0)} m/s — ${outcome === 'intact' ? 'staying intact' : outcome === 'partial' ? 'breaking apart' : 'shattering'} (${slamBranch} entry)`);
+      if (outcome !== 'intact') {
+        const fwd = { x: Math.sin(this.heading), z: -Math.cos(this.heading) };
+        const ivx = fwd.x * (this.forwardSpeed || 0) * 0.3, ivz = fwd.z * (this.forwardSpeed || 0) * 0.3;
+        if (outcome === 'shatter') {
+          if (slamBranch === 'nose-down') this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz, cuts: 2, bowCrumple: true });
+          else if (slamBranch === 'flat') this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz, cuts: 3, midshipCut: true });
+          else this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz, mode: 'diagonal' });
+        }
+        else this.breakUp(ctx, 'water impact', { cuts: 1, energy: 1.4, impactVx: ivx, impactVz: ivz });
+        return;
+      }
+      this.state = 'sinking';
+      this.sinkT = 0;
+      // v1.4.1: an intact sink takes 24–38 s (seeded per kill),
+      // not a fixed 30 s — no two sinkings run the same clock.
+      this._sinkDur = 24 + this._brkRng() * 14;
+      this.impactY = seaH;
+      // v1.4.0 mass (audit F10): the final list comes from the
+      // damage state (impact roll + damage list), not a constant.
+      this.sinkRollTarget = Math.max(-0.6, Math.min(0.6, this.roll + this.list));
+      this._sinkPrevY = this.y;
+      if (this.wing) this.wing.handleCarrierSinking(ctx);
+    }
+  }
+
   // Split into a VARIABLE number of tumbling pieces (Hurricane splitShip
   // clipping-plane trick, generalised). The breakup is driven by the
   // killing blow — no fixed piece count, no single canned split:
@@ -2645,15 +2743,27 @@ export class Helicarrier {
       }
       segLen = 38; massFrac = 0.012; areaFrac = 0.44; dragK = 1.5; halfBeam = 19; halfH = 8;
     } else if (kind === 'strip') {
-      const plate = new THREE.Mesh(new THREE.BoxGeometry(12, 0.5, 50), DM.capSteel);
+      // v1.6.2: 2 m thick, so the visual matches the physics proxy
+      // (halfH was already 2 — the old 0.5 m plate read as a black
+      // card edge-on). A peeled deck section is still a plate, but a slab.
+      const plate = new THREE.Mesh(new THREE.BoxGeometry(12, 2, 50), DM.capSteel);
       plate.name = 'asmStrip';
       g.add(plate);
       segLen = 50; massFrac = 0.002; areaFrac = 0.18; dragK = 3; halfBeam = 6; halfH = 2;
     } else { // 'remnant' — D7 pulverised-segment large remnant
-      const frag = new THREE.Mesh(new THREE.TetrahedronGeometry(9), DM.capSteel);
-      frag.scale.set(1.4, 0.25, 1.8); frag.name = 'asmRemnant';
+      // v1.6.2: a REAL chunk, not a flat plate. The old Tetrahedron(9)
+      // scaled (1.4, 0.25, 1.8) was a 25×4.5×32 m card in near-black
+      // capSteel — in the frames it read as a floating black quad, and
+      // six of them were all a 186 m hull section left behind, which is
+      // what "parts of the ship just disappear" looked like. Now a
+      // ~45×26×48 m solid tetrahedron in mid-grey flat-shaded steel,
+      // with physics to match (segLen 44, massFrac 0.04 — a solid
+      // chunk, vt ≈ 110 m/s like the island/pod chunks, not the old
+      // flat-plate 59). 2–3 of these per pulverised segment.
+      const frag = new THREE.Mesh(new THREE.TetrahedronGeometry(15), DM.remnantSteel);
+      frag.scale.set(1.5, 0.85, 1.6); frag.name = 'asmRemnant';
       g.add(frag);
-      segLen = 14; massFrac = 0.005; areaFrac = 0.5; dragK = 4; halfBeam = 7; halfH = 3;
+      segLen = 44; massFrac = 0.04; areaFrac = 0.7; dragK = 3; halfBeam = 22; halfH = 12;
     }
     g.position.copy(worldPos);
     if (worldRot) {
@@ -2692,7 +2802,6 @@ export class Helicarrier {
     piece.halfBeamOverride = halfBeam; piece.halfHOverride = halfH;
     piece.centreLocal = { x: 0, y: 0, z: 0 }; piece.segCentre = 0;
     piece.segLo = -segLen / 2; piece.segHi = segLen / 2;
-    piece.smokeTrail = kind === 'island' || kind === 'pod';
     piece.burning = piece.reason === 'fire' || piece.reason === 'detonation';
     piece.spinMesh = spinMesh; piece.spinRate = spinRate;
     piece.bornT = ctx.time || 0;
@@ -2805,18 +2914,11 @@ export class Helicarrier {
       if (next) next._heldPiece = this._separatePiece(ctx, next, true);
     }
     // Phase 1 — crack propagation: each ribbon grows from the hit
-    // around the cross-section; a smoke wisp rides the moving tip.
+    // around the cross-section. (v1.6.2: the smoke wisp that rode the
+    // moving tip is gone — it dotted the tear with black orbs.)
     for (const r of this._crackRibbons) {
       const prog = Math.max(0, Math.min(1, (t - r.startAt) / r.dur));
       r.line.geometry.setDrawRange(0, Math.max(0, Math.floor(prog * r.nPts)));
-      r.tipT -= dt;
-      if (prog > 0 && prog < 1 && r.tipT <= 0) {
-        r.tipT = 0.15;
-        const idx = Math.max(0, Math.min(r.nPts - 1, Math.floor(prog * r.nPts)));
-        const lp = r.line.geometry.attributes.position;
-        const wp = this.group.localToWorld(new THREE.Vector3(lp.getX(idx), lp.getY(idx), lp.getZ(idx)));
-        ctx.vfx.spawnSprite(wp.x, wp.y, wp.z, 0.3, 6, 6, 1, 0x141414, 0.5);
-      }
     }
     // Phase 2 — hinge: 0 -> target over [hingeStart, hingeEnd].
     if (t >= plan.hingeStart) {
@@ -2892,17 +2994,15 @@ export class Helicarrier {
         }
       }
     }
-    // v1.4.1 pre-breakup list + venting: while the hull is still one
-    // piece, she heels toward her dead side and vents smoke from the
-    // hit point — the breakup is telegraphed before anything lets go.
+    // v1.4.1 pre-breakup list: while the hull is still one piece, she
+    // heels toward her dead side — the breakup is telegraphed before
+    // anything lets go. (v1.6.2: the vent smoke from the hit point is
+    // gone — it rose as a column of black orbs over the deck.)
     if (this.breakState === 'cracking' || this.breakState === 'hinging') {
       this._breakList += (this._breakListTarget - this._breakList) * Math.min(1, dt * 1.2);
       plan.ventT -= dt;
       if (plan.ventT <= 0) {
         plan.ventT = 0.25;
-        const wp = this.deckPoint(plan.hit.lx, plan.hit.lz);
-        const sm = ctx.vfx.spawnSprite(wp.x, wp.y + 6, wp.z, 2.5, 12, 12, 0.5, 0x141414, 0.55);
-        sm.vy = 2.5;
         // v1.5.0 D2: fire vents from the trench along the whole split
         // length while the deck unzips.
         if (plan.mode === 'longitudinal') {
@@ -3139,25 +3239,32 @@ export class Helicarrier {
     return false;
   }
   // v1.5.0 D7: the segment bursts into a debris cloud — a big burst
-  // (budgeted first, ~100 particles + 8 sprites, pool-guarded), a
-  // smoke column, and 2-4 large remnants as light draggy assembly
-  // pieces (they fall slowly and drift, never like a hull section).
+  // (budgeted first, ~100 particles + 8 sprites, pool-guarded) and
+  // 2-3 large remnants as solid assembly pieces (they fall slowly and
+  // drift, never like a hull section). (v1.6.2: the black smoke column
+  // is gone — six big black sprites hanging over the burst read as
+  // floating black orbs. The particle bursts are the cloud now.)
   _pulveriseSegment(ctx, seg) {
     const wp = this.group.localToWorld(new THREE.Vector3(0, deckLocalYAt(-seg.centre) + 2, -seg.centre));
     if (ctx.vfx.liveParticles() < 1200) {
       ctx.vfx.burst(wp.x, wp.y, wp.z, 100, [0.9, 0.9, 0.9], 12, 8);
       ctx.vfx.burst(wp.x, wp.y, wp.z, 40, [1, 0.55, 0.15], 10, 6);
     }
-    for (let i = 0; i < 6; i++) {
-      const sm = ctx.vfx.spawnSprite(wp.x + (Math.random() - 0.5) * 40, wp.y + (Math.random() - 0.5) * 20, wp.z + (Math.random() - 0.5) * 40, 3.5, 22, 22, 1, 0x141414, 0.6);
-      sm.vy = 2;
-    }
     if (ctx.audio) ctx.audio.boom(true);
     const rng = mulberry32(fracSeed(this._brkSeed, 700, seg.centre));
-    const nRem = 2 + Math.floor(rng() * 3);
+    const nRem = 2 + Math.floor(rng() * 2);
+    // v1.6.2: stagger the remnants' spawn altitudes (20 m apart) —
+    // siblings used to spawn at the same deck level, interpenetrated
+    // by up to ~24 m, and the solidity solver had to clear the whole
+    // overlap at once. A blast throws fragments apart vertically as
+    // well as sideways, so staggered birth altitudes are the physical
+    // reading — and the worst spawn overlap drops to the section-vs-
+    // remnant case (~14 m), which the per-substep cap then clears
+    // in ~0.1 s without a teleport (see PUSH_CAP_PIECE).
     for (let i = 0; i < nRem; i++) {
       const off = (rng() - 0.5) * (seg.hi - seg.lo) * 0.7;
-      const rp = this.group.localToWorld(new THREE.Vector3((rng() - 0.5) * 30, deckLocalYAt(-seg.centre - off) + 2, -seg.centre - off));
+      const yOff = (i - (nRem - 1) / 2) * 20;
+      const rp = this.group.localToWorld(new THREE.Vector3((rng() - 0.5) * 30, deckLocalYAt(-seg.centre - off) + 2 + yOff, -seg.centre - off));
       this._spawnAssemblyPiece(ctx, 'remnant', undefined, rp, undefined, i);
     }
   }
@@ -3661,6 +3768,13 @@ export class Helicarrier {
       // recoverable: the pods are alive, so restoring throttle spools
       // the fans back up (see the falling branch) — but only if there
       // was altitude to spool up in.
+      // v1.6.2: the switch above is now for TRUE zero only — the
+      // physics is continuous across it. Intermediate throttles
+      // (0.005–0.69) no longer hit a -8 m/s capped sink; they take
+      // the gravity-descent branch in the alive update below
+      // (a = -g*(1 - liftThrust) + drag), which at 0.005 gives
+      // -9.74 m/s^2 against the fall's -9.81 — the same curve, so
+      // there is no cliff at the switch any more.
       // v1.5.0 D9: a crippled ship's breakup owns her fate — the
       // zero-throttle fall must not fire while she is shedding pieces.
       if (this.throttle < 0.005 && this.breakState === 'none' && !this._crippled) { this.startFall(ctx, 'throttle at zero — no lift', { recoverable: true }); return; }
@@ -3723,83 +3837,133 @@ export class Helicarrier {
       this.pitch += this.pitchRate * dt;
       if (this.pitch > PHYSICS.PITCH_MAX) { this.pitch = PHYSICS.PITCH_MAX; this.pitchRate = 0; }
       if (this.pitch < -PHYSICS.PITCH_MAX) { this.pitch = -PHYSICS.PITCH_MAX; this.pitchRate = 0; }
-      // v1.4.0 climb — one unified lift model (spec §2.1/§7.4):
-      // throttle is a TOTAL lift demand, shared over the surviving
-      // fans up to their combined 1.45xW max. liftThrust is the lift
-      // actually produced as a fraction of weight; the excess over
-      // weight climbs (or sinks) at 8 m/s per unit. Pitch climb
-      // authority scales with the REMAINING lift margin: full lift ->
-      // full 6 m/s; 3 pods (margin 8.75%) -> ~1.2 m/s; <=2 pods -> no
-      // margin, pitch cannot climb and the shortfall sinks the ship
-      // (~2.3 m/s at lift 0.5, ~5.1 at 0.25) even at max throttle.
-      // Pitch DOWN is not margin-limited (descending only needs less
-      // lift, which is always available). The old separate sink term
-      // ((0.69-lift)*12) double-counted this shortfall and is gone:
-      // the excess term IS the sink. While pitch or throttle is
-      // off hover, altitude hold is suspended and targetAlt tracks the
-      // ship (hold resumes at the new altitude on release, as pitch
-      // did in v1.2.0). At default throttle a 3-pod ship still holds
-      // altitude (demand 1.0W is inside her 1.09W max); a 2-pod ship
-      // cannot hover at any throttle (max 0.73W).
-      let climb = 0;
-      const dy = this.targetAlt - this.y;
-      if (dy > 2) climb = Math.min(PHYSICS.ALT_HOLD_CAP_UP, dy * 0.2);
-      else if (dy < -2) climb = Math.max(PHYSICS.ALT_HOLD_CAP_DN, dy * 0.2);
-      const liftThrust = Math.min(this.throttle * PHYSICS.T_LIFT_MAX_RATIO, this.lift * PHYSICS.T_LIFT_MAX_RATIO);
+      // v1.6.2 throttle-continuous descent (Nicholas 02:09 SGT) — ONE
+      // vertical equation for throttle, no binary switch. Lift is the
+      // lift actually produced (fraction of weight) — _liftSpool below:
+      // it cuts instantly when throttle drops (fans stop, as in the
+      // v1.4.2 freefall model) and spools UP with ROTOR_SPOOL_TAU
+      // (6 s), the same asymmetric spool as the falling branch's
+      // _fallSpool. So a throttle cut drops lift at once (a descent
+      // starts at the full shortfall acceleration), and FULL throttle
+      // from a descent takes the 6 s spool to arrive.
+      //   liftThrust >= 1: controlled flight, as before — vy chases
+      //     the climb command (pitch + altitude hold + the throttle
+      //     excess over hover, linear in throttle) with TAU_VY.
+      //   liftThrust < 1: gravity descent — net vertical acceleration
+      //     from the lift shortfall, with drag, the SAME equation as
+      //     the falling branch: a = -g*(1 - liftThrust) + a_drag. At
+      //     0.69 a = 0 (hover); just below, a slow sink; half throttle
+      //     -2.7 m/s^2; zero throttle full freefall (a = -g + drag,
+      //     80.8 m/s from 350 m, as verified). No velocity cap, no
+      //     hold, no pitch vertical on this side: the old model chased
+      //     a capped velocity (throttleClimb = excess*8, clamped at
+      //     -8 m/s) and jumped to the freefall branch at throttle <
+      //     0.005 — a cliff between a -7.9 m/s sink and an unbounded
+      //     fall. That cliff and the cap are gone: the curve is one
+      //     smooth function of throttle through hover (both sides give
+      //     vy = 0 and a = 0 at exactly 0.69).
+      //   Carve-outs (scripted sequences, not throttle flight):
+      //     _crippled (D9 shedding) and mid-breakup keep the old
+      //     velocity model — their descents are scripted, and their
+      //     verified behaviour (crippled ~2.5 m/s sink, breakup
+      //     sequencing) is untouched.
+      //   Consequence to know (same equation, damage side): a ship
+      //     whose SURVIVING lift cannot make weight — a 2-pod ship
+      //     (max 0.73W) at any throttle — now accelerates down at
+      //     -g*(1 - liftThrust) instead of sinking steadily at
+      //     ~2.2 m/s. She could never hover; now she falls like the
+      //     physics says. (3-pod ships still hold: 1.09W max.)
+      const liftTarget = Math.min(this.throttle * PHYSICS.T_LIFT_MAX_RATIO, this.lift * PHYSICS.T_LIFT_MAX_RATIO);
+      if (liftTarget < this._liftSpool) this._liftSpool = liftTarget;
+      else this._liftSpool += (liftTarget - this._liftSpool) * (1 - Math.exp(-dt / PHYSICS.ROTOR_SPOOL_TAU));
+      const liftThrust = this._liftSpool;
       this.liftThrustNow = liftThrust; // v1.4.2: lift actually produced (downwash + probes)
-      const liftExcess = liftThrust - 1;
-      const throttleClimb = liftExcess * PHYSICS.THROTTLE_CLIMB;
       const marginFrac = Math.max(0, Math.min(1, (this.lift * PHYSICS.T_LIFT_MAX_RATIO - 1) / (PHYSICS.T_LIFT_MAX_RATIO - 1)));
-      if (Math.abs(this.pitchInput) > 0.05 || Math.abs(throttleClimb) > 0.05) {
-        // v1.4.0 mass (audit F13): spec §7.3 verbatim —
-        // climb_cmd = clamp((|V|·0.8 + 6)·sin(pitch), ±6). The old
-        // pitchBase gave 6.0 m/s at hover (spec: 1.25) and 6.0 at
-        // FULL 16 m/s, 12° (spec: 3.9) — a 120,000 t ship must not
-        // climb at 6 m/s from a hover on pitch alone. Pitch UP is
-        // margin-limited (full lift -> full 6 m/s; 3 pods -> ~1.2);
-        // pitch DOWN is not (descending only needs less lift).
-        const pitchClimb = Math.max(-PHYSICS.CLIMB_MAX, Math.min(PHYSICS.CLIMB_MAX,
-          (Math.abs(this.forwardSpeed) * 0.8 + 6) * Math.sin(this.pitch)));
-        const pitchClimbM = pitchClimb >= 0 ? pitchClimb * marginFrac : pitchClimb;
-        // v1.4.2: the descent clamp is CLIMB_MAX_DN (8), not CLIMB_MAX
-        // (6) — see the PHYSICS note. The throttle term's natural floor
-        // is -8 m/s, and clamping the sum at -6 saturated the bottom
-        // of the slider (see v142-throttle-climb.json).
-        climb = Math.max(-PHYSICS.CLIMB_MAX_DN, Math.min(PHYSICS.CLIMB_MAX, pitchClimbM + throttleClimb));
-        this.targetAlt = this.y; // hold resumes here when pitch/throttle releases
+      if (liftThrust < 1 && !this._crippled && this.breakState === 'none') {
+        // Gravity descent (see the note above). Hold is suspended and
+        // targetAlt tracks the ship, so hold resumes at the descent
+        // altitude when throttle returns to hover.
+        this.targetAlt = this.y;
+        const area = fallProjectedArea(this.pitch, this.roll);
+        const a = -9.81 * (1 - liftThrust) + fallDragAccel(this.vy, area, PHYSICS.MASS);
+        this.vy += a * dt;
+        this.y += this.vy * dt;
+        this.y = Math.min(650, this.y);
+        // No altitude floor on a gravity descent — she falls to the
+        // sea, and the impact ladder decides the outcome exactly as
+        // for a fall (see _waterImpact). The floor stop below is for
+        // controlled flight only.
+        const seaHg = ctx.sea.waveHeight(this.x, this.z, ctx.time);
+        if (this.y <= seaHg + 2) this._waterImpact(ctx);
+      } else {
+        // Controlled flight — the v1.4.0 climb model, unchanged except
+        // that liftThrust is now the SPOOLED value (see above), so a
+        // throttle step develops over the 6 s spool; the steady-state
+        // climb stays linear in throttle, hover at 0.69 unchanged.
+        // (v1.4.0 spec §2.1/§7.4: throttle is a TOTAL lift demand,
+        // shared over the surviving fans up to their combined 1.45xW
+        // max; pitch climb authority scales with the REMAINING lift
+        // margin: full lift -> full 6 m/s; 3 pods (margin 8.75%) ->
+        // ~1.2 m/s; <=2 pods -> no margin, pitch cannot climb. Pitch
+        // DOWN is not margin-limited. At default throttle a 3-pod ship
+        // still holds altitude (demand 1.0W is inside her 1.09W max).)
+        let climb = 0;
+        const dy = this.targetAlt - this.y;
+        if (dy > 2) climb = Math.min(PHYSICS.ALT_HOLD_CAP_UP, dy * 0.2);
+        else if (dy < -2) climb = Math.max(PHYSICS.ALT_HOLD_CAP_DN, dy * 0.2);
+        const liftExcess = liftThrust - 1;
+        const throttleClimb = liftExcess * PHYSICS.THROTTLE_CLIMB;
+        if (Math.abs(this.pitchInput) > 0.05 || Math.abs(throttleClimb) > 0.05) {
+          // v1.4.0 mass (audit F13): spec §7.3 verbatim —
+          // climb_cmd = clamp((|V|·0.8 + 6)·sin(pitch), ±6). The old
+          // pitchBase gave 6.0 m/s at hover (spec: 1.25) and 6.0 at
+          // FULL 16 m/s, 12° (spec: 3.9) — a 120,000 t ship must not
+          // climb at 6 m/s from a hover on pitch alone. Pitch UP is
+          // margin-limited (full lift -> full 6 m/s; 3 pods -> ~1.2);
+          // pitch DOWN is not (descending only needs less lift).
+          const pitchClimb = Math.max(-PHYSICS.CLIMB_MAX, Math.min(PHYSICS.CLIMB_MAX,
+            (Math.abs(this.forwardSpeed) * 0.8 + 6) * Math.sin(this.pitch)));
+          const pitchClimbM = pitchClimb >= 0 ? pitchClimb * marginFrac : pitchClimb;
+          // v1.4.2: the descent clamp is CLIMB_MAX_DN (8), not
+          // CLIMB_MAX (6). Below hover the throttle term is
+          // acceleration, not a velocity (see the v1.6.2 note above),
+          // so this clamp now bounds pitch-down descents only.
+          climb = Math.max(-PHYSICS.CLIMB_MAX_DN, Math.min(PHYSICS.CLIMB_MAX, pitchClimbM + throttleClimb));
+          this.targetAlt = this.y; // hold resumes here when pitch/throttle releases
+        }
+        // Pitch alone can never drive her into the sea or above the ceiling.
+        // v1.5.0 D9 crippled flight: she sinks steadily (~2.5 m/s+) while
+        // shedding — the controls go mushy (pitch authority x0.3) and
+        // altitude hold cannot save her.
+        if (this._crippled) {
+          climb = Math.min(climb, -2.5);
+          this.throttle = Math.max(0, this.throttle - dt * 0.03);
+          this.pitchInput *= 0.3;
+        }
+        if (this.y <= ALT_FLOOR && climb < 0) climb = 0;
+        if (this.y >= ALT_CEIL && climb > 0) climb = 0;
+        // v1.4.0: one lag shape everywhere — first-order, tau named per
+        // lag (spec §12.4). vy chases the climb command with TAU_VY 5 s.
+        this.vy += (climb - this.vy) * (1 - Math.exp(-dt / PHYSICS.TAU_VY));
+        this.y += this.vy * dt;
+        // Hard altitude stops: pitch can ease the carrier down to the
+        // floor, but never through it (and never above the ceiling) —
+        // residual downward velocity is killed at the stop, so there is
+        // no overshoot below it.
+        // v1.4.1: the floor snap is a stop for a DESCENDING ship, not a
+        // teleport for a ship that recovered from a zero-throttle fall
+        // below the floor — a recovery can bottom out at ~60 m, and the
+        // old unconditional snap (plus the 120 m backstop) teleported
+        // her +93 m to 150 m in one frame (probed 2026-11-26). A ship
+        // climbing out from below the floor just climbs; the climb gate
+        // above already stops descents at the floor, and the falling
+        // branch's impact is the only way down to the sea. The snap
+        // therefore fires only on a descent command (climb <= 0) — a
+        // recovery climbing out (climb > 0) never trips it.
+        this.y = Math.min(650, this.y);
+        if (this.y <= ALT_FLOOR && this.vy < 0 && climb <= 0) { this.y = ALT_FLOOR; this.vy = 0; }
+        if (this.y >= ALT_CEIL) { this.y = ALT_CEIL; if (this.vy > 0) this.vy = 0; }
       }
-      // Pitch alone can never drive her into the sea or above the ceiling.
-      // v1.5.0 D9 crippled flight: she sinks steadily (~2.5 m/s+) while
-      // shedding — the controls go mushy (pitch authority x0.3) and
-      // altitude hold cannot save her.
-      if (this._crippled) {
-        climb = Math.min(climb, -2.5);
-        this.throttle = Math.max(0, this.throttle - dt * 0.03);
-        this.pitchInput *= 0.3;
-      }
-      if (this.y <= ALT_FLOOR && climb < 0) climb = 0;
-      if (this.y >= ALT_CEIL && climb > 0) climb = 0;
-      // v1.4.0: one lag shape everywhere — first-order, tau named per
-      // lag (spec §12.4). vy chases the climb command with TAU_VY 5 s.
-      this.vy += (climb - this.vy) * (1 - Math.exp(-dt / PHYSICS.TAU_VY));
-      this.y += this.vy * dt;
-      // Hard altitude stops: pitch can ease the carrier down to the
-      // floor, but never through it (and never above the ceiling) —
-      // residual downward velocity is killed at the stop, so there is
-      // no overshoot below it.
-      // v1.4.1: the floor snap is a stop for a DESCENDING ship, not a
-      // teleport for a ship that recovered from a zero-throttle fall
-      // below the floor — a recovery can bottom out at ~60 m, and the
-      // old unconditional snap (plus the 120 m backstop) teleported
-      // her +93 m to 150 m in one frame (probed 2026-11-26). A ship
-      // climbing out from below the floor just climbs; the climb gate
-      // above already stops descents at the floor, and the falling
-      // branch's impact is the only way down to the sea. The snap
-      // therefore fires only on a descent command (climb <= 0) — a
-      // recovery climbing out (climb > 0) never trips it.
-      this.y = Math.min(650, this.y);
-      if (this.y <= ALT_FLOOR && this.vy < 0 && climb <= 0) { this.y = ALT_FLOOR; this.vy = 0; }
-      if (this.y >= ALT_CEIL) { this.y = ALT_CEIL; if (this.vy > 0) this.vy = 0; }
       // v1.4.2 rotor downwash — spray + mist at the sea under each live
       // pod (the sea shader draws the flattened disc / spray ring /
       // churn; this is the airborne spray thrown up where the jet hits
@@ -3992,69 +4156,7 @@ export class Helicarrier {
           sm.vy = 2;
         }
       }
-      const seaH = ctx.sea.waveHeight(this.x, this.z, ctx.time);
-      if (this.breakState === 'none' && this.y <= seaH + 2) {
-        // v1.3.1 water-impact evaluation: the breakup decision is made
-        // HERE, not only at the kill — a carrier can fall whole and
-        // then fragment (or not) on how she hits the water. Level +
-        // slower stays largely intact and sinks; hard or nose-first
-        // shatters into many pieces, which inherit the impact
-        // velocity and attitude.
-        const impactSpeed = Math.abs(this.vy);
-        const rollW = Math.atan2(Math.sin(this.roll), Math.cos(this.roll));
-        // frag: impact speed relative to a 65 m/s reference, attitude
-        // (nose-down and rolled entries hit far harder than level ones),
-        // and remaining structural health. Level + slower + healthy
-        // stays intact; hard or nose-first shatters.
-        const attF = 1 + 2 * Math.abs(this.pitch) + 1.2 * Math.abs(rollW);
-        // v1.4.1: the impact also follows the ship's state on arrival —
-        // a burning ship is structurally weaker (fires), and residual
-        // lift thrust cushions the blow (lift). Both are neutral for a
-        // cold zero-throttle fall (no fires, no thrust) and bite only
-        // when the condition is present: 4 fires raise frag ~48%, full
-        // thrust cuts it 35%.
-        const liftThrustAtImpact = Math.min(this.throttle * PHYSICS.T_LIFT_MAX_RATIO, this.lift * PHYSICS.T_LIFT_MAX_RATIO);
-        const fireF = 1 + 0.12 * Math.min(4, this.fires.length);
-        const liftF = 1 - 0.35 * Math.min(1, liftThrustAtImpact);
-        const frag = (impactSpeed / 65) * attF * (1.3 - 0.6 * this.hpFrac) * fireF * liftF;
-        const outcome = frag < 1.0 ? 'intact' : frag < 1.8 ? 'partial' : 'shatter';
-        // v1.5.0 D10 slamming shatter: entry angle decides the damage.
-        // Nose-down (|pitch| > 0.25): bow-flare slamming — the bow
-        // crumples and the slam load runs aft as a whipping wave.
-        // Flat: whole-bottom slam — largest total force, strongest
-        // whipping, most likely midship fracture. On her side
-        // (|roll| > 0.2): the side shell takes the slam, the deck edge
-        // digs in and the ship trips and rolls. Slam pressure peaks
-        // ~625 kPa bow-flare; whipping adds 30-40% bending moment.
-        const slamBranch = Math.abs(rollW) > 0.2 ? 'side' : Math.abs(this.pitch) > 0.25 ? 'nose-down' : 'flat';
-        this.lastImpact = { speed: +impactSpeed.toFixed(1), pitch: +this.pitch.toFixed(2), roll: +rollW.toFixed(2), hpFrac: +this.hpFrac.toFixed(2), fires: this.fires.length, liftThrust: +liftThrustAtImpact.toFixed(2), fireF: +fireF.toFixed(2), liftF: +liftF.toFixed(2), frag: +frag.toFixed(2), outcome, slamBranch };
-        ctx.vfx.splash(this.x, seaH, this.z, impactSpeed);
-        // White slam ring racing outward + spray sheet up the hull side.
-        ctx.vfx.slamSheet(this.x, seaH, this.z, this.heading, CARRIER_LEN, slamBranch === 'side' ? Math.sign(rollW) : 0);
-        ctx.msg(`${this.name} hit the sea at ${impactSpeed.toFixed(0)} m/s — ${outcome === 'intact' ? 'staying intact' : outcome === 'partial' ? 'breaking apart' : 'shattering'} (${slamBranch} entry)`);
-        if (outcome !== 'intact') {
-          const fwd = { x: Math.sin(this.heading), z: -Math.cos(this.heading) };
-          const ivx = fwd.x * (this.forwardSpeed || 0) * 0.3, ivz = fwd.z * (this.forwardSpeed || 0) * 0.3;
-          if (outcome === 'shatter') {
-            if (slamBranch === 'nose-down') this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz, cuts: 2, bowCrumple: true });
-            else if (slamBranch === 'flat') this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz, cuts: 3, midshipCut: true });
-            else this.breakUp(ctx, 'water impact', { energy: 2.2 + frag * 0.5, impactVx: ivx, impactVz: ivz, mode: 'diagonal' });
-          }
-          else this.breakUp(ctx, 'water impact', { cuts: 1, energy: 1.4, impactVx: ivx, impactVz: ivz });
-          return;
-        }
-        this.state = 'sinking';
-        this.sinkT = 0;
-        // v1.4.1: an intact sink takes 24–38 s (seeded per kill),
-        // not a fixed 30 s — no two sinkings run the same clock.
-        this._sinkDur = 24 + this._brkRng() * 14;
-        this.impactY = seaH;
-        // v1.4.0 mass (audit F10): the final list comes from the
-        // damage state (impact roll + damage list), not a constant.
-        this.sinkRollTarget = Math.max(-0.6, Math.min(0.6, this.roll + this.list));
-        this._sinkPrevY = this.y;
-        if (this.wing) this.wing.handleCarrierSinking(ctx);
-      }
+      this._waterImpact(ctx);
     } else if (this.state === 'capsizing') {
       // v1.5.0 D8 progressive flooding capsize (Concordia/Estonia):
       // no breakup — the flooding state machine drives the list in
