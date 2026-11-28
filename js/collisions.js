@@ -270,7 +270,9 @@ export function solidBodies(G) {
       // parent carrier — the parent body already covers it. Counting it
       // as a second body would double-push anything it touches.
       if (p.held) continue;
-      if (p.state === 'falling' || p.state === 'sinking') out.push(...pieceBodies(p));
+      // v1.6.3: a plunging piece is a solid body too — it is still
+      // falling, just in water, with a real integrated vy.
+      if (p.state === 'falling' || p.state === 'sinking' || p.state === 'plunging') out.push(...pieceBodies(p));
     }
   }
   return out;
@@ -315,12 +317,13 @@ function pushBodyXZ(b, nx, nz, d) {
   b.x += nx * d; b.z += nz * d;
 }
 // Vertical moves only work where the owner integrates y: a FALLING piece
-// (vy is integrated with drag toward terminal velocity). A sinking
+// (vy is integrated with drag toward terminal velocity) and a PLUNGING
+// piece (vy is integrated with water drag + buoyancy, v1.6.3). A sinking
 // piece's y is derived from sinkT and a carrier's y from its flight /
 // fall model, so neither can be pushed in y — for those, vertical
 // contact falls back to a horizontal shove (canMoveY false).
 function canMoveY(b) {
-  return b.kind === 'piece' && b.state === 'falling';
+  return b.kind === 'piece' && (b.state === 'falling' || b.state === 'plunging');
 }
 function pushBodyY(b, d) {
   if (b.kind === 'piece') {
@@ -352,7 +355,10 @@ function deflectBody(b, nx, nz, ny, j, closing) {
   const p = b.ref;
   p.vx = (p.vx || 0) + nx * j * b.invMass;
   p.vz = (p.vz || 0) + nz * j * b.invMass;
-  if (ny && b.state === 'falling') p.vy = (p.vy || 0) + ny * j * b.invMass;
+  // v1.6.3: a plunging piece integrates vy like a falling one, so it
+  // takes a vertical impulse too (a sinking piece's y is curve-derived
+  // and cannot).
+  if (ny && (b.state === 'falling' || b.state === 'plunging')) p.vy = (p.vy || 0) + ny * j * b.invMass;
 }
 
 // Live velocity of a body, read from its owner (not the body's built
@@ -618,7 +624,7 @@ export function checkCarrierCollisions(G, ctx, dt) {
       // v1.4.0 mass (audit F19): full vertical closing — the old 0.5×
       // discount had no basis, and with F3 fixed a falling carrier's
       // real horizontal velocity enters closingH properly.
-      const dvy = (a.state === 'falling' || b.state === 'falling') ? Math.abs(vb.y - va.y) : 0;
+      const dvy = (a.state === 'falling' || b.state === 'falling' || a.state === 'plunging' || b.state === 'plunging') ? Math.abs(vb.y - va.y) : 0;
       const closing = closingH + dvy;
 
       // Positional push-apart (Hurricane v11.34), split by inverse mass.
@@ -812,8 +818,8 @@ export function checkCarrierCollisions(G, ctx, dt) {
         let closingH;
         if (hit.vertical) closingH = Math.max(0, -rvy * hit.dir);
         else closingH = Math.max(0, -(rvx * hit.nx + rvz * hit.nz));
-        const fallingInvolved = (A.kind === 'piece' && A.state === 'falling')
-          || (B.kind === 'piece' && B.state === 'falling')
+        const fallingInvolved = (A.kind === 'piece' && (A.state === 'falling' || A.state === 'plunging'))
+          || (B.kind === 'piece' && (B.state === 'falling' || B.state === 'plunging'))
           || (A.kind === 'carrier' && A.state === 'falling')
           || (B.kind === 'carrier' && B.state === 'falling');
         const dvy = fallingInvolved ? Math.abs(rvy) : 0;

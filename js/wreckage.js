@@ -103,7 +103,7 @@ export class WreckageField {
     this.chunkGeos = [
       new THREE.BoxGeometry(1, 1, 1),
       new THREE.BoxGeometry(1, 1, 1), // flat plate (scaled thin)
-      new THREE.TetrahedronGeometry(1),
+      new THREE.BoxGeometry(1.6, 0.5, 1.2), // flat plating shard (v1.6.3: no tetrahedra — debris reads as torn plating, not triangles)
     ];
     this.chunkMats = [
       new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.9, metalness: 0.3 }), // scorched black

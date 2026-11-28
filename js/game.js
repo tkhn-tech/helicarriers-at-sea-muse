@@ -1485,7 +1485,7 @@ function computeOutcome() {
   // (The old pieces.length===0 test could never pass at all: pieces are
   // never removed from the array, so a breakup kill hung the
   // round-end check forever.)
-  const destroyed = c => (c.state === 'gone' || c.state === 'rested') && !c.pieces.some(p => p.state === 'falling' || p.state === 'sinking');
+  const destroyed = c => (c.state === 'gone' || c.state === 'rested') && !c.pieces.some(p => p.state === 'falling' || p.state === 'sinking' || p.state === 'plunging');
   // (e) Survivors are carriers in state 'alive' ONLY. A carrier that is
   // falling/sinking is doomed, not a survivor — and while one is still
   // falling/sinking the outcome is undecided, so the round waits for it

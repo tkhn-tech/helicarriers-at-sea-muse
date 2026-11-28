@@ -1169,12 +1169,18 @@ export class BreakupPiece {
   // from equilibrium to fully submerged). Hull sections are big sealed
   // boxes (~6 m draft); island/pod/strip are light and ride high;
   // pulverised remnants are negatively buoyant and sink at once.
+  // v1.6.3: `buoy` is the buoyancy ratio at full submersion (displaced
+  // water mass / piece mass) for the plunge branch — >1 floats back
+  // up, <1 keeps sinking. A sealed hull section is mostly air (1.35);
+  // a deck slab is a steel plate with trapped air (1.1); a solid
+  // steel chunk is 0.7.
   _buoyancy() {
-    if (this.assembly === 'island') return { draft: 0.8, floodDur: 150 };
-    if (this.assembly === 'pod') return { draft: 1.2, floodDur: 80 };
-    if (this.assembly === 'strip') return { draft: 0.4, floodDur: 180 };
-    if (this.assembly === 'remnant') return { draft: 0, floodDur: 6 };
-    return { draft: 6, floodDur: this.sinkDur || 30 };
+    if (this.assembly === 'island') return { draft: 0.8, floodDur: 150, buoy: 1.25 };
+    if (this.assembly === 'pod') return { draft: 1.2, floodDur: 80, buoy: 1.15 };
+    if (this.assembly === 'strip') return { draft: 0.4, floodDur: 180, buoy: 1.2 };
+    if (this.assembly === 'deck') return { draft: 4, floodDur: 60, buoy: 1.1 };
+    if (this.assembly === 'remnant') return { draft: 0, floodDur: 6, buoy: 0.7 };
+    return { draft: 6, floodDur: this.sinkDur || 30, buoy: 1.35 };
   }
   update(dt, ctx) {
     // v1.6.0 duplicates fix (B): a held piece does not integrate — the
@@ -1328,18 +1334,71 @@ export class BreakupPiece {
         if (Math.abs(this.pitch) > 0.15) this.pitchRate += Math.sign(this.pitch) * 0.15;
         ctx.vfx.splash(box.minX, seaH, box.minZ, Math.abs(this.vy));
         ctx.vfx.burst(box.minX, seaH + 2, box.minZ, 30, [0.9, 0.9, 0.9], 8, 6);
-        // v1.6.0 B2: a buoyant piece floats at its equilibrium draft
-        // and floods from there; a negatively buoyant remnant sinks
-        // straight away on the deep curve (anchored to its own origin
-        // altitude at entry, so there is no one-frame jump).
-        const b = this._buoyancy();
-        if (b.floodDur <= 8) {
+        // v1.6.3: the piece does NOT stop dead at the surface — it
+        // PLUNGES. The impact velocity carries into the water (see the
+        // 'plunging' branch below): water drag + buoyancy decelerate it
+        // over 1-2 s, and it hands over to sinking/floating already
+        // submerged. The old direct handover discarded the impact
+        // velocity — the sinking curve starts at zero speed and the
+        // floating chase at 5 m/s, so pieces hung at the surface easing
+        // down for 20-30 s, and later pieces stacked on the stopped
+        // ones in mid-air (the frozen floating triangles).
+        this.state = 'plunging'; this._plungeT = 0;
+      }
+    } else if (this.state === 'plunging') {
+      // v1.6.3: water entry is a plunge, not a stop. The piece keeps
+      // its impact velocity; water drag (ramped by submerged fraction,
+      // so a tilted piece pierces deep and a flat piece slaps) and
+      // buoyancy (per-part, from _buoyancy) decelerate it over 1-2 s.
+      // When it has slowed it hands over to the sinking/floating
+      // branch ALREADY SUBMERGED — the slow curves below never run at
+      // the surface, so no piece hovers over the water easing down,
+      // and no later piece can stack on a stopped one in mid-air.
+      this._plungeT = (this._plungeT || 0) + dt;
+      const lenFracP = Math.max(20, this.segLen || 60) / 333;
+      const massP = PHYSICS.MASS * (this.massFrac !== null && this.massFrac !== undefined ? this.massFrac : lenFracP);
+      const areaP = fallProjectedArea(this.pitch, this.roll) * lenFracP * (this.areaFrac || 1) * (this.dragK || 1);
+      const kW = 0.5 * 1025 * 1.0 * areaP / massP; // water drag (water ~840x air)
+      const pbox = this.pieceBoxCorners(_bpBox);
+      const seaHp = ctx.sea.waveHeight(pbox.cx, pbox.cz, ctx.time);
+      const boxHp = Math.max(1, pbox.maxY - pbox.minY);
+      const subFrac = Math.max(0, Math.min(1, (seaHp - pbox.minY) / boxHp));
+      const bp = this._buoy || (this._buoy = this._buoyancy());
+      const buoyR = bp.buoy !== undefined ? bp.buoy : 1.0;
+      // Net vertical accel: gravity minus the buoyancy of the
+      // submerged part, minus water drag (grows with submersion).
+      this.vy += (-9.81 * (1 - buoyR * subFrac) - kW * subFrac * this.vy * Math.abs(this.vy)) * dt;
+      this.y += this.vy * dt;
+      // Horizontal drift dies fast in water; tumbling decays too.
+      const dragP = Math.exp(-dt * 0.6);
+      this.vx *= dragP; this.vz *= dragP;
+      this.group.position.x += this.vx * dt;
+      this.group.position.z += this.vz * dt;
+      const rDecayP = Math.exp(-dt / 8);
+      this.rollRate *= rDecayP; this.pitchRate *= rDecayP; this.yawRate *= rDecayP;
+      this.roll += this.rollRate * dt * 0.3;
+      this.pitch += this.pitchRate * dt * 0.3;
+      this.heading += this.yawRate * dt * 0.3;
+      this.group.position.y = this.y;
+      this.group.rotation.set(this.pitch, -this.heading, this.roll);
+      // Floor: a plunging piece that reaches the seabed rests there.
+      const fbP = this.pieceBoxCorners(_bpBox);
+      if (fbP.minY <= SEA_FLOOR_Y) {
+        this.y += SEA_FLOOR_Y - fbP.minY; this.group.position.y = this.y;
+        this.state = 'rested'; this.vy = 0; this.vx = 0; this.vz = 0;
+        this.rollRate = 0; this.pitchRate = 0; this.yawRate = 0;
+      } else if (this.vy > -3 || this._plungeT > 6) {
+        // Slowed (or timed out): hand over to the surface branch,
+        // already submerged. Buoyant pieces float up to their draft;
+        // negatively buoyant ones take the deep curve from here.
+        if (bp.floodDur <= 8) {
           this.state = 'sinking'; this.sinkT = 0; this._deepStartY = this.y;
         } else {
-          this.state = 'floating'; this.floodF = 0; this._buoy = b;
+          this.state = 'floating'; this.floodF = 0; this._buoy = bp;
           this._floodSide = Math.sign(this.rollRate) || (this.roll >= 0 ? 1 : -1);
         }
       }
+      this._fireCookoffs(dt, ctx);
     } else if (this.state === 'floating') {
       // v1.6.0 B2: the piece rides at its equilibrium draft, bobbing
       // with the live sea and listing/trimming as it floods. It only
@@ -1654,7 +1713,6 @@ export class Helicarrier {
     this._brkRng = mulberry32(this._brkSeed);
     this._breakList = 0; this._breakListTarget = 0; // v1.4.1: pre-breakup list (eases in during cracking/hinging)
     this._sinkDur = 30; // v1.4.1: intact-sinking duration, varied per kill (24–38 s)
-    this._fallVentT = 0; // v1.4.1: falling-vent timer (smoke while falling hurt)
     this._washAcc = 0; // v1.4.2: downwash spray/mist emission accumulator
     // v1.5.0: damage-detail state (§6). _damageList is the stepped list
     // (radians toward the dead side) added by damage events — pod lost
@@ -2677,7 +2735,7 @@ export class Helicarrier {
     // coincident cluster. `salt` is the remnant/strip index; the kind
     // base keeps island/pod/strip/remnant streams apart even when the
     // pod index coincides (an island and pod 0 used to share a seed).
-    const kindSalt = kind === 'island' ? 900 : kind === 'strip' ? 600 : kind === 'remnant' ? 700 : 500;
+    const kindSalt = kind === 'island' ? 900 : kind === 'deck' ? 800 : kind === 'strip' ? 600 : kind === 'remnant' ? 700 : 500;
     const rng = mulberry32(fracSeed(this._brkSeed, kindSalt + (podIdx || 0) + (salt || 0) * 37, this.lastHit ? this.lastHit.lz : 0));
     const g = new THREE.Group();
     let segLen = 30, massFrac = 0.01, areaFrac = 0.4, dragK = 1;
@@ -2750,20 +2808,23 @@ export class Helicarrier {
       plate.name = 'asmStrip';
       g.add(plate);
       segLen = 50; massFrac = 0.002; areaFrac = 0.18; dragK = 3; halfBeam = 6; halfH = 2;
-    } else { // 'remnant' — D7 pulverised-segment large remnant
-      // v1.6.2: a REAL chunk, not a flat plate. The old Tetrahedron(9)
-      // scaled (1.4, 0.25, 1.8) was a 25×4.5×32 m card in near-black
-      // capSteel — in the frames it read as a floating black quad, and
-      // six of them were all a 186 m hull section left behind, which is
-      // what "parts of the ship just disappear" looked like. Now a
-      // ~45×26×48 m solid tetrahedron in mid-grey flat-shaded steel,
-      // with physics to match (segLen 44, massFrac 0.04 — a solid
-      // chunk, vt ≈ 110 m/s like the island/pod chunks, not the old
-      // flat-plate 59). 2–3 of these per pulverised segment.
-      const frag = new THREE.Mesh(new THREE.TetrahedronGeometry(15), DM.remnantSteel);
-      frag.scale.set(1.5, 0.85, 1.6); frag.name = 'asmRemnant';
-      g.add(frag);
-      segLen = 44; massFrac = 0.04; areaFrac = 0.7; dragK = 3; halfBeam = 22; halfH = 12;
+    } else { // 'deck' — v1.6.3: a recognisable slab of flight deck
+      // (replaces the tetrahedron remnant, and any legacy 'remnant'
+      // spawn). Full beam width (68 m), hull-grey sides, a dark deck
+      // top with a pale runway centreline and deck-edge bars — it reads
+      // as a chunk of the carrier from every angle. Closed boxes
+      // throughout: solid, no hollow shells, no one-sided geometry,
+      // no triangles.
+      const deckLen = 44;
+      const slab = new THREE.Mesh(new THREE.BoxGeometry(68, 6, deckLen), DM.remnantSteel);
+      slab.name = 'asmDeckSlab'; g.add(slab);
+      const top = new THREE.Mesh(new THREE.BoxGeometry(68, 0.8, deckLen), DM.capSteel);
+      top.position.y = 3.2; top.name = 'asmDeckTop'; g.add(top);
+      const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.5, 1.0, deckLen * 0.92), DM.whiteMark);
+      stripe.position.y = 3.3; stripe.name = 'asmDeckStripe'; g.add(stripe);
+      const edge = new THREE.Mesh(new THREE.BoxGeometry(68, 1.0, 1.5), DM.lightGrey);
+      edge.position.y = 3.3; edge.position.z = deckLen / 2 - 1; edge.name = 'asmDeckEdge'; g.add(edge);
+      segLen = deckLen; massFrac = 0.03; areaFrac = 0.7; dragK = 1.5; halfBeam = 34; halfH = 3.5;
     }
     g.position.copy(worldPos);
     if (worldRot) {
@@ -3252,20 +3313,44 @@ export class Helicarrier {
     }
     if (ctx.audio) ctx.audio.boom(true);
     const rng = mulberry32(fracSeed(this._brkSeed, 700, seg.centre));
-    const nRem = 2 + Math.floor(rng() * 2);
-    // v1.6.2: stagger the remnants' spawn altitudes (20 m apart) —
-    // siblings used to spawn at the same deck level, interpenetrated
-    // by up to ~24 m, and the solidity solver had to clear the whole
-    // overlap at once. A blast throws fragments apart vertically as
-    // well as sideways, so staggered birth altitudes are the physical
-    // reading — and the worst spawn overlap drops to the section-vs-
-    // remnant case (~14 m), which the per-substep cap then clears
-    // in ~0.1 s without a teleport (see PUSH_CAP_PIECE).
-    for (let i = 0; i < nRem; i++) {
-      const off = (rng() - 0.5) * (seg.hi - seg.lo) * 0.7;
-      const yOff = (i - (nRem - 1) / 2) * 20;
-      const rp = this.group.localToWorld(new THREE.Vector3((rng() - 0.5) * 30, deckLocalYAt(-seg.centre - off) + 2 + yOff, -seg.centre - off));
-      this._spawnAssemblyPiece(ctx, 'remnant', undefined, rp, undefined, i);
+    // v1.6.3: a pulverised segment becomes RECOGNISABLE carrier parts,
+    // not tetrahedra — deck segments (full beam, deck markings) plus
+    // the actual pod / island when the segment contains one and it has
+    // not already torn off (a tearoff hides the island meshes / sets
+    // pod.alive false, so the checks below never double-spawn). Each
+    // part gets its own physics (see _spawnAssemblyPiece
+    // 'deck'/'pod'/'island' + _buoyancy). The old 2-3 tetrahedra were
+    // ~80% of the section's volume gone and read as floating black
+    // triangles; the deck slabs span the full beam and the island/pod
+    // are the ship's own parts, so nothing disappears.
+    const plan = this._breakPlan;
+    const segLenP = seg.hi - seg.lo;
+    let spawnIsland = false;
+    if (plan && plan.islBox) {
+      const ib = plan.islBox;
+      const islDLo = -ib.max.z, islDHi = -ib.min.z; // d = -localZ
+      if (islDHi >= seg.lo && islDLo <= seg.hi) {
+        let vis = false;
+        this.group.traverse(o => { if (o.isMesh && o.name && o.name.startsWith('island_') && o.visible) vis = true; });
+        spawnIsland = vis;
+      }
+    }
+    const podsHere = this.pods.filter(p => p.alive && (-p.local.z) >= seg.lo && (-p.local.z) <= seg.hi);
+    const nDeck = Math.max(1, Math.min(3, Math.round(segLenP / 60)));
+    for (let i = 0; i < nDeck; i++) {
+      const off = nDeck > 1 ? (i - (nDeck - 1) / 2) * (segLenP / nDeck) : 0;
+      const rp = this.group.localToWorld(new THREE.Vector3((rng() - 0.5) * 20, deckLocalYAt(-seg.centre - off) + 2, -seg.centre - off));
+      this._spawnAssemblyPiece(ctx, 'deck', undefined, rp, undefined, i);
+    }
+    if (spawnIsland) {
+      const ib = plan.islBox;
+      const cx = (ib.min.x + ib.max.x) / 2, cy = (ib.min.y + ib.max.y) / 2, cz = (ib.min.z + ib.max.z) / 2;
+      const wpI = this.group.localToWorld(new THREE.Vector3(cx, cy, cz));
+      this._spawnAssemblyPiece(ctx, 'island', undefined, wpI);
+    }
+    for (const pod of podsHere.slice(0, 2)) {
+      const wpP = this.group.localToWorld(new THREE.Vector3(pod.local.x, pod.local.y, pod.local.z));
+      this._spawnAssemblyPiece(ctx, 'pod', this.pods.indexOf(pod), wpP);
     }
   }
   // Phase 4 — one segment becomes a free BreakupPiece (the old mkPiece
@@ -3702,11 +3787,21 @@ export class Helicarrier {
               (Math.random() - 0.5) * 4, 4 + Math.random() * 3, (Math.random() - 0.5) * 4, 1.2, 1, 0.5, 0.1, -6);
           }
         }
-        const smokeCol = f.zone === 'reactor' ? 0xd8ecf2 : burnFrac > 0.5 ? 0x0a0a0a : (f.zone === 'magazine' ? 0x241812 : 0x141414);
-        const sm = ctx.vfx.spawnSprite(vent.x, vent.y + 8, vent.z, 3.5, (8 + f.intensity * 4 + burnFrac * 6) * visScale, (8 + f.intensity * 4 + burnFrac * 6) * visScale, 0.5,
-          smokeCol, 0.6);
-        sm.vy = 3;
-        sm.vx = -this.vx * 0.3; sm.vz = -this.vz * 0.3; // trail behind the motion
+        // v1.6.3: a destroyed carrier vents NO smoke — the fire loop
+        // used to spawn a near-black smoke sprite every 0.15 s per
+        // fire while the ship was falling/sinking, and the sprites rose
+        // at +3 m/s while the wreck fell at up to -77 m/s, hanging in
+        // the air as a vertical dotted line of black orbs for the whole
+        // destroyed stage (the v1.6.2 orb line Nicholas photographed).
+        // The fire still drains zone HP (damage model unchanged); only
+        // the smoke emission stops once the ship is no longer alive.
+        if (this.state === 'alive') {
+          const smokeCol = f.zone === 'reactor' ? 0xd8ecf2 : burnFrac > 0.5 ? 0x0a0a0a : (f.zone === 'magazine' ? 0x241812 : 0x141414);
+          const sm = ctx.vfx.spawnSprite(vent.x, vent.y + 8, vent.z, 3.5, (8 + f.intensity * 4 + burnFrac * 6) * visScale, (8 + f.intensity * 4 + burnFrac * 6) * visScale, 0.5,
+            smokeCol, 0.6);
+          sm.vy = 3;
+          sm.vx = -this.vx * 0.3; sm.vz = -this.vz * 0.3; // trail behind the motion
+        }
       }
       // Cook-off: a hot magazine/reactor fire throws secondary bursts
       // as it matures — visual only, no extra damage.
@@ -4144,18 +4239,13 @@ export class Helicarrier {
           }
         }
       }
-      // v1.4.1 falling vent: a hurt ship falling intact vents smoke
-      // from her deck as she goes down — pre-breakup behaviour even
-      // when she never comes apart in the air.
-      if (this.hpFrac < 0.6) {
-        this._fallVentT -= dt;
-        if (this._fallVentT <= 0) {
-          this._fallVentT = 0.5;
-          const wp = this.deckPoint((this._brkRng() - 0.5) * 40, (this._brkRng() - 0.5) * 200);
-          const sm = ctx.vfx.spawnSprite(wp.x, wp.y + 6, wp.z, 2.5, 12, 12, 0.5, 0x141414, 0.55);
-          sm.vy = 2;
-        }
-      }
+      // v1.6.3: the falling vent is GONE. It spawned a near-black smoke
+      // sprite (0x141414, vy +2) every 0.5 s from a hurt ship's deck
+      // while she fell intact — the sprites hung in the air behind the
+      // plunging ship as a dotted line of black orbs (Nicholas's
+      // example 4: three vertical dotted trails behind the falling
+      // wreck). A falling ship leaves no smoke trail; the detonation
+      // fireball and explosion visuals already cover the destruction.
       this._waterImpact(ctx);
     } else if (this.state === 'capsizing') {
       // v1.5.0 D8 progressive flooding capsize (Concordia/Estonia):
