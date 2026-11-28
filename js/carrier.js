@@ -3787,15 +3787,19 @@ export class Helicarrier {
               (Math.random() - 0.5) * 4, 4 + Math.random() * 3, (Math.random() - 0.5) * 4, 1.2, 1, 0.5, 0.1, -6);
           }
         }
-        // v1.6.3: a destroyed carrier vents NO smoke — the fire loop
-        // used to spawn a near-black smoke sprite every 0.15 s per
-        // fire while the ship was falling/sinking, and the sprites rose
-        // at +3 m/s while the wreck fell at up to -77 m/s, hanging in
-        // the air as a vertical dotted line of black orbs for the whole
-        // destroyed stage (the v1.6.2 orb line Nicholas photographed).
-        // The fire still drains zone HP (damage model unchanged); only
-        // the smoke emission stops once the ship is no longer alive.
-        if (this.state === 'alive') {
+        // v1.6.4: dark smoke ONLY in controlled level flight — alive, not
+        // breaking up, and producing at least hover thrust. The v1.6.3
+        // gate (state==='alive') still let a burning ship vent a black
+        // smoke sprite every 0.15 s per fire while she DESCENDED alive
+        // (low throttle, or 2 pods dead so max lift is 0.73W) and while
+        // she was BREAKING UP in the air — the sprites rise at +3 m/s
+        // while the ship falls, hanging as a dotted black line through
+        // the whole sky (reproduced v164: 27-29 dark sprites steady for
+        // a 16 s descent, y-range 13-369 m; 42 during a fire breakup).
+        // A level-flying burning ship still smokes (damage feedback);
+        // a descending or breaking-up one vents nothing. Flames,
+        // embers and HP drain are untouched.
+        if (this.state === 'alive' && this.breakState === 'none' && (this.liftThrustNow || 0) >= 1) {
           const smokeCol = f.zone === 'reactor' ? 0xd8ecf2 : burnFrac > 0.5 ? 0x0a0a0a : (f.zone === 'magazine' ? 0x241812 : 0x141414);
           const sm = ctx.vfx.spawnSprite(vent.x, vent.y + 8, vent.z, 3.5, (8 + f.intensity * 4 + burnFrac * 6) * visScale, (8 + f.intensity * 4 + burnFrac * 6) * visScale, 0.5,
             smokeCol, 0.6);
@@ -3828,8 +3832,11 @@ export class Helicarrier {
     if (this.fireT <= 0) this.fireT = 0.15;
     // Hurt smoke (no fire): hp < 70% dark smoke, < 40% thicker + embers
     // (v1.3.0 H grading — was smoke-only at both thresholds).
+    // v1.6.4: same controlled-flight gate as fire smoke (see above) —
+    // a hurt ship descending alive or breaking up vents no dark smoke,
+    // or it dots the sky exactly like the fire smoke did (v164 repro).
     this.hurtT -= dt;
-    if (this.hurtT <= 0 && this.hpFrac < 0.7 && this.state === 'alive') {
+    if (this.hurtT <= 0 && this.hpFrac < 0.7 && this.state === 'alive' && this.breakState === 'none' && (this.liftThrustNow || 0) >= 1) {
       this.hurtT = this.hpFrac < 0.4 ? 0.3 : 0.45;
       const wp = this.deckPoint((Math.random() - 0.5) * 40, (Math.random() - 0.5) * 200);
       const sm = ctx.vfx.spawnSprite(wp.x, wp.y + 6, wp.z, 3.0, 10, 10, 0.4, 0x1a1a1a, 0.5);
